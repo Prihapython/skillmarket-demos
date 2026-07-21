@@ -102,6 +102,20 @@ CFG = {
     "trailing_pct": 0.25,
     # 逃生预警阈值（severity 0-100）
     "escape_severity": 70,
+    # SHADOW-only 自动交易：入场固定 $20 名义仓位；子额度独立于人工 max_concurrent_positions，
+    # 避免机器人吃满人工一键买入的额度；同地址止损/逃生离场后冷却期内不重新入场。
+    "auto_size_usd": 20.0,
+    "max_auto_positions": 5,
+    "auto_reentry_cooldown_s": 90.0,
+    # 自动交易三段式离场（用户指定）：
+    #   1) +30% 部分止盈：卖一半，锁定利润；
+    #   2) 剩余仓位止损上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
+    #   3) 剩余仓位用移动止损 25%（保本价与移动止损取更高者）+ 硬止盈 +150% 管理。
+    # 初始硬止损 -35%（复用 hard_stop_pct）只在部分止盈发生前生效。
+    "auto_tp1_pct": 0.30,
+    "auto_tp1_sell_frac": 0.5,
+    "auto_tp2_pct": 1.50,
+    "auto_trailing_pct": 0.25,
 }
 # 各链「原生/币种」token 地址（买入时作 input、卖出时作 output）。
 # 地址来自 gmgn-cli 权威 Chain Currencies 表，绝不能凭记忆改（错一个字符会静默失败）。
@@ -119,6 +133,10 @@ NATIVE_TOKEN = {
 NATIVE_DECIMALS = {"sol": 9, "bsc": 18, "base": 18, "eth": 18, "robinhood": 18}
 def native_token(chain): return NATIVE_TOKEN.get(chain, NATIVE_TOKEN["sol"])
 def native_decimals(chain): return NATIVE_DECIMALS.get(chain, 9)
+
+# 自动交易 $20 名义仓位换算原生币数量时的兜底价格（仅当 token_price(原生币地址) 查询失败时用，
+# 例如 MockGMGN 的 db 里没有原生币地址这一条 → KeyError；或 Live 侧一次性网络故障）。
+NATIVE_USD_FALLBACK = {"sol": 150.0, "bsc": 600.0, "base": 3000.0, "eth": 3000.0, "robinhood": 3000.0}
 
 # 安全护栏：置 True 时即使配了 private key、即使 mode=LIVE，也强制走 SHADOW、绝不调 swap。
 # 已解锁(False)：LIVE 模式 + 已配 GMGN_PRIVATE_KEY 时，「一键买入/平仓」会真实发单、动用资金、不可逆。
@@ -1275,6 +1293,112 @@ def exit_plan() -> dict:
                 trailing=f"{int(CFG['trailing_pct']*100)}%")
 
 # ──────────────────────────────────────────────────────────────────────────
+# 8b. SHADOW-only 自动交易（人在环铁律的有意收窄豁免，仅纸面模拟；见 SPEC.md §2/§14）
+#     入场：通过全部闸门(action=ACTION)且开关打开 → 自动开 $20 名义纸面仓位。
+#     离场：三段式（用户指定，见 CFG 里 auto_tp1_*/auto_tp2_pct/auto_trailing_pct 注释）：
+#       1) 逃生 severity≥escape_severity → 任何阶段都立即全仓离场；
+#       2) 部分止盈前：pnl≤-hard_stop_pct → 全仓止损；pnl≥auto_tp1_pct(+30%) → 卖出
+#          auto_tp1_sell_frac(一半)、锁定利润，剩余仓位止损上移到保本价(entry_price)；
+#       3) 部分止盈后：剩余仓位止损 = max(保本价, 峰值价×(1-auto_trailing_pct))，只升不降
+#          （保证不再亏钱）；pnl≥auto_tp2_pct(+150%) → 剩余全部止盈离场。
+# ──────────────────────────────────────────────────────────────────────────
+def native_usd_price(g: "GMGNAdapter", chain: str) -> float:
+    try:
+        p = g.token_price(native_token(chain))
+        if p and p > 0:
+            return p
+    except Exception:
+        pass
+    return NATIVE_USD_FALLBACK.get(chain, 150.0)
+
+def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int) -> None:
+    """SHADOW-only 自动入场；调用方须已持有 ST.lock（从 screen_once 内调用，api_run 持锁跑它）。"""
+    if ST.mode != "SHADOW":                  # 硬安全阀：绝不在 LIVE 下自动开仓
+        return
+    if any(p["address"] == f.address and p.get("chain", "sol") == chain for p in ST.positions):
+        return                               # 已持有（人工或自动）→ 不重复开仓
+    if sum(1 for p in ST.positions if p.get("auto")) >= CFG["max_auto_positions"]:
+        return                               # 机器人子额度已满，不挤占人工额度
+    if time.monotonic() < ST._auto_cooldown.get(f.address, 0):
+        return                               # 该币刚被自动离场，冷却期内不重新入场
+    g = ST.adapter_for(chain)
+    size_native = round(CFG["auto_size_usd"] / native_usd_price(g, chain), 6)
+    allow, rnote = ST.risk.gate(size_native, len(ST.positions), ST.exposure())
+    if not allow:
+        log("AUTO_BUY_SKIP", f.symbol_safe, rnote)
+        return
+    try:
+        sec = g.token_security(f.address)
+    except Exception:
+        sec = {}
+    entry = dict(honeypot=sec.get("honeypot", False), renounced_mint=sec.get("renounced_mint", False),
+                 renounced_freeze=sec.get("renounced_freeze", False),
+                 burn_ratio=sec.get("burn_ratio", 0.0), top10=sec.get("top10", 0.0))
+    try:
+        entry_price = g.token_price(f.address)
+    except Exception:
+        entry_price = 0.0
+    sig = dict(verdict=v.verdict, conviction=v.conviction, crowdedness=v.crowdedness,
+               dev_score=f.dev_eval, priority=pri, sm_confluence=f.sm_confluence)
+    ST.positions.append(dict(symbol=f.symbol_safe, address=f.address, size_sol=size_native,
+                             orig_size_sol=size_native, pnl=0.0, cycles=0, entry=entry, chain=chain,
+                             entry_price=entry_price, cur_price=entry_price,
+                             auto=True, tp1_done=False, peak_price=entry_price,
+                             entry_signal=sig))
+    save_positions()
+    log("BUY", f.symbol_safe, f"SHADOW AUTO 记录 {size_native} ({chain})",
+        dict(address=f.address, size_sol=size_native, chain=chain, auto=True,
+             entry_signal=sig, hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%",
+             tp1=f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%+保本",
+             tp2=f"+{int(CFG['auto_tp2_pct']*100)}%→清剩余", trailing=f"{int(CFG['auto_trailing_pct']*100)}%"))
+
+def _auto_decide_exit(p: dict):
+    """纯规则判断该 auto 持仓本轮该怎么处理；顺带更新 p 的 peak_price（供移动止损用）。
+    返回 None（不动）/ ("full", tag) 全仓离场 / ("partial", frac, tag) 部分止盈。"""
+    if p.get("severity", 0) >= CFG["escape_severity"]:      # 逃生信号任何阶段都优先、立即全仓离场
+        return ("full", "AUTO_ESCAPE")
+    pnl = p.get("pnl", 0.0)
+    cur = p.get("cur_price", 0.0)
+    entry = p.get("entry_price", 0.0)
+    if not p.get("tp1_done"):
+        # 部分止盈前：初始硬止损 -35% 保护全仓
+        if pnl <= -CFG["hard_stop_pct"]:
+            return ("full", "AUTO_SL")
+        if pnl >= CFG["auto_tp1_pct"]:
+            return ("partial", CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
+        return None
+    # 部分止盈后：剩余仓位止损 = max(保本价, 峰值价的移动止损)，只升不降 → 这笔交易此后不可能再亏钱
+    peak = max(p.get("peak_price", 0.0), cur)
+    p["peak_price"] = peak
+    if pnl >= CFG["auto_tp2_pct"]:
+        return ("full", "AUTO_TP2")
+    stop_price = max(entry, peak * (1 - CFG["auto_trailing_pct"])) if entry > 0 else 0
+    if entry > 0 and cur > 0 and cur <= stop_price:
+        return ("full", "AUTO_TRAIL_BE")
+    return None
+
+def auto_manage_exits(chain: str) -> None:
+    """独立于 monitor_positions 的第二遍：该函数会 do_sell()/do_sell_partial()（改 ST.positions），
+    不能在 monitor_positions 自己的 for 循环里做，否则边遍历边改会错乱/漏项。只在 SHADOW 且开关打开时运行——
+    开关关闭必须是真正的killswitch，已开的 auto 仓位也不再被自动管理（否则关闭开关后机器人仍会继续
+    部分止盈/移动止损/平仓，用户会看到"开关是关的但仓位还在自己动"的困惑现象）。"""
+    if ST.mode != "SHADOW" or not ST.auto_trade:
+        return
+    for p in [p for p in ST.positions if p.get("chain", "sol") == chain and p.get("auto")]:
+        decision = _auto_decide_exit(p)
+        if not decision:
+            continue
+        try:
+            if decision[0] == "full":
+                do_sell(p["address"], exit_tag=decision[1])
+                ST._auto_cooldown[p["address"]] = time.monotonic() + CFG["auto_reentry_cooldown_s"]
+            else:
+                _, frac, tag = decision
+                do_sell_partial(p["address"], frac, tag)
+        except Exception as e:
+            log("AUTO_SELL_FAIL", p["symbol"], str(e))
+
+# ──────────────────────────────────────────────────────────────────────────
 # 9. 全局状态（单进程单用户；持仓 + 风控有状态）
 # ──────────────────────────────────────────────────────────────────────────
 class RiskManager:
@@ -1305,6 +1429,8 @@ class AppState:
     def __init__(self):
         self.lock = threading.Lock()
         self.mode = "SHADOW"          # SHADOW | LIVE（钱包级安全设置，全局）
+        self.auto_trade = False       # SHADOW-only 自动交易开关；不落盘，重启回默认 False（同 mode 的安全默认哲学）
+        self._auto_cooldown: dict[str, float] = {}   # address -> monotonic() 之前禁止自动重新入场
         self.chain = CFG["chain"]     # 启动默认链（仅用于未带 chain 的请求兜底 + status 展示）
         self.live = False             # 是否已配 key（决定按链建 Live 还是 Mock 适配器）
         self._adapters: dict[str, GMGNAdapter] = {}              # chain -> 适配器（缓存）
@@ -1419,6 +1545,77 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 # ──────────────────────────────────────────────────────────────────────────
+# 10b. 自动交易统计（反馈飞轮第一个真正的"读"：trade_decisions.jsonl 过去只写不读，见 SPEC §5.4）
+#      直接复用 do_sell 写进 SELL 记录里的 entry_signal + exit_tag，一行即一笔完整的已平仓交易，
+#      不需要额外的持久化文件，也不需要 BUY/SELL 关联查询。
+# ──────────────────────────────────────────────────────────────────────────
+def _load_auto_sells(max_lines: int = 20000) -> list[dict]:
+    if not LOG_PATH.exists():
+        return []
+    lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-max_lines:]
+    out = []
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if rec.get("action") == "SELL" and rec.get("auto"):
+            out.append(rec)
+    return out
+
+def _bucket_conviction(c):
+    if c is None:
+        return "unknown"
+    return "0.6-0.75" if c < 0.75 else ("0.75-0.85" if c < 0.85 else "0.85-1.0")
+
+def _bucket_dev(d):
+    if d is None:
+        return "unscored"
+    return "weak(<0.3)" if d < 0.3 else ("mid(0.3-0.6)" if d < 0.6 else "strong(>=0.6)")
+
+def _row_usd(r: dict) -> float:
+    """该笔 SELL 记录对应的 $ 名义。有部分止盈的仓位，一笔交易会拆成 2 条 SELL 记录，各自只占
+    原始 $20 的一部分（见 _sell_usd_notional）；没有 usd_notional 字段的旧记录（部分止盈上线前
+    写的、或非自动持仓）按整份 auto_size_usd 兜底，保持历史数据可读。"""
+    v = r.get("usd_notional")
+    return v if v else CFG["auto_size_usd"]
+
+def _group_trades(rows: list[dict], keyfn) -> list[dict]:
+    buckets: dict[str, list[dict]] = {}
+    for r in rows:
+        buckets.setdefault(keyfn(r), []).append(r)
+    out = []
+    for k, rs in buckets.items():
+        n = len(rs)
+        wins = sum(1 for r in rs if r.get("pnl", 0) > 0)
+        total_usd = sum(r.get("pnl", 0) * _row_usd(r) for r in rs)
+        out.append(dict(key=k, n=n, win_rate=round(wins / n, 3),
+                        avg_pnl_pct=round(sum(r.get("pnl", 0) for r in rs) / n, 4),
+                        total_pnl_usd=round(total_usd, 2)))
+    return sorted(out, key=lambda x: -x["n"])
+
+def compute_auto_stats() -> dict:
+    rows = _load_auto_sells()
+    n = len(rows)
+    if n == 0:
+        return dict(total_trades=0, wins=0, losses=0, win_rate=0, total_pnl_usd=0, avg_pnl_pct=0,
+                    by_exit_tag=[], by_conviction=[], by_crowdedness=[], by_dev_bucket=[], recent=[])
+    wins = sum(1 for r in rows if r.get("pnl", 0) > 0)
+    losses = sum(1 for r in rows if r.get("pnl", 0) <= 0)
+    total_usd = sum(r.get("pnl", 0) * _row_usd(r) for r in rows)
+    return dict(
+        total_trades=n, wins=wins, losses=losses, win_rate=round(wins / n, 3), total_pnl_usd=round(total_usd, 2),
+        avg_pnl_pct=round(sum(r.get("pnl", 0) for r in rows) / n, 4),
+        by_exit_tag=_group_trades(rows, lambda r: r.get("exit_tag") or "unknown"),
+        by_conviction=_group_trades(rows, lambda r: _bucket_conviction((r.get("entry_signal") or {}).get("conviction"))),
+        by_crowdedness=_group_trades(rows, lambda r: (r.get("entry_signal") or {}).get("crowdedness") or "unknown"),
+        by_dev_bucket=_group_trades(rows, lambda r: _bucket_dev((r.get("entry_signal") or {}).get("dev_score"))),
+        recent=[dict(ts=r.get("ts"), symbol=r.get("symbol"), address=r.get("address"), chain=r.get("chain"),
+                    pnl=r.get("pnl", 0), exit_tag=r.get("exit_tag"), entry_signal=r.get("entry_signal"),
+                    partial=bool(r.get("partial")))
+                for r in rows[-50:]][::-1])
+
+# ──────────────────────────────────────────────────────────────────────────
 # 11. 筛选流水线（核心：确定性先筛 → 评分 → LLM 只判幸存者 → 产候选，不执行）
 # ──────────────────────────────────────────────────────────────────────────
 def screen_once(chain: str) -> dict:
@@ -1490,13 +1687,17 @@ def screen_once(chain: str) -> dict:
             exec=exit_plan()))
         log("SCREEN", f.symbol_safe, "通过闸门 · 待决策",
             dict(size_sol=size, priority=pri, risk_warn=(not allow)))
+        if ST.auto_trade:                    # SHADOW-only 自动交易开关打开 → 自动开 $20 纸面仓位
+            auto_open_position(chain, f, v, pri)
 
     # 持仓逃生监控（与筛选同一轮跑）；把本轮热榜行喂进去，持仓在榜则零额外 cli
     rows_by_addr = {t["address"]: t for t in candidates if t.get("address")}
     positions_out = monitor_positions(chain, rows_by_addr)
+    auto_manage_exits(chain)                 # 独立第二遍：止损/止盈/移动止损/逃生离场（仅 auto 持仓）
 
     # 回传后端真实 mode：前端据此同步 LIVE/SHADOW 开关，避免重启后端后开关停留在 LIVE 误导
-    return dict(decisions=decisions, portfolio=_portfolio(), positions=positions_out, mode=ST.mode)
+    return dict(decisions=decisions, portfolio=_portfolio(), positions=positions_out, mode=ST.mode,
+                auto_trade=ST.auto_trade)
 
 # 公开演示缓存：后台线程定时刷新真实筛选结果，访客只读这份缓存（见 PUBLIC_DEMO 注释）。
 _PUBLIC_CACHE: dict = {"data": None, "err": None}
@@ -1616,9 +1817,11 @@ def monitor_positions(chain: str, rows_by_addr: dict | None = None) -> list[dict
             ep = p.get("entry_price", 0.0)
             if ep > 0:
                 p["cur_price"] = round(ep * (1 + p["pnl"]), 10)
+        p["severity"] = severity          # 存回持仓：auto_manage_exits 复用，不用重算 assess_escape
         out.append(dict(symbol=p["symbol"], address=p["address"], size_sol=p["size_sol"],
                         pnl=p.get("pnl", 0), entry_price=p.get("entry_price", 0.0),
                         cur_price=p.get("cur_price", 0.0), severity=severity,
+                        auto=bool(p.get("auto")), tp1_done=bool(p.get("tp1_done")),
                         signals=[dict(t=s[0], hot=s[1]) for s in sigs]))
     return out
 
@@ -1699,7 +1902,9 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
     log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})", dict(size_sol=size_sol, chain=chain, **exit_plan()))
     return dict(ok=True, status=status_msg, filled=filled, symbol=symbol)
 
-def do_sell(address: str) -> dict:
+def do_sell(address: str, exit_tag: str | None = None) -> dict:
+    """exit_tag：非空时说明这是 auto_manage_exits 触发的自动离场（AUTO_SL/AUTO_TP/AUTO_TRAIL/
+    AUTO_ESCAPE），写进日志供 compute_auto_stats 读取；人工卖出（/api/sell）永远传 None。"""
     idx = next((i for i, p in enumerate(ST.positions) if p["address"] == address), None)
     if idx is None:
         raise HTTPException(404, "未找到该持仓")
@@ -1720,8 +1925,43 @@ def do_sell(address: str) -> dict:
         ST.risk.realized_loss_today = round(ST.risk.realized_loss_today + abs(pnl) * p["size_sol"], 4)
     else:
         ST.risk.consec_losses = 0
-    log("SELL", p["symbol"], f"{ST.mode} 平仓 PnL {pnl:+.1%}")
+    usd_notional = _sell_usd_notional(p, p["size_sol"])   # auto 部分止盈过的仓位，剩余部分只值原 $20 的一部分
+    log("SELL", p["symbol"], f"{ST.mode} 平仓 PnL {pnl:+.1%}" + (f" · {exit_tag}" if exit_tag else ""),
+        dict(address=p["address"], chain=pchain, size_sol=p["size_sol"], pnl=pnl, usd_notional=usd_notional,
+             auto=bool(p.get("auto")), exit_tag=exit_tag, entry_signal=p.get("entry_signal")))
     ST.positions.pop(idx)
+    save_positions()
+    return dict(ok=True, symbol=p["symbol"])
+
+def _sell_usd_notional(p: dict, sell_size_sol: float) -> float:
+    """卖出的这部分持仓，按«占当初建仓原始数量的比例»折算成 $ 名义（只对 auto 仓位有意义；
+    人工仓位没有 auto_size_usd 概念，返回 0，前端/统计只统计 auto=true 的行，不会用到这个值）。"""
+    orig = p.get("orig_size_sol") or p.get("size_sol") or 0
+    if not p.get("auto") or orig <= 0:
+        return 0.0
+    return round(min(1.0, sell_size_sol / orig) * CFG["auto_size_usd"], 4)
+
+def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
+    """SHADOW-only 部分止盈：卖掉仓位的 frac 比例，持仓保留（size_sol 按比例减少），不 pop。
+    只从 auto_manage_exits 调用（已在 mode==SHADOW 下才会触发），故这里不处理 LIVE 真实 swap。"""
+    idx = next((i for i, p in enumerate(ST.positions) if p["address"] == address), None)
+    if idx is None:
+        raise HTTPException(404, "未找到该持仓")
+    p = ST.positions[idx]
+    pnl = p.get("pnl", 0)
+    sell_size = round(p["size_sol"] * frac, 6)
+    usd_notional = _sell_usd_notional(p, sell_size)
+    if pnl < 0:                     # 部分止盈按定义 pnl>0 触发，这里只是防御性保留同样的风控记账逻辑
+        ST.risk.consec_losses += 1
+        ST.risk.realized_loss_today = round(ST.risk.realized_loss_today + abs(pnl) * sell_size, 4)
+    else:
+        ST.risk.consec_losses = 0
+    log("SELL", p["symbol"], f"{ST.mode} 部分止盈 {frac:.0%} PnL {pnl:+.1%} · {exit_tag}",
+        dict(address=p["address"], chain=p.get("chain", "sol"), size_sol=sell_size, pnl=pnl, usd_notional=usd_notional,
+             auto=bool(p.get("auto")), exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
+    p["size_sol"] = round(p["size_sol"] - sell_size, 6)
+    p["tp1_done"] = True
+    p["peak_price"] = p.get("cur_price", p.get("entry_price", 0.0))   # 从此刻开始追踪移动止损
     save_positions()
     return dict(ok=True, symbol=p["symbol"])
 
@@ -1778,6 +2018,9 @@ class ChainIn(BaseModel):
 class ModeIn(BaseModel):
     mode: str                # "LIVE" | "SHADOW"
 
+class AutoTradeIn(BaseModel):
+    enabled: bool             # SHADOW-only 自动交易开关
+
 class WalletIn(BaseModel):
     chain: str = "sol"
     address: str
@@ -1798,7 +2041,7 @@ def api_status():
     return dict(live_adapter=ST.is_live_adapter, chain=ST.chain, mode=ST.mode,
                 has_key=bool(load_env().get("GMGN_API_KEY")),
                 trading_locked=LIVE_TRADING_DISABLED, public_demo=PUBLIC_DEMO,
-                trending_cmd=ST.get_trending_cmd(ST.chain))
+                trending_cmd=ST.get_trending_cmd(ST.chain), auto_trade=ST.auto_trade)
 
 @app.post("/api/config")
 def api_config(cfg: ConfigIn):
@@ -1817,12 +2060,15 @@ def api_config(cfg: ConfigIn):
         # 安全护栏：LIVE_TRADING_DISABLED 为真时，即使请求 LIVE 也强制 SHADOW（绝不上链）
         want_live = cfg.mode.upper() == "LIVE"
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
+        if ST.mode != "SHADOW" and ST.auto_trade:    # 自动交易仅 SHADOW；离开 SHADOW 就可见地关掉
+            ST.auto_trade = False
+            log("AUTO_TOGGLE", "-", "mode 离开 SHADOW → auto_trade 自动关闭")
         try:
             ST.use_live()      # 配了 key 即走真实数据适配器（按链按需建，只读真实行情）
         except Exception:
             pass               # gmgn-cli 未装时退回 Mock，仍可联调
     return dict(ok=True, mode=ST.mode, live_adapter=ST.is_live_adapter,
-                trading_locked=LIVE_TRADING_DISABLED)
+                trading_locked=LIVE_TRADING_DISABLED, auto_trade=ST.auto_trade)
 
 @app.post("/api/mode")
 def api_mode(m: ModeIn):
@@ -1831,7 +2077,26 @@ def api_mode(m: ModeIn):
     want_live = m.mode.upper() == "LIVE"
     with ST.lock:
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
-    return dict(ok=True, mode=ST.mode, trading_locked=LIVE_TRADING_DISABLED)
+        if ST.mode != "SHADOW" and ST.auto_trade:    # 自动交易仅 SHADOW；离开 SHADOW 就可见地关掉
+            ST.auto_trade = False
+            log("AUTO_TOGGLE", "-", "mode 离开 SHADOW → auto_trade 自动关闭")
+    return dict(ok=True, mode=ST.mode, trading_locked=LIVE_TRADING_DISABLED, auto_trade=ST.auto_trade)
+
+@app.post("/api/auto_trade")
+def api_auto_trade(a: AutoTradeIn):
+    """SHADOW-only 自动交易开关（右上角新增的小拨钮）。LIVE 模式下请求打开会被拒绝生效。"""
+    _block_if_public()
+    with ST.lock:
+        ST.auto_trade = bool(a.enabled) and ST.mode == "SHADOW"
+        log("AUTO_TOGGLE", "-", f"auto_trade={ST.auto_trade}")
+    return dict(ok=True, auto_trade=ST.auto_trade, mode=ST.mode)
+
+@app.get("/api/stats/auto")
+def api_stats_auto():
+    """自动交易统计：按信号分组的胜率/PnL，供前端统计卡片用。持仓不对外（同 §7 约定），公开演示模式不可读。"""
+    if PUBLIC_DEMO:
+        raise HTTPException(403, "公开演示不展示本机自动交易统计")
+    return JSONResponse(compute_auto_stats())
 
 @app.post("/api/chain")
 def api_chain(c: ChainIn):

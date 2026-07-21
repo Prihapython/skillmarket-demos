@@ -75,6 +75,12 @@ body.publicro #escCard{display:none !important}
 .langbtn:hover{border-color:var(--lime);color:var(--lime)}
 .pill.mode.clk{cursor:pointer;transition:border-color .15s}
 .pill.mode.clk:hover{border-color:var(--lime)}
+.pill.auto{cursor:pointer;transition:border-color .15s,opacity .15s}
+.pill.auto:hover{border-color:var(--lime)}
+.pill.auto.on{border-color:var(--lime);background:#9ee14a12}
+.pill.auto.on .v{color:var(--lime)}
+.pill.auto.disabled{opacity:.4;cursor:not-allowed}
+.autob{display:inline-flex;align-items:center;gap:3px;color:var(--lime);font-size:8px;font-weight:700;margin-left:5px;border:1px solid #9ee14a44;background:#9ee14a14;border-radius:4px;padding:1px 4px;vertical-align:middle;cursor:help}
 
 /* KPI */
 .kpis{display:grid;grid-template-columns:repeat(7,1fr);gap:11px;flex-shrink:0}
@@ -95,12 +101,6 @@ body.publicro #escCard{display:none !important}
 .card>h3{font-family:var(--disp);font-weight:700;font-size:12.5px;display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);color:var(--paper2);flex-shrink:0;letter-spacing:.01em}
 .card>h3 svg{width:14px;height:14px;color:var(--lime)}
 .card>h3 .scanning{margin-left:auto;font-size:9.5px;color:var(--lime);letter-spacing:.14em;opacity:0;transition:.2s}
-.logwrap>h3 .logtog{margin-left:auto;width:24px;height:24px;border-radius:7px;border:1px solid var(--line);color:var(--dim);display:grid;place-items:center;cursor:pointer;transition:.15s;flex-shrink:0}
-.logwrap>h3 .logtog:hover{border-color:var(--lime);color:var(--lime)}
-.logwrap>h3 .logtog svg{width:14px;height:14px;transition:transform .18s}
-.logwrap.collapsed>h3 .logtog svg{transform:rotate(180deg)}
-.logwrap.collapsed>.body{display:none}
-.logwrap.collapsed{flex:0 0 auto;height:auto}   /* 覆盖固定 166px：收起后只剩标题，高度归零给筛选结果 */
 .amt-wrap{margin-left:12px;display:flex;align-items:center;gap:5px;font-weight:400;flex-shrink:0}
 .amt-lbl{font-family:var(--mono);font-size:9px;color:var(--dim2);letter-spacing:.05em}
 .amt-in{width:58px;height:22px;background:var(--ink);border:1px solid var(--line);color:var(--paper);border-radius:6px;padding:0 7px;font-family:var(--mono);font-size:11px}
@@ -228,21 +228,29 @@ td{padding:5px 10px;vertical-align:middle}
 .fn .track i.ml{background:linear-gradient(90deg,#4a7,var(--teal))}
 .fn .track .kil{position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:9px;color:var(--clay);font-weight:600}
 .fn .n{text-align:right;font-weight:700;font-family:var(--disp)}
-.riskmini{border-top:1px solid var(--line);padding:11px 15px;display:flex;flex-direction:column;gap:9px}
+.riskmini{padding:11px 15px;display:flex;flex-direction:column;gap:9px}
 .rkrow .h{display:flex;justify-content:space-between;font-size:10px;margin-bottom:5px}
 .rkrow .h span{color:var(--dim)}.rkrow .h b.hot{color:var(--clay)}
 .rkrow .t{height:6px;border-radius:4px;background:var(--ink);border:1px solid var(--line);overflow:hidden}
 .rkrow .t i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,var(--lime-d),var(--lime));width:0;transition:width 1s cubic-bezier(.2,.7,.3,1)}
 .rkrow .t i.hot{background:linear-gradient(90deg,#a44,var(--clay))}
 
-/* log */
-.logwrap{height:166px;flex-shrink:0}
-.logfeed{font-size:11.5px;padding:6px 10px}
-.lg{display:grid;grid-template-columns:90px 64px 104px 1fr;gap:10px;align-items:center;padding:4px 6px;border-radius:6px;animation:slidein .35s ease}
-.lg:hover{background:var(--panel)}
-@keyframes slidein{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
-.lg .ts{color:var(--dim2)}.lg .a{font-weight:700;letter-spacing:.05em}
-.lg .s{color:var(--paper);font-weight:600}.lg .r{color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* auto-trade stats：现在是左列独立大卡片（同筛选结果表同宽），逐笔成交列一张真表，点行开该币 GMGN 图表分析 */
+.autostats-hd{display:flex;align-items:baseline;gap:14px;padding:9px 14px;border-bottom:1px solid var(--line);font-size:11px;color:var(--dim);flex-shrink:0}
+.autostats-hd b{font-family:var(--disp);font-size:14px;letter-spacing:0}
+.autostats-hd b.up{color:var(--lime)}.autostats-hd b.dn{color:var(--clay)}
+.astable{width:100%;border-collapse:collapse}
+.astable td{padding:7px 14px;font-size:11.5px;border-bottom:1px solid var(--line)}
+.astable tr{cursor:pointer}
+.astable tr:hover td{background:var(--panel)}
+.astable .sym{color:var(--paper2);font-weight:700}
+.astable .addr{color:var(--dim2);font-size:9.5px;margin-left:6px}
+.astable .tag{color:var(--dim)}
+.astable .pnl{font-weight:700;font-family:var(--disp);text-align:right;white-space:nowrap}
+.astable .pnl.up{color:var(--lime)}.astable .pnl.dn{color:var(--clay)}
+.partialb{display:inline-flex;align-items:center;margin-left:6px;color:var(--amber);font-size:8px;font-weight:700;border:1px solid #f0a93b44;background:#f0a93b14;border-radius:4px;padding:1px 4px;vertical-align:middle}
+.autostats .empty{color:var(--dim2);padding:1px 0}
+
 ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--line2);border-radius:6px}::-webkit-scrollbar-track{background:transparent}
 
 /* modal */
@@ -414,8 +422,8 @@ td{padding:5px 10px;vertical-align:middle}
           <div data-ch="robinhood" onclick="switchChain('robinhood')">Robinhood</div>
         </div>
       </div>
-      <div class="pill"><div><span class="k">P50 LAT</span><span class="v" id="lat">182ms</span></div></div>
       <div class="pill mode clk" id="modePillWrap" onclick="toggleMode()" data-i18n-title="mode_toggle_title"><span class="dot" id="modeDot" style="background:var(--amber)"></span><div><span class="k">MODE</span><span class="v" id="modePill">模拟盘</span></div></div>
+      <div class="pill auto" id="autoPillWrap" onclick="toggleAuto()" data-i18n-title="auto_toggle_title"><span class="dot" id="autoDot" style="background:var(--dim2)"></span><div><span class="k">AUTO</span><span class="v" id="autoPill" data-i18n="auto_off">关闭</span></div></div>
       <div class="seg2"><button id="srcDemo" class="on" onclick="setSource('demo')">DEMO</button><button id="srcBe" onclick="setSource('backend')" data-i18n="src_backend">本地后端</button></div>
       <div class="langbtn" id="langBtn" data-i18n-title="lang_title" onclick="switchLang()">中文</div>
       <div class="gear" id="gearBtn" data-i18n-title="gear_title"></div>
@@ -427,7 +435,7 @@ td{padding:5px 10px;vertical-align:middle}
 
   <div class="grid">
     <div class="col">
-      <div class="card" style="flex:1">
+      <div class="card" style="flex:1.6">
         <h3 id="ic-pipe"><span data-i18n="pipe_h3">筛选结果 · 待你决策</span><span class="scanning" id="scanning" data-i18n="scanning">◢ 扫描中…</span><span class="amt-wrap" data-i18n-title="amt_title"><span class="amt-lbl" data-i18n="amt_lbl">买入</span><input id="amtInput" class="amt-in" type="number" step="0.01" min="0" value="0.01" oninput="onAmt(this)"><span class="amt-lbl" id="amtUnit">SOL</span></span><span class="h3gear" id="pipeGear" data-i18n-title="pipegear_title"></span></h3>
         <div class="body">
           <table>
@@ -439,20 +447,18 @@ td{padding:5px 10px;vertical-align:middle}
         </div>
         <div class="detail" id="detail"></div>
       </div>
-      <div class="card logwrap">
-        <h3 id="ic-log"><span data-i18n="log_h3">实时决策日志 · trade_decisions.jsonl</span><span class="logtog" id="logTog" data-i18n-title="logtog_title"></span></h3>
-        <div class="body logfeed" id="logfeed"></div>
+      <div class="card" style="flex:1" id="autoStatsCard">
+        <h3 id="ic-autostats"><span data-i18n="stats_h3">自动交易统计</span> <span class="cnt" id="autoStatsCnt"></span></h3>
+        <div class="body" id="autostats"></div>
       </div>
     </div>
 
     <div class="col">
-      <div class="card" style="flex:1.1" id="escCard">
+      <div class="card" style="flex:1;min-height:170px" id="escCard">
         <h3 id="ic-esc"><span data-i18n="esc_h3">持仓逃生监控</span> <span class="cnt" id="escCnt"></span></h3>
         <div class="body" id="positions"></div>
       </div>
-      <div class="card">
-        <h3 id="ic-funnel"><span data-i18n="funnel_h3">闸门漏斗 · </span><span id="funnelSub"></span></h3>
-        <div class="funnel" id="funnel"></div>
+      <div class="card" style="flex:0 0 auto">
         <div class="riskmini" id="riskmini"></div>
       </div>
     </div>
@@ -538,7 +544,7 @@ const I18N={
     tag:'确定性规则抓全 · ML 砍狠 · LLM 只解释幸存者 · 你按下成交',
     mode_tip:'成交模式　|　模拟盘：买卖只记录、不上链（当前锁定，先感受用）；实盘：经签名密钥真实成交、动用资金',
     gear_title:'配置凭据',
-    lang_title:'中文 / English',
+    lang_title:'中文 / English / Українська',
     chain_title:'点击切换链',
     src_backend:'本地后端',
     pipe_h3:'筛选结果 · 待你决策',
@@ -548,7 +554,7 @@ const I18N={
     pipegear_title:'热榜命令 / 轮询间隔',
     th_token:'TOKEN', th_pipe:'规则→排序→LLM', th_safe:'安全', th_bund:'捆绑', th_dev:'DEV', th_t10:'前10', th_smart:'聪明钱/KOL', th_devhist:'DEV评分', th_timing:'时机', th_pri:'优先级', th_dec:'决策',
     log_h3:'实时决策日志 · trade_decisions.jsonl',
-    logtog_title:'展开 / 收起',
+    funneltog_title:'展开 / 收起',
     esc_h3:'持仓逃生监控',
     funnel_h3:'闸门漏斗 · ',
     cfg_h2:'配置 · GMGN 凭据',
@@ -680,6 +686,23 @@ const I18N={
     buy_log_reason:(live,size,exit)=>`${live?'LIVE 真实成交 ':'SHADOW 记录 '}${size} SOL · ${exit}`,
     toast_buy_fail:(m)=>`下单失败：${m}`, buy_ordering:'下单中…',
     toast_trade_locked:'链上交易已锁（LIVE_TRADING_DISABLED），无法切到 LIVE。后端始终走 SHADOW。',
+    auto_on:'已开启', auto_off:'关闭',
+    auto_toggle_title:'自动交易（仅 SHADOW）：按信号自动开 $20 纸面仓位 + 三段式自动离场（部分止盈→保本→移动止损/止盈）',
+    auto_disabled_title:'自动交易仅支持 SHADOW，请先切回模拟盘',
+    confirm_auto_title:'开启自动交易（SHADOW）',
+    confirm_auto_msg:'开启后，通过全部闸门的信号会<b>自动</b>以 $20 名义仓位开纸面仓（不会真实上链），三段式离场：① 涨 +30% 自动卖一半锁定利润，剩余止损上移到保本价（此后不可能再亏钱）；② 剩余仓位用移动止损 25% + 硬止盈 +150% 管理；③ 部分止盈前若跌 -35% 触发初始止损全仓离场。任何阶段命中逃生信号都立即全仓离场。仅在 SHADOW 生效，切到 LIVE 会自动关闭。<br>确定开启吗？',
+    toast_auto_on:'自动交易已开启（SHADOW · $20/单）', toast_auto_off:'自动交易已关闭', toast_auto_fail:(m)=>`切换失败：${m}`,
+    toast_auto_live_only:'自动交易仅支持 SHADOW，请先切回模拟盘',
+    toast_auto_reverted:'后端已自动关闭自动交易（可能切到了 LIVE 或重启过）。',
+    auto_pos_tip:'该持仓由自动交易开仓（$20 纸面仓位），按代码规则自动管理止损/止盈',
+    auto_armed:'已部分止盈·保本+移动止损',
+    auto_row_tip:'点击在 GMGN 打开该币图表',
+    partial_lbl:'部分',
+    stats_h3:'自动交易统计', stats_none:'暂无已平仓的自动交易',
+    stats_total:(n)=>`${n} 笔`, stats_winrate:'胜率', stats_pnl:'累计 PnL',
+    stats_by_exit:'按离场方式', stats_by_conv:'按 LLM 置信度', stats_by_dev:'按 Dev 评分',
+    exit_AUTO_SL:'止损', exit_AUTO_TP:'止盈', exit_AUTO_TRAIL:'移动止损', exit_AUTO_ESCAPE:'逃生信号', exit_unknown:'—',
+    exit_AUTO_TP1_PARTIAL:'部分止盈+30%', exit_AUTO_TP2:'最终止盈+150%', exit_AUTO_TRAIL_BE:'保本/移动止损',
     sell_title:(sym)=>`平仓 ${sym}`,
     sell_msg:(sym,size,esc)=>`平仓 <b>${sym}</b>（${size} SOL）？`+(esc?'<br><span style="color:var(--clay)">⚠ 已触发逃生信号，建议立即平仓。</span>':'')+'<br><span style="color:var(--dim2);font-size:11.5px">SHADOW 模式下仅记录、不真实发单。</span>',
     toast_sell_sent:(sym)=>`已发送平仓 ${sym}`, toast_sell_fail:(m)=>`平仓失败：${m}`,
@@ -701,7 +724,7 @@ const I18N={
     tag:'Deterministic rules cast wide · ML cuts hard · LLM only explains survivors · you press to trade',
     mode_tip:'Trade mode　|　Shadow: trades recorded only, never on-chain (locked for now, just to feel it); Live: real settlement via signing key, real funds',
     gear_title:'Configure credentials',
-    lang_title:'中文 / English',
+    lang_title:'中文 / English / Українська',
     chain_title:'Click to switch chain',
     src_backend:'Local backend',
     pipe_h3:'Screening Results · Awaiting Your Call',
@@ -711,7 +734,7 @@ const I18N={
     pipegear_title:'Trending command / poll interval',
     th_token:'TOKEN', th_pipe:'RULE→RANK→LLM', th_safe:'SAFE', th_bund:'BUND', th_dev:'DEV', th_t10:'T10', th_smart:'SMART/KOL', th_devhist:'DEV Score', th_timing:'TIMING', th_pri:'PRIORITY', th_dec:'DECISION',
     log_h3:'Live Decision Log · trade_decisions.jsonl',
-    logtog_title:'Expand / collapse',
+    funneltog_title:'Expand / collapse',
     esc_h3:'Position Escape Monitor',
     funnel_h3:'Gate Funnel · ',
     cfg_h2:'Configure · GMGN Credentials',
@@ -843,6 +866,23 @@ const I18N={
     buy_log_reason:(live,size,exit)=>`${live?'LIVE filled ':'SHADOW logged '}${size} SOL · ${exit}`,
     toast_buy_fail:(m)=>`Order failed: ${m}`, buy_ordering:'Placing order…',
     toast_trade_locked:'On-chain trading is locked (LIVE_TRADING_DISABLED); cannot switch to LIVE. The backend always runs SHADOW.',
+    auto_on:'ON', auto_off:'OFF',
+    auto_toggle_title:'Auto-trade (SHADOW only): auto-opens $20 paper positions on signal + 3-stage exit (partial TP → breakeven → trailing/final TP)',
+    auto_disabled_title:'Auto-trade only works in SHADOW — switch back first',
+    confirm_auto_title:'Enable auto-trade (SHADOW)',
+    confirm_auto_msg:'Once enabled, any signal that clears every gate will <b>automatically</b> open a $20 paper position (never on-chain), with a 3-stage exit: ① at +30% auto-sell half to lock in profit, stop on the rest moves up to breakeven (this trade can never turn into a loss after that); ② the rest is managed with a 25% trailing stop + hard +150% take-profit; ③ before the partial TP, a -35% drop triggers an initial stop-loss on the full position. An escape signal at any stage closes the full position immediately. Only active in SHADOW; switching to LIVE disables it automatically.<br>Enable it?',
+    toast_auto_on:'Auto-trade enabled (SHADOW · $20/trade)', toast_auto_off:'Auto-trade disabled', toast_auto_fail:(m)=>`Toggle failed: ${m}`,
+    toast_auto_live_only:'Auto-trade only works in SHADOW — switch back first',
+    toast_auto_reverted:'Backend auto-disabled auto-trade (likely switched to LIVE or restarted).',
+    auto_pos_tip:'Opened by the auto-trade bot ($20 paper position); managed automatically per its stop/TP rules',
+    auto_armed:'partial TP done · breakeven+trailing',
+    auto_row_tip:'Click to open this token\'s chart on GMGN',
+    partial_lbl:'partial',
+    stats_h3:'Auto-trade stats', stats_none:'No closed auto-trades yet',
+    stats_total:(n)=>`${n} trades`, stats_winrate:'win rate', stats_pnl:'total PnL',
+    stats_by_exit:'By exit reason', stats_by_conv:'By LLM conviction', stats_by_dev:'By dev score',
+    exit_AUTO_SL:'stop-loss', exit_AUTO_TP:'take-profit', exit_AUTO_TRAIL:'trailing stop', exit_AUTO_ESCAPE:'escape signal', exit_unknown:'—',
+    exit_AUTO_TP1_PARTIAL:'partial TP +30%', exit_AUTO_TP2:'final TP +150%', exit_AUTO_TRAIL_BE:'breakeven/trailing stop',
     sell_title:(sym)=>`Close ${sym}`,
     sell_msg:(sym,size,esc)=>`Close <b>${sym}</b> (${size} SOL)?`+(esc?'<br><span style="color:var(--clay)">⚠ Escape signal triggered, close now.</span>':'')+'<br><span style="color:var(--dim2);font-size:11.5px">In SHADOW, records only, no real order.</span>',
     toast_sell_sent:(sym)=>`Sell sent ${sym}`, toast_sell_fail:(m)=>`Close failed: ${m}`,
@@ -852,13 +892,195 @@ const I18N={
     toast_unmon:(sym)=>`Stopped monitoring ${sym}`, toast_unmon_fail:(m)=>`Stop failed: ${m}`,
     toast_copied:(tk)=>`Copied ${tk}`, toast_copy_fail:'Copy failed',
     toast_connected:(l)=>`Connected to local backend (${l})`,
+  },
+  uk:{
+    title:'AI Trader - автоскринінг, купівля в один клік, моніторинг позицій',
+    tab_token:'Скринінг токенів', tab_wallet:'Оцінка гаманця',
+    wlt_ph:'Вставте адресу гаманця (поточний ланцюг)… можна оцінювати і трейдерські, і dev-гаманці', wlt_go:'Оцінити',
+    wlt_empty:'Введіть адресу гаманця → стиль торгівлі · реальний скор результатів · оцінка «можна копіювати» · бектест копітрейдингу · репутація dev',
+    demobar:'⚠ <b>Демо-режим</b> · приклад даних, <b>не офіційна торгова функція GMGN, не є інвестиційною порадою</b> · для реальних ончейн-даних клонуйте код і запустіть локально (свій API-ключ; угоди виконуються лише на вашій машині) · <a href="https://github.com/GMGNAI/skillmarket-demos/blob/main/aitrader/README.en.md" target="_blank" rel="noopener" style="color:var(--lime);font-weight:600">Дивитись код ↗</a>',
+    publicbar:'● <b>Реальні дані наживо · лише перегляд</b> · реальні результати ончейн-скринінгу, <b>не є інвестиційною порадою</b> · тут лише перегляд — без ордерів, без зміни налаштувань; щоб торгувати самостійно, клонуйте код і запустіть локально (свій API-ключ)',
+    h1_suffix:'Скринінг + купівля в один клік',
+    tag:'Детерміновані правила відсіюють широко · ML ріже жорстко · LLM лише пояснює тих, хто вижив · ви натискаєте на угоду',
+    mode_tip:'Режим торгівлі　|　Shadow: угоди лише записуються, ніколи не йдуть ончейн (зараз заблоковано, щоб просто відчути); Live: реальний розрахунок через ключ підпису, реальні кошти',
+    gear_title:'Налаштувати ключі',
+    lang_title:'中文 / English / Українська',
+    chain_title:'Клік — перемкнути ланцюг',
+    src_backend:'Локальний бекенд',
+    pipe_h3:'Результати скринінгу · Чекають вашого рішення',
+    scanning:'◢ Сканування…',
+    amt_title:'Сума купівлі (нативний токен); зміна тут синхронізує всі кнопки купівлі нижче',
+    amt_lbl:'КУПИТИ',
+    pipegear_title:'Команда хайп-листа / інтервал опитування',
+    th_token:'ТОКЕН', th_pipe:'ПРАВИЛА→РЕЙТИНГ→LLM', th_safe:'БЕЗПЕКА', th_bund:'БАНДЛ', th_dev:'DEV', th_t10:'T10', th_smart:'SMART/KOL', th_devhist:'DEV-скор', th_timing:'МОМЕНТ', th_pri:'ПРІОРИТЕТ', th_dec:'РІШЕННЯ',
+    log_h3:'Журнал рішень наживо · trade_decisions.jsonl',
+    funneltog_title:'Розгорнути / згорнути',
+    esc_h3:'Моніторинг втечі з позицій',
+    funnel_h3:'Вирва воріт · ',
+    cfg_h2:'Налаштування · Ключі GMGN',
+    cfg_apikey_ph:'Залиште порожнім = використати наявний ключ з ~/.config/gmgn/.env',
+    cfg_apikey_hint:'Потрібен для автентифікації запитів OpenAPI. Вже налаштовано? Не треба вводити повторно — при оновленні сторінки автопідключення за ключем з env.',
+    cfg_signkey_label:'GMGN SIGNING KEY · ключ підпису запитів',
+    cfg_signkey_hint:'Ed25519-ключ підпису, це НЕ приватний ключ гаманця; надсилається лише на локальний бекенд',
+    cfg_mode_label:'Режим торгівлі',
+    cfg_mode_hint:'Ланцюг перемикається у CHAIN справа вгорі (зберігається в браузері, не в файл)',
+    cfg_mwarn:'⚠ Обидва ключі надсилаються лише на ваш локальний бекенд (127.0.0.1) — вони ніколи не покидають вашу машину і не потрапляють у сховище браузера. У SHADOW «купівля/продаж в один клік» лише пишеться в журнал; перемкніть на LIVE для реального розрахунку через ключ підпису.',
+    cfg_save:'Зберегти на локальний бекенд',
+    btn_close:'Закрити', btn_cancel:'Скасувати',
+    pipe_h2:'Налаштування скринінгу · Команда хайп-листа / опитування',
+    pipe_cmd_label:'Команда GMGN-CLI для хайп-листа',
+    pipe_cmd_hint:'Повна команда, що виконується щосканування; має починатись з <code>gmgn-cli market trending</code>, <code>--raw</code> додається автоматично. Налаштовуйте --limit / --interval / --order-by / --filter / --chain.',
+    pipe_poll_label:'Інтервал опитування (секунди)',
+    pipe_poll_hint:'Як часто фронтенд викликає /api/run. Рекомендовано ≥30с для економії квоти; для першого враження можна коротше.',
+    pipe_mwarn:'⚠ Команда виконується на вашому локальному бекенді (127.0.0.1), лише команди хайп-листа. Діє одразу після збереження: команда — з наступного раунду, інтервал — миттєво.',
+    pipe_save:'Зберегти й застосувати зараз', pipe_reset:'Відновити команду за замовчуванням',
+    pipe_reset_btn:'↺ Скинути', pipe_reset_btn_title:'Скинути команду хайп-листа цього ланцюга до дефолту (зберігається на сервері)',
+    toast_reset_done:'Фільтри відновлено до дефолту', toast_reset_fail:(m)=>`Скидання не вдалось: ${m}`,
+    buy_h2:'Купівля в один клік · ',
+    buy_size_label:'Сума купівлі (порахована кодом за методом фіксованої частки; можна змінити)',
+    buy_size_hint:'Розмір = сума ризику / відстань до стопу. LLM ніколи не задає число.',
+    buy_confirm:'Підтвердити купівлю',
+    confirm_title:'Підтвердження', confirm_ok:'Підтвердити',
+    tokf_on:'Увімкнено: показує лише токени, які зараз у портфелі · клік — показати всі',
+    tokf_off:'Клік: показати лише токени в портфелі (ті, що вже в моніторингу втечі)',
+    gate0:'Скан', gate1:'Безпека', gate2:'Консенсус', gate3:'ML-рейтинг', gate4:'LLM', gate5:'Очікує',
+    gatetip0:'Кандидати з хайп-листа; тут проходять усі токени',
+    gatetip1:'Жорсткі ворота: honeypot / відмова від права допемісії / податок на купівлю-продаж / % бандлерів / % холдингу dev / концентрація топ10',
+    gatetip2:'«Розумні гроші» (smart_degen) + відомі KOL (renowned) — сума ≥ порогу',
+    gatetip3:'Ранжування за пріоритет-скором; в LLM йдуть лише найкращі (ріже обсяг, відповідає ML-рейтингу з документації)',
+    gatetip4:'LLM лише пояснює тих, хто вижив: pass / watch / reject + впевненість',
+    gatetip5:'Пройшов усі ворота; розмір вже пораховано кодом, чекає на вашу кнопку «Купити»',
+    gate_self:'Цей токен: ', gst_pass:'пройшов', gst_fail:'✗ вибув тут', gst_skip:'не дійшов',
+    crowd_early:'Рано', crowd_crowded:'Флет', crowd_late:'Перегрів', crowd_fading:'Згасання',
+    crowdtip_early:'Ранній ріст: і 5хв, і 1год у плюсі, момент лише починається — ідеальна точка входу за трендом',
+    crowdtip_crowded:'Флет / рваний момент: тренд неясний, варто почекати',
+    crowdtip_late:'Ризик догону: 1год вже виріс >300%, можливо, близько до піку',
+    crowdtip_fading:'Згасання: і 1год, і 5хв у мінусі, тренд вниз (LLM відхилив)',
+    crowd_none_tip:'Не дійшов до етапу LLM (відсіяно раніше)',
+    timing_label:'Момент входу',
+    llmtip_pass:'Пройшов: момент вгору, покупці домінують — додано в чергу', llmtip_watch:'Спостерігати: момент/купівля недостатньо сильні, нижче лінії входу', llmtip_reject:'Відхилено: згасання або не відповідає умовам тренду',
+    llm_none_tip:'Етап LLM　|　не дійшов до LLM (відсіяно раніше)',
+    smc_tip:(degen,kol,smc)=>`Розумні гроші/KOL　|　${degen} smart_degen / ${kol} відомих KOL, разом ${smc}`,
+    dev_good:'ДОБРЕ', dev_mid:'ОК', dev_weak:'СЛАБКО',
+    reskin_tag:'ПЕРЕШКІРКА', reskin_tip:'Повторний реліз під новою «шкіркою»: цей dev перевикористовує один і той же логотип у СВОЇХ токенах (той самий сценарій знову). Рахується лише історія релізів самого dev — виключає крадіжку картинки іншими; зміна імені в Twitter не враховується',
+    dev_rep_label:'Репутація dev', dev_trust:'довіра ✓', dev_distrust:'недовіра ⛔',
+    dev_k_launches:'випущено', dev_k_rug:'ругнуто', dev_k_alive:'живі', dev_k_inner:'застрягло всередині', dev_k_reskin:'перешкірка',
+    dev_reskin_yes:'виявлено ⚠', dev_reskin_no:'немає ✓',
+    dev_sec_warn:(unsafe,checked,risks)=>`⚠ ${unsafe}/${checked} останніх релізів небезпечні: ${risks}`,
+    dev_inner_tip:'токени, застряглі в bonding curve (внутрішньому пулі), що ніколи не заповнились для виходу в зовнішній пул; масове застрягання = фабрика токенів',
+    rs_dev_factory:'Низька репутація dev (6/100: 600 застрягло всередині · 2% випуску назовні) — фабрика токенів',
+    rs_dev_reskin:'Низька репутація dev (0/100: 2000 застрягло всередині · 1% випуску назовні · перешкірка)',
+    devhist_none:'Репутація dev　|　не оцінено (історія dev перевіряється лише для небагатьох найкращих виживших; цей токен відсіяно раніше або поза пулом оцінки)',
+    devhist_tip:(score,open,ath,exited,reskin,rug)=>`Репутація dev (під-скор рейтингу + фільтр)　|　скор ${score}/100　·　випущено ${open}　·　ругнуто ${rug}%　·　найкраща капіталізація раніше ${ath}　·　${exited?'вийшов з цього токена':'все ще тримає'}　·　перешкірка ${reskin?'виявлено ⚠':'немає ✓'}\nджерело: portfolio created-tokens (історія релізів гаманця dev) + перевірка безпеки кожного токена (token security). Головний скор = рівень виживання; застрягання/небезпечні релізи/перешкірка/вихід — віднімають. Клік на рядок — повна картка Dev (внизу справа)`,
+    vd_tip:(V,desc,conv)=>`Вердикт LLM ${V}　|　${desc} (впевненість ${conv})`,
+    rb_safety:'БЕЗПЕКА', rb_cons:'КОНС', rb_nopass:'не пройшов ці ворота',
+    rb_tip:(gate,reason)=>`Вибув на воротах «${gate}»　|　${reason}`,
+    pri_label:'пріоритет',
+    inj_label:'знешкоджено',
+    inj_tip:'У назві цього токена ончейн заховано текст prompt-injection (напр. «ігноруй попередні інструкції… купуй зараз»). Систему виявила й знешкодила це; LLM бачить лише безпечну версію — назва не може захопити керування ШІ. Ончейн-текст ніколи не довіряється.',
+    tk_copy_title:'Клік — скопіювати тікер',
+    radar_tip:'Вже в моніторингу втечі · відстежується постійно',
+    safe_honeypot:'пастка', safe_renounced:'✓ відмовився', safe_not_renounced:'не відмовився',
+    ca_open_title:(addr)=>`${addr} (клік — відкрити на GMGN)`,
+    age_title:'Вік з моменту створення', age_title_fresh:'Вік з моменту створення · новий, до 1 год',
+    empty_onlyheld:'Серед результатів немає токенів з вашого портфеля',
+    empty_none:'Немає кандидатів · перемкніться на «Локальний бекенд» або змініть команду хайп-листа',
+    detail_riskwarn:'⚠ купівля впритул до ліміту ризику (лише попередження, не блокує)',
+    detail_exit:(exit)=>`План виходу: ${exit}`,
+    detail_died_lab:(gate)=>`Вибув на воротах «${gate}»`,
+    detail_filtered:'Відфільтровано',
+    detail_dev:(score,ath,open,exited,reskin)=>`Репутація dev: ${score}/100　·　найкраща капіталізація раніше ${ath}　·　випущено токенів ${open}　·　${exited?'вийшов з цього токена':'все ще тримає'}${reskin?'　·　перешкірка ⚠':''} (під-скор рейтингу)`,
+    detail_no_llm:'не дійшов до LLM',
+    detail_llm_note:(s)=>`LLM лише пояснює тих, хто вижив (${s}); угоду підтверджуєте ви.`,
+    sev_escape:'ВТЕЧА', sev_high:'Високий ризик', sev_watch:'Спостерігати', sev_stable:'Стабільно',
+    esc_cnt:(n,max,al)=>`${n}/${max} у портфелі${al?` · ${al} тривог`:''}`,
+    pos_empty:'Позицій ще немає.<br>Після кліку «Купити» на результаті зліва,<br>позиції з\'являться тут і будуть у реальному часі перевірятись на сигнали втечі.',
+    pos_price:(price,entry)=>`Зараз ${price} · Вхід ${entry}`,
+    escbtn_now:'Продати зараз', escbtn:'Закрити',
+    unmon_btn_title:'Зупинити моніторинг (без продажу, лише прибрати зі списку)',
+    funnel_sub:(N,act)=>`${N} на вході · ${act} очікує`,
+    risk_open:'Відкриті позиції', risk_expo:'Загальна експозиція', risk_loss:'Денний збиток', risk_streak:'Серія збитків / kill',
+    log_screen_reason:(size,pri)=>`пройшов ворота · очікує · пропоновано ${size} SOL · пріоритет ${pri}`,
+    kpi_scan:'Всього просканов.', kpi_safety:'Пройшли безпеку', kpi_consensus:'Пройшли консенсус', kpi_pending:'Чекають вас', kpi_pos:'Позиції / ліміт', kpi_escape:'Тривоги втечі', kpi_catch:'Відсів пасток',
+    kpi_sub_scan:(c)=>`${c} раундів · top-N відсів`, kpi_sub_block:(n)=>`заблоковано ${n}`, kpi_sub_pending:'клік — купити', kpi_sub_expo:(e)=>`експозиція ${e} SOL`,
+    kpi_sub_escape_act:'⚠ дійте зараз', kpi_sub_escape_ok:'все стабільно', kpi_catch_sub:'0 пасток пропущено',
+    sig_normal:'позиція під моніторингом, норма',
+    sig_top31:'концентрація топ10 зросла до 31%', sig_top45:'концентрація топ10 зросла до 45%', sig_top58:'концентрація топ10 зросла до 58%',
+    sig_5mweak:'момент 5хв слабшає, тиск продажів росте', sig_mintback:'право допемісії, схоже, повернулось (ризик зливу) ← сигнал втечі',
+    sig_top10sell:'холдери топ10 почали продавати', sig_devout:'відтік з гаманця, пов\'язаного з dev', sig_lppull:'почалось виведення ліквідності LP ← сигнал втечі',
+    alert_lp:'Сигнал втечі: почалось виведення LP, продавайте зараз',
+    exit_full:'SL -35% · TP +60%→продати 40% / +150%→продати 30% · трейлінг 25%',
+    exit_ladder:'SL -35% · драбина TP · трейлінг 25%',
+    th_cleancat:'48 розумних гаманців + 16 відомих KOL присутні; допемісію відкликано, пропозиція ще розпорошена.',
+    th_gooddog:'9 розумних гаманців + 3 KOL накопичують рано; допемісію відкликано, пропозиція розпорошена.',
+    th_basepepe:'Пройшов усі ворота якості; але купівля впритул до ліміту одночасних позицій/експозиції — ризик просить спершу звільнити слот.',
+    rs_latemoon:'LLM визначив як «пізно»: 1год вже +250%, схоже на позицію для утримувачів мішка.',
+    rs_bundled:'Ворота безпеки: бандлери 41% > 30%, холдинг dev 25% > 10%, топ10 55%.',
+    rs_rugpull:'Ворота безпеки: виявлено honeypot, відхилено одразу.',
+    rs_inject:'Ворота консенсусу: розумні гроші+KOL 0 < 1. (prompt-injection у назві знешкоджено)',
+    bk_safety:(iss)=>`Ворота безпеки: ${iss}`,
+    bk_safety_generic:'не пройшов перевірку honeypot / податок / rug / холдинг',
+    bk_consensus:(smc,degen,kol)=>`Ворота консенсусу: розумні гроші+KOL ${smc} замало (degen ${degen} / KOL ${kol})`,
+    bk_rank:'ML-рейтинг: занизький скор, відсіяно',
+    bk_llm_reject:'LLM відхилив',
+    bk_llm_late:'LLM відхилив: пізно (перегрів)',
+    bk_filtered:'Відфільтровано',
+    toast_chain_switched:(l)=>`Перемкнено на ${l}`, toast_chain_fail:(m)=>`Не вдалось перемкнути ланцюг: ${m}`,
+    toast_be_fail:(m)=>`З'єднання з бекендом не вдалось, опитування призупинено: ${m}`,
+    toast_be_switched:'Перемкнено на локальний бекенд: збережіть ключ, щоб почати опитування',
+    pipe_loading:'Завантаження…', pipe_be_off:'Бекенд не підключено; команда доступна лише з локальним бекендом',
+    toast_poll_min:'Інтервал опитування має бути ≥ 1с', saving:'Збереження…',
+    pipe_applied:(s)=>`✓ Застосовано (інтервал ${s}с)`, toast_pipe_saved:'Налаштування скринінгу збережено й застосовано', toast_pipe_fail:(m)=>`Збереження не вдалось: ${m}`,
+    live_lbl_live:'LIVE · один клік = реальна угода!', live_lbl_shadow:'SHADOW · купівля в один клік лише записується', mode_live:'LIVE', mode_shadow:'SHADOW',
+    mode_toggle_title:'Клік — перемкнути Live / Shadow', toast_mode_live:'Перемкнено на LIVE · угоди йдуть реально, реальні кошти', toast_mode_shadow:'Перемкнено на SHADOW · угоди лише записуються, не ончейн', toast_mode_fail:(m)=>`Перемикання не вдалось: ${m}`,
+    confirm_live_title:'Перемкнути на режим LIVE',
+    confirm_live_msg:'Після цього купівля/продаж в один клік буде <b>реально виконуватись через ключ підпису, з реальними коштами</b>.<br>Увімкнути?',
+    toast_need_key:'Спочатку введіть API Key', cfg_saved:'✓ Записано в ~/.config/gmgn/.env', toast_cfg_fail:(m)=>`Збереження не вдалось: бекенд не запущено? (${m})`,
+    buy_exit_html:(exit,thesis)=>`<b>План виходу (виставляється як стратегічні ордери після заповнення)</b><br>${exit}<br><span style="color:var(--dim)">Причина: ${thesis||'—'}</span>`,
+    buy_riskwarn:'⚠ Портфельний ризик: купівля впритул до ліміту одночасних позицій/експозиції. Спершу закрийте позицію або зменшіть суму.',
+    buy_mode_live:'Режим LIVE: після підтвердження ордер піде реально через ключ підпису.', buy_mode_shadow:'Режим SHADOW: після підтвердження лише запишеться намір, реального ордера не буде.',
+    toast_buy:(live,sym,size)=>`${live?'Ордер виставлено ':'Записано (SHADOW) '}${sym} ${size} SOL`,
+    toast_buy_v2:(kind,sym,size,st)=>kind==='sh'?`Записано (SHADOW, не ончейн) ${sym} ${size}`:kind==='live'?`✓ Заповнено ${sym} ${size} · ${st}`:`Подано · очікує (ще не заповнено) ${sym} ${size} · ${st}`,
+    toast_mode_reverted:'Бекенд повернувся до SHADOW (ймовірно, перезапустився): купівля/продаж лише записуються, не ончейн. Для реальних угод перемкніть на LIVE ще раз.',
+    toast_buy_demo:(live,sym,size)=>`${live?'Ордер виставлено ':'Записано (SHADOW) '}${sym} ${size} SOL · додано в моніторинг втечі`,
+    buy_log_reason:(live,size,exit)=>`${live?'LIVE заповнено ':'SHADOW записано '}${size} SOL · ${exit}`,
+    toast_buy_fail:(m)=>`Ордер не вдався: ${m}`, buy_ordering:'Виставлення ордера…',
+    toast_trade_locked:'Ончейн-торгівля заблокована (LIVE_TRADING_DISABLED); перемкнути на LIVE не можна. Бекенд завжди працює в SHADOW.',
+    auto_on:'УВІМК', auto_off:'ВИМК',
+    auto_toggle_title:'Автотрейд (лише SHADOW): автоматично відкриває паперові позиції по $20 за сигналом + триетапний вихід (частковий тейк → беззбиток → трейлінг/фінальний тейк)',
+    auto_disabled_title:'Автотрейд працює лише в SHADOW — спершу перемкніться назад',
+    confirm_auto_title:'Увімкнути автотрейд (SHADOW)',
+    confirm_auto_msg:'Після увімкнення будь-який сигнал, що пройде всі ворота, <b>автоматично</b> відкриє паперову позицію на $20 (ніколи не ончейн), з триетапним виходом: ① на +30% автоматично продає половину, фіксуючи прибуток, стоп на залишок підтягується до беззбитку (після цього угода вже не може стати збитковою); ② залишок ведеться трейлінг-стопом 25% + жорстким тейк-профітом +150%; ③ до часткового тейк-профіту падіння -35% вмикає початковий стоп-лос на всю позицію. Сигнал втечі на будь-якому етапі одразу закриває всю позицію. Діє лише в SHADOW; перемикання на LIVE вимикає автоматично.<br>Увімкнути?',
+    toast_auto_on:'Автотрейд увімкнено (SHADOW · $20/угода)', toast_auto_off:'Автотрейд вимкнено', toast_auto_fail:(m)=>`Перемикання не вдалось: ${m}`,
+    toast_auto_live_only:'Автотрейд працює лише в SHADOW — спершу перемкніться назад',
+    toast_auto_reverted:'Бекенд сам вимкнув автотрейд (ймовірно, перемкнувся на LIVE або перезапустився).',
+    auto_pos_tip:'Відкрито автотрейд-ботом (паперова позиція $20); керується автоматично за його правилами стоп/тейк',
+    auto_armed:'частковий тейк зроблено · беззбиток+трейлінг',
+    auto_row_tip:'Клік — відкрити графік цього токена на GMGN',
+    partial_lbl:'частково',
+    stats_h3:'Статистика автотрейду', stats_none:'Ще немає закритих угод автотрейду',
+    stats_total:(n)=>`${n} угод`, stats_winrate:'вінрейт', stats_pnl:'сумарний PnL',
+    stats_by_exit:'За причиною виходу', stats_by_conv:'За впевненістю LLM', stats_by_dev:'За dev-скором',
+    exit_AUTO_SL:'стоп-лос', exit_AUTO_TP:'тейк-профіт', exit_AUTO_TRAIL:'трейлінг-стоп', exit_AUTO_ESCAPE:'сигнал втечі', exit_unknown:'—',
+    exit_AUTO_TP1_PARTIAL:'частковий тейк +30%', exit_AUTO_TP2:'фінальний тейк +150%', exit_AUTO_TRAIL_BE:'беззбиток/трейлінг',
+    sell_title:(sym)=>`Закрити ${sym}`,
+    sell_msg:(sym,size,esc)=>`Закрити <b>${sym}</b> (${size} SOL)?`+(esc?'<br><span style="color:var(--clay)">⚠ Спрацював сигнал втечі, закрийте зараз.</span>':'')+'<br><span style="color:var(--dim2);font-size:11.5px">У SHADOW лише записується, реального ордера не буде.</span>',
+    toast_sell_sent:(sym)=>`Продаж надіслано ${sym}`, toast_sell_fail:(m)=>`Закриття не вдалось: ${m}`,
+    sell_log:(esc,pnl)=>`${esc?'Продаж-втеча ':'Ручний продаж '}PnL ${pnl}`, toast_sold:(sym)=>`Закрито ${sym}`,
+    unmon_title:(sym)=>`Зупинити моніторинг ${sym}`,
+    unmon_msg:(sym)=>`Прибирає <b>${sym}</b> лише зі списку моніторингу втечі — <b>без продажу, без впливу на ризик</b>.<br><span style="color:var(--dim2);font-size:11.5px">Ви й далі тримаєте цей токен, просто його сигнали втечі більше не відстежуються.</span>`,
+    toast_unmon:(sym)=>`Моніторинг зупинено ${sym}`, toast_unmon_fail:(m)=>`Не вдалось зупинити: ${m}`,
+    toast_copied:(tk)=>`Скопійовано ${tk}`, toast_copy_fail:'Копіювання не вдалось',
+    toast_connected:(l)=>`Підключено до локального бекенду (${l})`,
   }
 };
 function detectLang(){
   const saved=localStorage.getItem('aitrader_lang');
-  if(saved==='zh'||saved==='en')return saved;
+  if(saved==='zh'||saved==='en'||saved==='uk')return saved;
   const nav=(navigator.language||navigator.userLanguage||'').toLowerCase();
-  return nav.indexOf('zh')===0?'zh':'en';   // 简体/繁体(zh-*) → 中文；其他 → 英文
+  if(nav.indexOf('zh')===0)return 'zh';                          // 简体/繁体(zh-*) → 中文
+  if(nav.indexOf('en')===0)return 'en';                          // 英文系统 → English
+  return 'uk';   // 本部署主用户为乌克兰语；其余（含 ru 等未知）默认乌克兰语而非英文
 }
 let lang=detectLang();
 const APP_VERSION='v0.0.1';   // 显示在副标题，方便排查问题；改动前端时一并 bump
@@ -891,7 +1113,7 @@ const fill=n=>`<svg viewBox="0 0 24 24" fill="currentColor" stroke="none">${I[n]
 /* 同源请求：后端(127.0.0.1:8000)托管本页时走相对路径，经隧道访问也回到本机后端；
    仅 file:// 直接打开时回退到本地端口。连不上(纯静态/GitHub Pages)→ 自动 DEMO。 */
 const API=location.protocol==='file:'?"http://127.0.0.1:8000":"";
-let source="demo", bePolling=false, liveMode=false, tradingLocked=false;
+let source="demo", bePolling=false, liveMode=false, tradingLocked=false, autoTrade=false, autoStatsTick=0;
 let pollMs=5600, pollTimer=null, defaultTrendCmd="", curChain="sol", beReady=false, buyAmount=0.01;
 let onlyHeld=false;            // TOKEN 旁警告图标：只看当前持仓的币
 function toggleOnlyHeld(){
@@ -1082,7 +1304,7 @@ function normalize(data){
     loss:p.realized_loss_today??0,lossMax:p.daily_loss_cap??0.5,consec:p.consec_losses??0,consecMax:p.kill_switch_consec??3,killed:p.kill_switch??false};
   const positions=(data.positions||[]).map(q=>({sym:q.symbol||q.sym,addr:(q.address||'').slice(0,8)+'…',address:q.address,
     size:q.size_sol||q.size||0,pnl:q.pnl||0,severity:q.severity||0,escaping:(q.severity||0)>=70,
-    price:q.cur_price||0,entryPrice:q.entry_price||0,
+    price:q.cur_price||0,entryPrice:q.entry_price||0,auto:!!q.auto,tp1Done:!!q.tp1_done,
     sigs:(q.signals||[]).map(s=>typeof s==='string'?{t:s,hot:false}:s)}));
   return {list,risk,positions};
 }
@@ -1090,11 +1312,7 @@ function normalize(data){
 /* ── static icons ── */
 document.getElementById('ic-logo').innerHTML=fill('zap');
 document.getElementById('ic-pipe').insertAdjacentHTML('afterbegin',svg('layers'));
-document.getElementById('ic-log').insertAdjacentHTML('afterbegin',svg('trend'));
-document.getElementById('logTog').innerHTML=svg('chev');
-document.getElementById('logTog').onclick=()=>document.querySelector('.logwrap').classList.toggle('collapsed');
 document.getElementById('ic-esc').insertAdjacentHTML('afterbegin',svg('siren'));
-document.getElementById('ic-funnel').insertAdjacentHTML('afterbegin',svg('target'));
 document.getElementById('ic-cog').innerHTML=svg('cog');
 document.getElementById('ic-buyz').innerHTML=svg('zap');
 document.getElementById('gearBtn').innerHTML=svg('cog');
@@ -1225,8 +1443,9 @@ function renderPositions(){
     let acls=p.escaping?'esc':'';
     if(posIsAlert(p)){acls+=' falert';if(!escAlertSet.has(key)){acls+=' flash';escAlertSet.add(key);}}
     else escAlertSet.delete(key);
+    const autob=p.auto?`<span class="autob has-tip" data-tip="${t2('auto_pos_tip')}">AUTO${p.tp1Done?' · '+t2('auto_armed'):''}</span>`:'';
     return `<div class="pos ${acls}">
-      <div class="top"><div><span class="ps">${p.sym}</span>${caCell(p)}${p.price?`<small class="px">${t('pos_price',fmtPrice(p.price),fmtPrice(p.entryPrice))}</small>`:''}</div>
+      <div class="top"><div><span class="ps">${p.sym}</span>${autob}${caCell(p)}${p.price?`<small class="px">${t('pos_price',fmtPrice(p.price),fmtPrice(p.entryPrice))}</small>`:''}</div>
         <span class="pnl ${p.pnl>=0?'up':'dn'}">${p.pnl>=0?'+':''}${(p.pnl*100).toFixed(1)}%</span>
         <button class="escbtn" onclick="escape_(${i})">${svg('door')}${p.escaping?t('escbtn_now'):t('escbtn')}</button>
         <button class="xbtn" title="${t('unmon_btn_title')}" onclick="unmonitor_(${i})">×</button></div>
@@ -1237,30 +1456,21 @@ function renderPositions(){
 
 /* ── funnel + risk mini ── */
 function renderFunnel(){
-  const N=T.length, act=T.filter(t=>t.status==='action').length;
-  const F=[[gateName(0),'scan',N,0,false],[gateName(1),'shield',passG(1),killAt(1),false],[gateName(2),'users',passG(2),killAt(2),false],
-    [gateName(3),'filter',passG(3),killAt(3),true],[gateName(4),'brain',passG(4),killAt(4),false],[gateName(5),'target',act,0,false]];
-  const max=N||1;
-  document.getElementById('funnel').innerHTML=F.map(f=>`
-    <div class="fn"><span class="lab">${svg(f[1])}${f[0]}</span>
-      <div class="track"><i class="${f[4]?'ml':''}" data-w="${f[2]/max*100}"></i>${f[3]?`<span class="kil">−${f[3]}</span>`:''}</div>
-      <span class="n">${f[2]}</span></div>`).join('');
-  document.getElementById('funnelSub').textContent=t('funnel_sub',N,act);
+  // 闸门漏斗图已整块移除（与顶部 KPI 卡数字重复，用户明确要求删掉）；此函数只保留风控迷你条渲染
   const bars=[[t('risk_open'),POS.length,RISK.openMax,''],[t('risk_expo'),+(+RISK.expo).toFixed(3),RISK.expoMax,' SOL'],[t('risk_loss'),RISK.loss,RISK.lossMax,' SOL'],[t('risk_streak'),RISK.consec,RISK.consecMax,'']];
   document.getElementById('riskmini').innerHTML=bars.map(b=>{const r=b[2]?b[1]/b[2]:0,hot=r>=1;
     return `<div class="rkrow"><div class="h"><span>${b[0]}</span><b class="${hot?'hot':''}">${b[1]}${b[3]} / ${b[2]}${b[3]}</b></div>
     <div class="t"><i class="${hot?'hot':''}" data-w="${Math.min(r,1)*100}"></i></div></div>`;}).join('');
   requestAnimationFrame(()=>setTimeout(()=>{
-    document.querySelectorAll('#funnel .track i').forEach(i=>i.style.width=i.dataset.w+'%');
     document.querySelectorAll('#riskmini .t i').forEach(i=>i.style.width=i.dataset.w+'%');},90));
-  // 顶部 KILL 指示 pill 已移除（kill-switch 风控逻辑仍在后端 + 右下风控迷你条显示）
 }
 
 function renderAll(flash){renderKpis(flash);renderRows();renderDetail();renderPositions();renderFunnel();}
 
 /* ── log ── */
-const feed=document.getElementById('logfeed');
+const feed=document.getElementById('logfeed');   // 面板已从界面移除；feed 为 null 时下面直接 no-op（后端 trade_decisions.jsonl 仍照常写）
 function logRow(a,sym,reason,color){
+  if(!feed)return;
   const ts=new Date().toISOString().substr(11,8);
   const row=document.createElement('div');row.className='lg';
   row.innerHTML=`<span class="ts">${ts}</span><span class="a" style="color:${color}">${a}</span><span class="s">${sym}</span><span class="r">${reason}</span>`;
@@ -1276,7 +1486,7 @@ function logScreen(){
 
 /* ── clock / telemetry ── */
 function tick(){document.getElementById('clock').textContent=new Date().toISOString().substr(11,8)+'Z';}
-function telemetry(){if(source==='demo')document.getElementById('lat').textContent=(150+Math.round(Math.random()*90))+'ms';}
+function telemetry(){}   // P50 LAT 面板已移除（原用于 DEMO 模式假造延迟数字，无实际功能）
 
 /* ── position risk drift (demo escape showcase) ── */
 function driftPositions(){
@@ -1302,7 +1512,7 @@ async function scanCycle(){
     if(!bePolling||scanInFlight)return;       // 防重入：上一次没回来就跳过本轮，避免请求堆积雪崩
     if(document.hidden)return;                 // 后台 tab 暂停轮询，不烧配额（重新可见时立即补一轮）
     scanInFlight=true;
-    sc.classList.add('on');const t0=performance.now();
+    sc.classList.add('on');
     try{
       const reqChain=curChain;                   // 记下本次请求的链，返回后比对，切走了就丢弃
       const r=await fetch(API+'/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chain:reqChain})});
@@ -1310,11 +1520,12 @@ async function scanCycle(){
       const data=await r.json();
       if(source!=='backend'||reqChain!==curChain)return;   // 期间切走源/切了链 → 丢弃，不拿旧链数据覆盖
       syncBackendMode(data.mode);            // 后端真实 mode 同步到开关（重启后端会回 SHADOW，避免开关停留 LIVE 误导）
+      syncAutoTrade(data.auto_trade);        // 同上，同步自动交易开关
       const {list,risk,positions}=normalize(data);
       loadingScreen=false;                 // 拿到后端响应，结束骨架
       T=list; RISK=risk; if(positions)POS=positions; if(sel>=T.length)sel=-1;
-      document.getElementById('lat').textContent=Math.round(performance.now()-t0)+'ms';
       cycles++;renderAll(true);logScreen();
+      if(++autoStatsTick%5===0)fetchAutoStats();   // 统计面板轮询更稀疏，非每轮 /api/run 都拉
     }catch(e){bePolling=false;toast(t('toast_be_fail',e.message),'err');}
     finally{scanInFlight=false;sc.classList.remove('on');}
     return;
@@ -1337,9 +1548,11 @@ function setSource(s){
     if(beReady){bePolling=true;scanCycle();}              // 环境已有 key，直接轮询，不弹框
     else{toast(t('toast_be_switched'),'ok');openCfg();}
     resetWalletView();   // 切回真实后端：清掉 DEMO 假数据，避免误认成真实查询结果
+    fetchAutoStats();
   }
-  else{mcp.textContent='DEMO';mcp.style.color='var(--amber)';loadingScreen=false;T=freshSeed();POS=seedPositions();RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};sel=-1;cycles=1;renderAll(false);feed.innerHTML='';logScreen();
+  else{mcp.textContent='DEMO';mcp.style.color='var(--amber)';loadingScreen=false;T=freshSeed();POS=seedPositions();RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};sel=-1;cycles=1;renderAll(false);if(feed)feed.innerHTML='';logScreen();
     showWalletDemo();   // 切到 DEMO：钱包评估也给一份假地址+假结果，只演示布局
+    autoTrade=false;applyAutoLabel();renderAutoStats(null);   // DEMO 无后端自动交易，拨钮回默认关闭
   }
 }
 
@@ -1430,6 +1643,84 @@ function applyLiveLabel(){
   const ll=document.getElementById('liveLbl'); if(ll)ll.textContent=liveMode?t('live_lbl_live'):t('live_lbl_shadow');
   const v=document.getElementById('modePill');v.textContent=liveMode?t('mode_live'):t('mode_shadow');v.style.color=liveMode?'var(--clay)':'var(--amber)';
   const dot=document.getElementById('modeDot'); if(dot)dot.style.background=liveMode?'var(--clay)':'var(--amber)';
+  if(liveMode&&autoTrade){autoTrade=false;}   // 前端本地也同步关掉（后端在 LIVE 下已强制 false）
+  applyAutoLabel();
+}
+// AUTO 拨钮：仅 SHADOW 生效，切到 LIVE 时视觉禁用（灰化）
+function applyAutoLabel(){
+  const v=document.getElementById('autoPill'); if(v){v.textContent=autoTrade?t('auto_on'):t('auto_off');v.style.color=autoTrade?'var(--lime)':'';}
+  const dot=document.getElementById('autoDot'); if(dot)dot.style.background=autoTrade?'var(--lime)':'var(--dim2)';
+  const wrap=document.getElementById('autoPillWrap');
+  if(wrap){wrap.classList.toggle('on',autoTrade);wrap.classList.toggle('disabled',liveMode);}
+}
+// 后端真实 auto_trade → 同步前端拨钮（如后端因切 LIVE / 重启而自动关闭）
+function syncAutoTrade(v){
+  if(typeof v!=='boolean')return;
+  if(v===autoTrade)return;
+  const was=autoTrade;
+  autoTrade=v;
+  applyAutoLabel();
+  if(was&&!autoTrade)toast(t('toast_auto_reverted'),'err');
+}
+function toggleAuto(){
+  if(liveMode){toast(t('toast_auto_live_only'),'err');return;}
+  const goOn=!autoTrade;
+  if(source!=='backend'){                       // DEMO 无后端：仅本地翻转，不会真的开仓
+    if(goOn){confirmDialog(t('confirm_auto_title'),t('confirm_auto_msg'),()=>{autoTrade=true;applyAutoLabel();});}
+    else{autoTrade=false;applyAutoLabel();}
+    return;
+  }
+  const apply=async(target)=>{
+    try{
+      const r=await fetch(API+'/api/auto_trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:target})});
+      if(!r.ok)throw new Error(await errDetail(r));
+      const d=await r.json();
+      autoTrade=!!d.auto_trade;applyAutoLabel();
+      toast(autoTrade?t('toast_auto_on'):t('toast_auto_off'),autoTrade?'err':'ok');
+    }catch(e){toast(t('toast_auto_fail',e.message),'err');}
+  };
+  if(goOn)confirmDialog(t('confirm_auto_title'),t('confirm_auto_msg'),()=>apply(true));
+  else apply(false);
+}
+function renderAutoStats(s){
+  // 独立大卡片(左列，同筛选表同宽)：头部统计(笔数/W-L/胜率/PnL) + 逐笔成交真表，点行开该币 GMGN 图表
+  const box=document.getElementById('autostats'); if(!box)return;
+  const cnt=document.getElementById('autoStatsCnt');
+  if(!s||!s.total_trades){
+    if(cnt)cnt.textContent='';
+    box.innerHTML=`<div class="posempty">${t('stats_none')}</div>`;
+    return;
+  }
+  if(cnt)cnt.textContent=t('stats_total',s.total_trades);
+  const pnlCls=s.total_pnl_usd>=0?'up':'dn';
+  const rows=(s.recent||[]).map(r=>{
+    const tag=t('exit_'+(r.exit_tag||'unknown'))||r.exit_tag||'';
+    const pc=r.pnl>=0?'up':'dn';
+    const sig=r.entry_signal||{};
+    const ch=r.chain||curChain;
+    const url=`https://gmgn.ai/${ch}/token/${r.address||''}`;
+    const tip=`${t('auto_row_tip')}\nEntry: ${sig.verdict||'-'} · conviction ${sig.conviction??'-'} · ${sig.crowdedness||'-'} · dev ${sig.dev_score??'-'}`;
+    const partialTag=r.partial?`<span class="partialb">${t('partial_lbl')}</span>`:'';
+    return `<tr title="${tip}" onclick="window.open('${url}','_blank')">
+      <td><span class="sym">${r.symbol||'?'}</span><span class="addr">${shortCA(r.address)}</span>${partialTag}</td>
+      <td class="tag">${tag}</td>
+      <td class="pnl ${pc}">${r.pnl>=0?'+':''}${(r.pnl*100).toFixed(1)}%</td>
+    </tr>`;
+  }).join('');
+  box.innerHTML=`<div class="autostats-hd">
+      <span>${s.wins}<b class="up">W</b> / ${s.losses}<b class="dn">L</b></span>
+      <span><b class="${s.win_rate>=0.5?'up':'dn'}">${(s.win_rate*100).toFixed(0)}%</b> ${t('stats_winrate')}</span>
+      <span><b class="${pnlCls}">${s.total_pnl_usd>=0?'+':''}$${s.total_pnl_usd}</b> ${t('stats_pnl')}</span>
+    </div>
+    <table class="astable"><tbody>${rows}</tbody></table>`;
+}
+async function fetchAutoStats(){
+  if(source!=='backend')return;
+  try{
+    const r=await fetch(API+'/api/stats/auto');
+    if(!r.ok)return;
+    renderAutoStats(await r.json());
+  }catch(e){/* 静默：统计面板非关键路径 */}
 }
 // 右上角 MODE 图标点击切换：→LIVE 需二次确认(动真钱)，→SHADOW 直接切。均通知后端 /api/mode。
 function toggleMode(){
@@ -1587,21 +1878,21 @@ function fallbackCopy(tk,done){
 
 /* ── i18n 应用：刷新所有静态文案 + 重渲染动态区 ── */
 function applyI18n(){
-  document.documentElement.lang = (lang==='zh'?'zh-CN':'en');
+  document.documentElement.lang = (lang==='zh'?'zh-CN':lang==='uk'?'uk':'en');
   document.title=t('title');
   document.querySelectorAll('[data-i18n]').forEach(el=>{el.innerHTML=t(el.getAttribute('data-i18n'));});
   const tagEl=document.querySelector('.tag');if(tagEl)tagEl.innerHTML=APP_VERSION+' · '+t('tag');   // 版本号放副标题句首，沿用副标题文案色值
   document.querySelectorAll('[data-i18n-title]').forEach(el=>{el.title=t(el.getAttribute('data-i18n-title'));});
   document.querySelectorAll('[data-i18n-tip]').forEach(el=>{el.setAttribute('data-tip',t(el.getAttribute('data-i18n-tip')));});
   document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=t(el.getAttribute('data-i18n-ph'));});
-  document.getElementById('langBtn').textContent=(lang==='zh'?'中文':'EN');
+  document.getElementById('langBtn').textContent=(lang==='zh'?'中文':lang==='uk'?'УКР':'EN');
   const tf=document.getElementById('tokFilter');if(tf)tf.setAttribute('data-tip',t(onlyHeld?'tokf_on':'tokf_off'));
   applyLiveLabel();
   renderAll(false);
   if(typeof wltData!=='undefined'&&wltData&&typeof renderWallet==='function')renderWallet();  // 已评估的钱包随语言重渲染
-  if(source==='demo'){feed.innerHTML='';logScreen();}   // 重置日志为当前语言
+  if(source==='demo'){if(feed)feed.innerHTML='';logScreen();}   // 重置日志为当前语言
 }
-function switchLang(){lang=(lang==='zh'?'en':'zh');localStorage.setItem('aitrader_lang',lang);applyI18n();}
+function switchLang(){lang=(lang==='uk'?'zh':lang==='zh'?'en':'uk');localStorage.setItem('aitrader_lang',lang);applyI18n();}
 
 /* ══════════ 钱包评估 Tab ══════════ */
 let curView=sessionStorage.getItem('aitrader_view')||'token';
@@ -1661,7 +1952,34 @@ const WLK={
     off:'Wallet eval needs the local backend running (127.0.0.1:8000).',
     need_key:'The local backend has no GMGN API Key yet — opened the settings dialog for you. Save a key, then hit evaluate again.',
     no_trades_note:n=>`This address has no real buy/sell activity${n>0?` (it holds ${n} token(s) on-chain, none acquired by trading)`:''} — no PnL distribution to show.`,
-    bt_no_trades:'This address has no real trading history, so it can\'t be scored/backtested.'}
+    bt_no_trades:'This address has no real trading history, so it can\'t be scored/backtested.'},
+  uk:{need_addr:'Введіть адресу гаманця', need_real_addr:'Введіть реальну адресу гаманця для запиту', loading:'Запит…', fail:'Запит не вдався',
+    play:'Стиль', active:d=>`активний ${d} дн.`, fans:'X',
+    s_pnl:'7Д PnL', s_win:'Вінрейт', s_hold:'Сер. утримання', s_trades:'7Д угод(купівля/продаж)', s_avg:'Сер./угоду',
+    s_early:'Вхід<$100k', s_flip:'Флip <5с',
+    dist:'Розподіл PnL', coins:'токенів',
+    trk:'Реальний скор результатів', trk_sub:'Чи справді є навички (з поправкою на розподіл)',
+    cpy:'Скор копіювання', cpy_sub:'Скільки ВИ реально зможете зловити',
+    trk_fac:'Результати · фактори', cpy_fac:'Копіювання · фактори', dev_fac:'DEV-репутація · фактори',
+    bt:'Бектест копітрейдингу', bt_formula:'копіювання/угода = %гаманця − дрейф затримки − 2× сліпедж − газ (низька капіталізація дрейфує найшвидше)',
+    bt_lat:'Затримка копіювання', bt_slip:'Сліпедж (одна сторона)', bt_gas:'Газ/угоду',
+    bt_net:'Чистий прибуток за угоду', bt_wallet:'Гаманець', bt_copy:'Копіювальник',
+    bt_w7:'Гаманець сам 7Д', bt_c7:'Копіювальник реально 7Д', bt_trap:'Ризик пастки копіювання',
+    learn:'Лише навчання 📖',
+    dev:'Репутація dev', dev_sub:'Чи справді чисті токени, які він випускає', dev_none_t:'Ця адреса ніколи не випускала токен',
+    dev_none_s:'Не гаманець-творець токенів — власні релізи менше половини торгованих токенів, тож оцінюється як звичайний трейдер без dev-репутації.',
+    dev_surv:'Виживання', dev_rug:'Рівень rug',
+    dev_reskin:'Повторне лого', dev_sec:'Ризик безпеки',
+    dev_migrate:'Рівень міграції', dev_migrate_detail:(total,inner)=>`Випущено токенів ${total}, застрягло всередині ${inner} — чим нижче це число, тим більше схоже на масове виробництво токенів, байдуже до їх долі`,
+    dev_survrug_note:'Вибірка з останніх релізів: ще є ліквідність (вижив) проти вже висмоктано/ругнуто',
+    dev_reskin_note:'Перевикористовує один логотип у власних релізах — справжні проєкти так не роблять, зазвичай це перейменування того самого руга',
+    self_deal_note:'⚠ Самообслуговування — обидва скори суттєво занижено',
+    yes:'виявлено ⚠', no:'немає ✓', none:'немає',
+    u_sec:'с', u_min:'хв', u_hr:'год', u_day:'д',
+    off:'Оцінка гаманця потребує запущеного локального бекенду (127.0.0.1:8000).',
+    need_key:'У локального бекенду ще немає GMGN API Key — відкрив для вас вікно налаштувань. Збережіть ключ і натисніть оцінити ще раз.',
+    no_trades_note:n=>`Ця адреса не має реальної активності купівлі/продажу${n>0?` (тримає ${n} токен(ів) ончейн, жоден не отриманий торгівлею)`:''} — розподіл PnL показати нема з чого.`,
+    bt_no_trades:'Ця адреса не має реальної торгової історії, тож оцінити/забектестити неможливо.'}
 };
 /* DEMO 模式下没有本地后端可查（GitHub Pages 纯静态托管同理），钱包评估给一份写死的示例结果，
    只为展示页面布局长什么样，地址是假的，数字也不代表任何真实钱包。选了一个「发币方+自产自销」的
