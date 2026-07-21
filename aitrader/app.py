@@ -24,7 +24,7 @@ app.py — GMGN AI Trader 本地后端 (FastAPI)
 """
 
 from __future__ import annotations
-import json, os, re, subprocess, random, datetime, pathlib, threading, math, shlex, time
+import json, os, re, subprocess, random, datetime, pathlib, threading, math, shlex, time, shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -36,6 +36,9 @@ from pydantic import BaseModel
 
 random.seed(7)
 HERE = pathlib.Path(__file__).resolve().parent
+# Windows 上 npm 全局装的 gmgn-cli 是 .CMD shim，subprocess(shell=False) 传裸命令名找不到
+# （WinError 2），需 shutil.which 解析出带扩展名的完整路径；非 Windows/找不到时回退裸命令名。
+GMGN_CLI = shutil.which("gmgn-cli") or "gmgn-cli"
 STATIC_DIR = HERE / "static"
 OUT_DIR = HERE / "outputs"
 LOG_PATH = OUT_DIR / "trade_decisions.jsonl"
@@ -76,8 +79,8 @@ CFG = {
     "dev_pool_n": 24,            # >llm_max，让 dev 子分能重排 gate3 名额边界
     "dev_info_ttl_s": 600,
     "min_dev_score": 0.15,       # dev 评分过滤：低于此分（工厂号/连环换皮/喷币）直接砍，不进 LLM/待决策
-    "dev_sec_scan_n": 3,         # dev 安全扫描：对该 dev 最近 N 个发币逐个查 token security（不安全则降分+提示风险）
-    "dev_fetch_workers": 8,      # dev 历史并发拉取线程数：冷缓存首轮把 24×(info+created+扫描) 串行 cli 改为并发，省掉「一直 loading」的长延时（subprocess 等待时释放 GIL）
+    "dev_sec_scan_n": 1,         # dev 安全扫描：对该 dev 最近 N 个发币逐个查 token security（不安全则降分+提示风险）
+    "dev_fetch_workers": 2,      # dev 历史并发拉取线程数：冷缓存首轮把 24×(info+created+扫描) 串行 cli 改为并发，省掉「一直 loading」的长延时（subprocess 等待时释放 GIL）。调低以避免对新 key 触发 GMGN 限流
     # 排序档位：趋势动能跟随（看现在在不在涨、买盘强不强、量价齐升）
     "rank_profile": "momentum",
     "rank_weights": {
@@ -245,8 +248,8 @@ class LiveGMGN(GMGNAdapter):
         return resp
 
     def _cli(self, *args) -> dict:
-        cmd = ["gmgn-cli", *args, "--chain", self.chain, "--raw"]
-        out = subprocess.run(cmd, capture_output=True, text=True,
+        cmd = [GMGN_CLI, *args, "--chain", self.chain, "--raw"]
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                              timeout=25, env=self.env)
         if out.returncode != 0:
             raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
@@ -257,9 +260,10 @@ class LiveGMGN(GMGNAdapter):
         parts = shlex.split(cmd_str)
         if parts[:1] != ["gmgn-cli"]:
             raise RuntimeError("命令必须以 gmgn-cli 开头")
+        parts[0] = GMGN_CLI                              # 解析出的带扩展名完整路径（见 GMGN_CLI 注释）
         if "--raw" not in parts:
             parts.append("--raw")
-        out = subprocess.run(parts, capture_output=True, text=True, timeout=25, env=self.env)
+        out = subprocess.run(parts, capture_output=True, text=True, encoding="utf-8", timeout=25, env=self.env)
         if out.returncode != 0:
             raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
         return self._check_code(json.loads(out.stdout))
@@ -360,8 +364,8 @@ class LiveGMGN(GMGNAdapter):
         if self.chain in self._wallet_cache:
             return self._wallet_cache[self.chain]
         # portfolio info 无 --chain 参数：直接调，不经 _cli（_cli 会硬加 --chain）
-        out = subprocess.run(["gmgn-cli", "portfolio", "info", "--raw"],
-                             capture_output=True, text=True, timeout=25, env=self.env)
+        out = subprocess.run([GMGN_CLI, "portfolio", "info", "--raw"],
+                             capture_output=True, text=True, encoding="utf-8", timeout=25, env=self.env)
         if out.returncode != 0:
             raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
         data = json.loads(out.stdout)
@@ -892,12 +896,18 @@ def _fetch_dev_profiles(g: GMGNAdapter, chain: str, addrs: list[str]) -> dict[st
     """并发拉一组地址的 dev 历史，返回 {address: dev_profile|None}。
     缓存命中走不到线程池（get_dev_profile 内 TTL 判断），故首轮冷缓存才真正并发打 cli；
     单地址直接同步拉（不值当起线程）。workers 上限约束并发，避免对 gmgn-cli 配额造成尖峰。"""
+    def _safe(a: str):
+        try:
+            return a, get_dev_profile(g, chain, a)
+        except Exception:
+            return a, None                              # 单地址失败（如限流）→ 中性处理，不拖垮整批
+
     uniq = list(dict.fromkeys(a for a in addrs if a))
     if len(uniq) <= 1:
-        return {a: get_dev_profile(g, chain, a) for a in uniq}
+        return dict(_safe(a) for a in uniq)
     workers = max(1, min(CFG["dev_fetch_workers"], len(uniq)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = ex.map(lambda a: (a, get_dev_profile(g, chain, a)), uniq)
+        results = ex.map(_safe, uniq)
         return dict(results)
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1405,7 +1415,7 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rec = dict(ts=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                action=action, symbol=symbol, reason=reason, mode=ST.mode, **(extra or {}))
-    with LOG_PATH.open("a") as fh:
+    with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 # ──────────────────────────────────────────────────────────────────────────
