@@ -108,13 +108,13 @@ CFG = {
     "max_auto_positions": 5,
     "auto_reentry_cooldown_s": 90.0,
     # 自动交易三段式离场（用户指定）：
-    #   1) +30% 部分止盈：卖一半，锁定利润；
+    #   1) +20% 部分止盈：卖 30%，锁定利润；
     #   2) 剩余仓位止损上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
-    #   3) 剩余仓位用移动止损 25%（保本价与移动止损取更高者）+ 硬止盈 +150% 管理。
+    #   3) 剩余仓位此后只用移动止损 25%（保本价与移动止损取更高者）管理，只升不降，不设固定金额
+    #      的硬止盈上限——用户明确要求「不在 +150% 强制清仓，就是持续上移止损」，让盈利尽量跑。
     # 初始硬止损 -35%（复用 hard_stop_pct）只在部分止盈发生前生效。
-    "auto_tp1_pct": 0.30,
-    "auto_tp1_sell_frac": 0.5,
-    "auto_tp2_pct": 1.50,
+    "auto_tp1_pct": 0.20,
+    "auto_tp1_sell_frac": 0.3,
     "auto_trailing_pct": 0.25,
 }
 # 各链「原生/币种」token 地址（买入时作 input、卖出时作 output）。
@@ -212,7 +212,7 @@ def load_trending_cmds() -> dict:
     if not TRENDING_CMDS_PATH.exists():
         return {}
     try:
-        data = json.loads(TRENDING_CMDS_PATH.read_text())
+        data = json.loads(TRENDING_CMDS_PATH.read_text(encoding="utf-8"))
         return {k: v for k, v in data.items() if isinstance(v, str)} if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -220,7 +220,7 @@ def load_trending_cmds() -> dict:
 def save_trending_cmds(cmds: dict):
     try:
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        TRENDING_CMDS_PATH.write_text(json.dumps(cmds, ensure_ascii=False))
+        TRENDING_CMDS_PATH.write_text(json.dumps(cmds, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -1295,12 +1295,12 @@ def exit_plan() -> dict:
 # ──────────────────────────────────────────────────────────────────────────
 # 8b. SHADOW-only 自动交易（人在环铁律的有意收窄豁免，仅纸面模拟；见 SPEC.md §2/§14）
 #     入场：通过全部闸门(action=ACTION)且开关打开 → 自动开 $20 名义纸面仓位。
-#     离场：三段式（用户指定，见 CFG 里 auto_tp1_*/auto_tp2_pct/auto_trailing_pct 注释）：
+#     离场：三段式（用户指定，见 CFG 里 auto_tp1_*/auto_trailing_pct 注释）：
 #       1) 逃生 severity≥escape_severity → 任何阶段都立即全仓离场；
-#       2) 部分止盈前：pnl≤-hard_stop_pct → 全仓止损；pnl≥auto_tp1_pct(+30%) → 卖出
-#          auto_tp1_sell_frac(一半)、锁定利润，剩余仓位止损上移到保本价(entry_price)；
+#       2) 部分止盈前：pnl≤-hard_stop_pct → 全仓止损；pnl≥auto_tp1_pct(+20%) → 卖出
+#          auto_tp1_sell_frac(30%)、锁定利润，剩余仓位止损上移到保本价(entry_price)；
 #       3) 部分止盈后：剩余仓位止损 = max(保本价, 峰值价×(1-auto_trailing_pct))，只升不降
-#          （保证不再亏钱）；pnl≥auto_tp2_pct(+150%) → 剩余全部止盈离场。
+#          （保证不再亏钱），无固定金额硬止盈上限——不强制清仓，只靠移动止损让盈利奔跑。
 # ──────────────────────────────────────────────────────────────────────────
 def native_usd_price(g: "GMGNAdapter", chain: str) -> float:
     try:
@@ -1350,7 +1350,7 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         dict(address=f.address, size_sol=size_native, chain=chain, auto=True,
              entry_signal=sig, hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%",
              tp1=f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%+保本",
-             tp2=f"+{int(CFG['auto_tp2_pct']*100)}%→清剩余", trailing=f"{int(CFG['auto_trailing_pct']*100)}%"))
+             trailing=f"{int(CFG['auto_trailing_pct']*100)}%（无固定止盈上限）"))
 
 def _auto_decide_exit(p: dict):
     """纯规则判断该 auto 持仓本轮该怎么处理；顺带更新 p 的 peak_price（供移动止损用）。
@@ -1370,8 +1370,6 @@ def _auto_decide_exit(p: dict):
     # 部分止盈后：剩余仓位止损 = max(保本价, 峰值价的移动止损)，只升不降 → 这笔交易此后不可能再亏钱
     peak = max(p.get("peak_price", 0.0), cur)
     p["peak_price"] = peak
-    if pnl >= CFG["auto_tp2_pct"]:
-        return ("full", "AUTO_TP2")
     stop_price = max(entry, peak * (1 - CFG["auto_trailing_pct"])) if entry > 0 else 0
     if entry > 0 and cur > 0 and cur <= stop_price:
         return ("full", "AUTO_TRAIL_BE")
@@ -1407,14 +1405,8 @@ class RiskManager:
         self.consec_losses = 0
         self.halted = False
     def gate(self, size_sol: float, n_positions: int, exposure: float):
-        """组合级硬风控：返回 (allow, reason)。"""
-        if self.halted:
-            return False, "BLOCK kill-switch 已触发"
-        if self.consec_losses >= CFG["kill_switch_consec_losses"]:
-            self.halted = True
-            return False, "BLOCK kill-switch（连亏）"
-        if self.realized_loss_today >= CFG["daily_loss_cap_sol"]:
-            return False, "BLOCK 当日亏损上限"
+        """组合级硬风控：返回 (allow, reason)。连亏 kill-switch 与当日亏损上限均已按用户要求移除——
+        用户明确希望机器人持续交易以积累统计数据，只保留仓位数/敞口上限这类容量约束。"""
         if n_positions >= CFG["max_concurrent_positions"]:
             return False, f"BLOCK 已达最大并发持仓 ({CFG['max_concurrent_positions']})"
         if exposure + size_sol > CFG["max_total_exposure_sol"]:
@@ -1521,7 +1513,7 @@ def valid_chain(ch: str) -> str:
 def save_positions():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        POSITIONS_PATH.write_text(json.dumps(ST.positions, ensure_ascii=False))
+        POSITIONS_PATH.write_text(json.dumps(ST.positions, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -1529,7 +1521,7 @@ def load_positions() -> list:
     if not POSITIONS_PATH.exists():
         return []
     try:
-        data = json.loads(POSITIONS_PATH.read_text())
+        data = json.loads(POSITIONS_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else []
     except Exception:
         return []
@@ -1613,7 +1605,7 @@ def compute_auto_stats() -> dict:
         recent=[dict(ts=r.get("ts"), symbol=r.get("symbol"), address=r.get("address"), chain=r.get("chain"),
                     pnl=r.get("pnl", 0), exit_tag=r.get("exit_tag"), entry_signal=r.get("entry_signal"),
                     partial=bool(r.get("partial")))
-                for r in rows[-50:]][::-1])
+                for r in rows][::-1])
 
 # ──────────────────────────────────────────────────────────────────────────
 # 11. 筛选流水线（核心：确定性先筛 → 评分 → LLM 只判幸存者 → 产候选，不执行）
