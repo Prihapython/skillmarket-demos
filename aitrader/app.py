@@ -103,10 +103,15 @@ CFG = {
     # 逃生预警阈值（severity 0-100）
     "escape_severity": 70,
     # SHADOW-only 自动交易：入场固定 $20 名义仓位；子额度独立于人工 max_concurrent_positions，
-    # 避免机器人吃满人工一键买入的额度；同地址止损/逃生离场后冷却期内不重新入场。
+    # 避免机器人吃满人工一键买入的额度；同一地址永远只自动入场一次（见 ST.auto_traded_addresses），
+    # 不再是限时冷却——用户明确要求同一个币不重复进场。
     "auto_size_usd": 20.0,
     "max_auto_positions": 5,
-    "auto_reentry_cooldown_s": 90.0,
+    # 入场年龄上限：默认不追超过 3 天的老币（早期动能大概率已过去），
+    # 除非信号极强（conviction 与优先级都很高）——用户明确要求的例外。
+    "max_token_age_days": 3,
+    "age_exception_min_conviction": 0.9,
+    "age_exception_min_priority": 80,
     # 自动交易三段式离场（用户指定）：
     #   1) +20% 部分止盈：卖 30%，锁定利润；
     #   2) 剩余仓位止损上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
@@ -1317,10 +1322,15 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         return
     if any(p["address"] == f.address and p.get("chain", "sol") == chain for p in ST.positions):
         return                               # 已持有（人工或自动）→ 不重复开仓
+    if f.address in ST.auto_traded_addresses:
+        return                               # 用户明确要求：同一地址永远只自动入场一次，不管上次结果如何
+    if f.age_min > CFG["max_token_age_days"] * 1440:
+        strong = (v.conviction >= CFG["age_exception_min_conviction"]
+                  and pri >= CFG["age_exception_min_priority"])
+        if not strong:
+            return                           # 币太老（早期动能大概率已过），且信号不够强 → 不追
     if sum(1 for p in ST.positions if p.get("auto")) >= CFG["max_auto_positions"]:
         return                               # 机器人子额度已满，不挤占人工额度
-    if time.monotonic() < ST._auto_cooldown.get(f.address, 0):
-        return                               # 该币刚被自动离场，冷却期内不重新入场
     g = ST.adapter_for(chain)
     size_native = round(CFG["auto_size_usd"] / native_usd_price(g, chain), 6)
     allow, rnote = ST.risk.gate(size_native, len(ST.positions), ST.exposure())
@@ -1345,6 +1355,7 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
                              entry_price=entry_price, cur_price=entry_price,
                              auto=True, tp1_done=False, peak_price=entry_price,
                              entry_signal=sig))
+    ST.auto_traded_addresses.add(f.address)
     save_positions()
     log("BUY", f.symbol_safe, f"SHADOW AUTO 记录 {size_native} ({chain})",
         dict(address=f.address, size_sol=size_native, chain=chain, auto=True,
@@ -1363,6 +1374,9 @@ def _auto_decide_exit(p: dict):
     if not p.get("tp1_done"):
         # 部分止盈前：初始硬止损 -35% 保护全仓
         if pnl <= -CFG["hard_stop_pct"]:
+            # 扫描周期之间价格可能已经跌穿止损位很远（"滑点"）；真实止损单会在触发价附近成交，
+            # 不会让账面亏损远超设定的止损百分比——用户明确要求最大亏损就是 -35%，不是"看到多少算多少"。
+            p["pnl"] = max(pnl, -CFG["hard_stop_pct"])
             return ("full", "AUTO_SL")
         if pnl >= CFG["auto_tp1_pct"]:
             return ("partial", CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
@@ -1372,6 +1386,7 @@ def _auto_decide_exit(p: dict):
     p["peak_price"] = peak
     stop_price = max(entry, peak * (1 - CFG["auto_trailing_pct"])) if entry > 0 else 0
     if entry > 0 and cur > 0 and cur <= stop_price:
+        p["pnl"] = max(pnl, stop_price / entry - 1)   # 同样按止损触发价成交，不按滑点后的更差价格
         return ("full", "AUTO_TRAIL_BE")
     return None
 
@@ -1389,7 +1404,6 @@ def auto_manage_exits(chain: str) -> None:
         try:
             if decision[0] == "full":
                 do_sell(p["address"], exit_tag=decision[1])
-                ST._auto_cooldown[p["address"]] = time.monotonic() + CFG["auto_reentry_cooldown_s"]
             else:
                 _, frac, tag = decision
                 do_sell_partial(p["address"], frac, tag)
@@ -1415,6 +1429,22 @@ class RiskManager:
 
 SUPPORTED_CHAINS = ("sol", "bsc", "base", "eth", "robinhood")
 
+def _load_auto_traded_addresses(max_lines: int = 20000) -> set[str]:
+    """启动时读一遍历史 BUY 记录，得到"曾经自动买过"的地址集合——用户明确要求同一个币不再二次
+    自动入场（哪怕上次是止损离场、冷却期已过），所以这是永久黑名单，不是限时冷却。"""
+    if not LOG_PATH.exists():
+        return set()
+    lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-max_lines:]
+    out: set[str] = set()
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if rec.get("action") == "BUY" and rec.get("auto") and rec.get("address"):
+            out.add(rec["address"])
+    return out
+
 class AppState:
     """链改为「请求维度」：不再有全局当前链，按链缓存 adapter + trending 结果。
     mode/risk/positions 仍全局（钱包级、跨链合一）。self.chain 仅作启动默认 + status 展示。"""
@@ -1422,7 +1452,7 @@ class AppState:
         self.lock = threading.Lock()
         self.mode = "SHADOW"          # SHADOW | LIVE（钱包级安全设置，全局）
         self.auto_trade = False       # SHADOW-only 自动交易开关；不落盘，重启回默认 False（同 mode 的安全默认哲学）
-        self._auto_cooldown: dict[str, float] = {}   # address -> monotonic() 之前禁止自动重新入场
+        self.auto_traded_addresses: set[str] = _load_auto_traded_addresses()  # 永久黑名单：同一地址只自动入场一次
         self.chain = CFG["chain"]     # 启动默认链（仅用于未带 chain 的请求兜底 + status 展示）
         self.live = False             # 是否已配 key（决定按链建 Live 还是 Mock 适配器）
         self._adapters: dict[str, GMGNAdapter] = {}              # chain -> 适配器（缓存）
