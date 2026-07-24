@@ -120,6 +120,11 @@ CFG = {
     #   流动性过低 → $20 的建仓/平仓本身就会显著滑点，止损/止盈价格失真。
     "max_auto_sniper_count": 5,
     "min_auto_liquidity_usd": 3000.0,
+    # 成交笔数/成交额过低 → 样本太小，buy_ratio 这种比率型信号在个位数笔数上纯属噪音
+    # （2 买 1 卖 = 67% 买占比，跟真正有意义的买盘完全不是一回事）；vol_1h 无论对错此前
+    # 从未被任何门槛用过（真实事故：9 分钟新币 Gorou，图表几乎空白，conviction 却给到 0.95）。
+    "min_auto_swaps": 50,            # swaps = buys+sells 之和，不是只看买入笔数
+    "min_auto_volume_usd": 10000.0,  # 1h 成交额
     # 自动交易离场（用户指定，2026-07-24 起改四段）：
     #   1) +20% 第一次部分止盈：卖原始仓位的 30%，锁定利润；
     #      剩余仓位止损立即上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
@@ -1370,6 +1375,8 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         return                               # 狙击钱包过多 → 疑似秒买等拉盘就跑，目前只在 UI 标签展示、不影响评分，这里补硬拦
     if f.liquidity < CFG["min_auto_liquidity_usd"]:
         return                               # 流动性太薄，$20 建仓/平仓本身就会显著滑价，止损/止盈价格会失真
+    if f.swaps < CFG["min_auto_swaps"] or f.vol_1h < CFG["min_auto_volume_usd"]:
+        return                               # 成交笔数/成交额太小，buy_ratio 等比率型信号在个位数样本上是噪音不是信号
     if f.age_min > CFG["max_token_age_days"] * 1440:
         strong = (v.conviction >= CFG["age_exception_min_conviction"]
                   and pri >= CFG["age_exception_min_priority"])
