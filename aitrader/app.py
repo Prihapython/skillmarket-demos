@@ -102,10 +102,12 @@ CFG = {
     "trailing_pct": 0.25,
     # 逃生预警阈值（severity 0-100）
     "escape_severity": 70,
-    # SHADOW-only 自动交易：入场固定 $20 名义仓位；子额度独立于人工 max_concurrent_positions，
-    # 避免机器人吃满人工一键买入的额度；同一地址永远只自动入场一次（见 ST.auto_traded_addresses），
-    # 不再是限时冷却——用户明确要求同一个币不重复进场。
+    # SHADOW-only 自动交易：入场固定 $20 名义仓位；同一地址永远只自动入场一次
+    # （见 ST.auto_traded_addresses），不再是限时冷却——用户明确要求同一个币不重复进场。
     "auto_size_usd": 20.0,
+    # max_auto_positions/max_concurrent_positions/max_total_exposure_sol 三个数量类容量上限
+    # 均已按用户要求移除（不再在 RiskManager.gate()/auto_open_position() 里拦截）——
+    # 用户明确要求 SOL 上不受仓位数/敞口限制持续交易；CFG 里留着仅供前端展示参考数字。
     "max_auto_positions": 5,
     # 入场年龄上限：默认不追超过 3 天的老币（早期动能大概率已过去），
     # 除非信号极强（conviction 与优先级都很高）——用户明确要求的例外。
@@ -1352,8 +1354,6 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
                   and pri >= CFG["age_exception_min_priority"])
         if not strong:
             return                           # 币太老（早期动能大概率已过），且信号不够强 → 不追
-    if sum(1 for p in ST.positions if p.get("auto")) >= CFG["max_auto_positions"]:
-        return                               # 机器人子额度已满，不挤占人工额度
     g = ST.adapter_for(chain)
     size_native = round(CFG["auto_size_usd"] / native_usd_price(g, chain), 6)
     allow, rnote = ST.risk.gate(size_native, len(ST.positions), ST.exposure())
@@ -1449,12 +1449,10 @@ class RiskManager:
         self.consec_losses = 0
         self.halted = False
     def gate(self, size_sol: float, n_positions: int, exposure: float):
-        """组合级硬风控：返回 (allow, reason)。连亏 kill-switch 与当日亏损上限均已按用户要求移除——
-        用户明确希望机器人持续交易以积累统计数据，只保留仓位数/敞口上限这类容量约束。"""
-        if n_positions >= CFG["max_concurrent_positions"]:
-            return False, f"BLOCK 已达最大并发持仓 ({CFG['max_concurrent_positions']})"
-        if exposure + size_sol > CFG["max_total_exposure_sol"]:
-            return False, "BLOCK 超出总敞口上限"
+        """组合级硬风控：返回 (allow, reason)。连亏 kill-switch、当日亏损上限、仓位数上限、总敞口
+        上限均已按用户要求移除——用户明确希望机器人在 SOL 上持续交易、不受数量类容量约束。
+        `max_concurrent_positions`/`max_total_exposure_sol` 仍留在 CFG 里仅供前端展示参考数字，
+        不再在这里拦截。"""
         return True, "ok"
 
 SUPPORTED_CHAINS = ("sol", "bsc", "base", "eth", "robinhood")
