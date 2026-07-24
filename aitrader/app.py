@@ -1393,17 +1393,17 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     if f.ath_mcap > 0 and f.mcap / f.ath_mcap < CFG["min_auto_ath_ratio"]:
         return                               # 当前市值/历史最高市值比例太低 → 主升浪已经走完，crowdedness="early"
                                               # 只看得到"现在在涨"，看不到"这是死透后的反弹"（真实事故：BUNKEE）
-    if f.dev and f.dev.get("exited"):
-        return                               # dev 已清仓本币（不是历史发币记录，是这一个币本身）——此前只在 dev_score
-                                              # 里扣 0.10 分，综合分仍可能远高于 min_dev_score 门槛而通过；
-                                              # 真实事故：Vader，dev 历史 100 币 97% rug，且已卖出这个币，
-                                              # dev_score=0.21 照样过关。这个信号单独就该硬拦，不该被平均掉。
     if f.sm_confluence < CFG["min_auto_sm_confluence"]:
         return                               # 聪明钱+KOL 计数刚好卡在 hard_gates 最低线(1)不是好现象——
                                               # 真实事故：连续三笔亏损全部 sm_confluence==1，无任何安全冗余
     if f.dev_eval is not None and f.dev_eval < CFG["min_auto_dev_score"]:
         return                               # dev 评分刚好卡在筛选流水线最低线(0.15)同理——
                                               # 三笔亏损里两笔 dev_score 正好等于 0.15
+    if not (f.dev and f.dev.get("exited")):
+        return                               # 用户明确要求反过来：dev 必须已经清仓本币才买——dev 还握着仓位
+                                              # 就随时可能砸盘；dev 已经出清、后续没有内部人能再靠抛售操纵价格，
+                                              # 配合上面的 dev_score 门槛（历史记录不能太差）比"dev 还在场"更安全。
+                                              # f.dev 为 None（没查到历史）按未知处理，同样不买。
     if f.age_min > CFG["max_token_age_days"] * 1440:
         strong = (v.conviction >= CFG["age_exception_min_conviction"]
                   and pri >= CFG["age_exception_min_priority"])
