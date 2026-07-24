@@ -308,7 +308,7 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 ⚠️ **仅此一处豁免**：§2 的人在环铁律（「机器负责筛，人负责按下成交」）对**人工流程**依旧成立、未改——一键买入/平仓、LIVE 全程仍必须人点按钮。本节新增的是**第二条、完全独立的路径**：用户显式要求，仅在 **SHADOW（纸面模拟）**下，让机器自己开仓+离场，用于跑量积累「信号→结果」的统计数据。**任何时候 `ST.mode != "SHADOW"`，这条路径整体不生效**（`auto_open_position`/`auto_manage_exits` 双重自检 mode，且离开 SHADOW 时 `/api/mode`/`/api/config` 会顺带强制关闭 `ST.auto_trade`）。
 
 - **开关**：右上角新拨钮 `AUTO`（`ST.auto_trade`，内存态，不落盘，同 `ST.mode` 一样重启回默认 `False`）。`POST /api/auto_trade`。LIVE 下不可开（前端禁用 + 后端强制拒绝）。
-- **入场**：`screen_once` 里，决策为 `action=="ACTION"`（已过全部闸门）且 `ST.auto_trade` 为真 → `auto_open_position` 自动开仓，**固定 `auto_size_usd`($20) 名义仓位**（换算成原生币数量：`$20 / native_usd_price(chain)`，兜底表 `NATIVE_USD_FALLBACK` 防 Mock 模式无原生币报价查询报错）。同地址已持仓（人工或自动）不重复开；`ST.auto_traded_addresses`（启动时从日志历史 BUY 记录重建）确保同一地址**永久**只自动入场一次，不是限时冷却；`crowdedness=="crowded"`（LLM 判定 5m/1h 动能不同向、非清晰单边）直接拒绝自动入场——`priority_score` 本身不看 crowdedness，靠这里硬拦，避免追进已经涨跌过一轮、当前只是横盘/假反弹的死币；机器人有独立子额度 `max_auto_positions=5`（不挤占人工 `max_concurrent_positions`）；仍过一遍 `RiskManager.gate()`；默认不追超过 `max_token_age_days`(3) 天的老币，除非 `conviction≥age_exception_min_conviction`(0.9) 且 `priority≥age_exception_min_priority`(80)。
+- **入场**：`screen_once` 里，决策为 `action=="ACTION"`（已过全部闸门）且 `ST.auto_trade` 为真 → `auto_open_position` 自动开仓，**固定 `auto_size_usd`($20) 名义仓位**（换算成原生币数量：`$20 / native_usd_price(chain)`，兜底表 `NATIVE_USD_FALLBACK` 防 Mock 模式无原生币报价查询报错）。同地址已持仓（人工或自动）不重复开；`ST.auto_traded_addresses`（启动时从日志历史 BUY 记录重建）确保同一地址**永久**只自动入场一次，不是限时冷却；`crowdedness=="crowded"`（LLM 判定 5m/1h 动能不同向、非清晰单边）直接拒绝自动入场——`priority_score` 本身不看 crowdedness，靠这里硬拦，避免追进已经涨跌过一轮、当前只是横盘/假反弹的死币；狙击钱包数 `sniper_count > max_auto_sniper_count`(5)、流动性 `liquidity < min_auto_liquidity_usd`($3000) 同理硬拦——这两项此前只在人工界面当标签展示，从不影响自动交易的评分/决策；机器人有独立子额度 `max_auto_positions=5`（不挤占人工 `max_concurrent_positions`）；仍过一遍 `RiskManager.gate()`；默认不追超过 `max_token_age_days`(3) 天的老币，除非 `conviction≥age_exception_min_conviction`(0.9) 且 `priority≥age_exception_min_priority`(80)。
 - **离场**（`auto_manage_exits`，`monitor_positions` 之后单独一遍，三段式，用户明确指定）：
   1. 逃生 severity ≥ `escape_severity`(70) → 立即全仓离场（复用既有 `assess_escape`）。
   2. 部分止盈前：pnl ≤ `-hard_stop_pct`(-35%) → 全仓止损；pnl ≥ `auto_tp1_pct`(+20%) → 卖出 `auto_tp1_sell_frac`(30%)、锁定利润，剩余止损上移到保本价（此后这笔交易不可能再亏钱）。
@@ -340,7 +340,7 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 - **GitHub Pages 演示**：static 自适应 DEMO + 演示横幅 + docs/ + pre-commit 同步（见 §7）。
 - 前端：见 §9（CA可点/年龄/即时tooltip/只看持仓/雷达/弱红联动/自定义确认弹窗/骨架loading/紧凑化等）。
 - **SHADOW-only 自动交易 + 按信号统计**（见 §10b）：`AUTO` 拨钮开关 → 按 ACTION 信号自动开 $20 纸面仓位，代码规则三段式离场：+20%部分止盈(卖30%+移保本)/无固定上限的25%移动止损/逃生离场，初始硬止损-35%；同地址永久只入场一次；`GET /api/stats/auto` 按离场方式/LLM置信度桶/dev评分桶给胜率+累计PnL，前端右下角新增统计卡片。仅 SHADOW 生效，离开 SHADOW 自动关闭；人工一键买入/LIVE 全程仍人在环，未改。
-- **自动入场新增 crowdedness 硬拦**（见 §10b）：实盘发现自动买入过一个已从 ATH 跌 98% 后横盘的死币（entry_signal 里 `crowdedness=="crowded"`，但 `priority_score` 从不看这个字段）——`auto_open_position` 现在直接拒绝 `crowdedness=="crowded"` 的信号，不再只靠 5m/1h 短窗动能判断。
+- **自动入场新增 crowdedness/狙击/流动性硬拦**（见 §10b）：实盘发现自动买入过一个已从 ATH 跌 98% 后横盘的死币（entry_signal 里 `crowdedness=="crowded"`，但 `priority_score` 从不看这个字段）——`auto_open_position` 现在直接拒绝 `crowdedness=="crowded"`、狙击钱包数过多(`sniper_count>5`)、流动性过低(`liquidity<$3000`) 的信号；这三项此前都只在人工界面当标签/提示展示，从不影响自动交易的实际决策。
 
 **占位 / 待接入**
 - `LLMJudge.judge`：动能启发式占位 → 换真实 Claude/GPT（喂 `symbol_safe`+数值，绝不喂原始名；JSON 严格解析）。当前 llm_max=20。

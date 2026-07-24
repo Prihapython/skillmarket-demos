@@ -112,6 +112,11 @@ CFG = {
     "max_token_age_days": 3,
     "age_exception_min_conviction": 0.9,
     "age_exception_min_priority": 80,
+    # 自动入场额外硬拦（人工流程不受影响，仍只是 UI 提示）：
+    #   狙击钱包过多 → 大概率是开盘秒买等拉盘就跑的老鼠仓，随时可能砸盘；
+    #   流动性过低 → $20 的建仓/平仓本身就会显著滑点，止损/止盈价格失真。
+    "max_auto_sniper_count": 5,
+    "min_auto_liquidity_usd": 3000.0,
     # 自动交易三段式离场（用户指定）：
     #   1) +20% 部分止盈：卖 30%，锁定利润；
     #   2) 剩余仓位止损上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
@@ -1327,6 +1332,10 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     if v.crowdedness == "crowded":
         return                               # LLM 已判定该币为"拥挤/迟到"（大概率已过高峰段），priority_score
                                               # 不看 crowdedness，靠这里硬拦，避免追进已经死掉的顶部
+    if f.sniper_count > CFG["max_auto_sniper_count"]:
+        return                               # 狙击钱包过多 → 疑似秒买等拉盘就跑，目前只在 UI 标签展示、不影响评分，这里补硬拦
+    if f.liquidity < CFG["min_auto_liquidity_usd"]:
+        return                               # 流动性太薄，$20 建仓/平仓本身就会显著滑价，止损/止盈价格会失真
     if f.age_min > CFG["max_token_age_days"] * 1440:
         strong = (v.conviction >= CFG["age_exception_min_conviction"]
                   and pri >= CFG["age_exception_min_priority"])
