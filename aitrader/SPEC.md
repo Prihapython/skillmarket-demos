@@ -77,6 +77,8 @@ trending(便宜, 1 次 cli, 行内已含全部尽调字段)
 持仓逃生监控(纯代码, 无 LLM): 复用本轮 trending 行的安全字段(零额外 cli; 掉榜的币才单独查)
   → assess_escape 比对建仓快照, 命中信号累加 severity
   → 信号(口径稳定的才用): honeypot 新触发 / 增发权找回(renounced_mint true→false) / top10 大幅集中(+15%)
+    / 流动性腰斩(cur < entry×0.5, 疑似撤池)——只在两端都有真实读数(建仓时抓到 liquidity 且该币仍在本轮
+    trending 行内)才比较, 缺一端就跳过, 不用缺失数据造成误报
     ⚠️ 不要用 burn_ratio: LP 销毁不可逆且 token security 与 trending 行口径不同, 相减必误报"流动性撤离"
   → 真实价格涨跌: 持仓记 entry_price, 监控比对当前价算 pnl
   → severity≥escape_severity(70) 即逃生预警 → 用户一键平仓
@@ -332,6 +334,7 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 - **dev 评估维度 v3**（见 §4）：数据源 = **`portfolio created-tokens` 查 dev 钱包发币历史 + 最近 N 币 `token security` 逐币安全扫描**（实现 demo 真实算法）——**逐币存活率主导** + 发不安全币(可增发/未弃权/未开源/貔貅)/内盘沉底/换皮/已清仓减分。既作**排序子分**、又作**过滤门**（`min_dev_score` 砍工厂号，scan 流出现「Dev 信誉低」kill）。**前端**：`DEV评分` 列 + **点代币行右下角弹 Dev 信誉卡**（信誉分 + 历史发币/rug次数(率)/存活/换皮重发 + 安全扫描风险行 + 可信）。真实校准：LMAO! dev（rug率 98%·内盘沉底 10659）→ 0.0 被过滤；Mock 同构合成、无 key 可跑。
 - **持仓真实价格涨跌**（entry_price/cur_price/pnl）+ **落盘持久化**（positions.json，reload/重启不丢）+ **按链隔离** + **取消监控**(/api/unmonitor)。
 - **逃生监控修误报**：删 burn_ratio 信号（不可逆+跨源口径），只留 honeypot/renounced_mint/top10。
+- **逃生监控新增流动性撤池检测**：建仓时（人工 `do_buy` 与自动 `auto_open_position` 均）记录 `entry.liquidity`；`assess_escape` 新增信号——当前 liquidity（仅在持仓仍在本轮 trending 行内、有真实读数时才比较）跌破建仓时一半 → +50 severity，标"疑似撤池"。此前该信号只是代码注释里的 TODO，从未真正接入。同时补上 `MockGMGN` 缺失的 `liquidity` 字段（此前恒为 0，会让 SHADOW 自动交易的最低流动性门槛在 Mock/demo 模式下把所有信号都拦掉）。
 - **多链切换**（SOL/BSC/Base/ETH）：**链改为请求维度**（无全局当前链）——按链缓存 adapter + 按链 trending 短缓存(3s，同链多 tab 共享一次 cli)；前端每 tab 用 sessionStorage 各自持链，N tab 各看各链互不干扰；后台 tab 暂停轮询省配额。按链记忆命令(ST.trending_cmds)、买入单位/数量按链。
 - **启动自动连真实数据**（env key → use_live → /api/status → 前端 autoConnect），api_key 可留空。
 - **热榜命令按链默认 + 齿轮可配**（/api/settings；sol 默认=pump platform 命令）。

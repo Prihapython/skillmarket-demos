@@ -456,13 +456,15 @@ class MockGMGN(GMGNAdapter):
         def tok(symbol, price, mcap, vol, chg1h, *, chg5m=None, buys=600, sells=400,
                 honeypot=0, mint=1, freeze=1, burn=0.0,
                 buy_tax=0.0, sell_tax=0.0, rug=0.0, bundler=0.05, dev=0.03, top10=0.25,
-                degen=0, renowned=0, sniper=0, age_min=45,
+                degen=0, renowned=0, sniper=0, age_min=45, liq=None,
                 dev_open=6, dev_status="creator_hold", dev_bal=1.0, dev_ath_mc=0.0,
                 dev_delpost=0, dev_cto=0, dev_imgdup=0,
                 dev_inner=0, dev_surv=1.0, dev_badsec=0):
             if chg5m is None:
                 chg5m = round(chg1h * 0.3, 2)   # 默认 5m 与 1h 同向
-            return dict(symbol=symbol, price=price, market_cap=mcap, volume=vol,
+            if liq is None:
+                liq = round(mcap * 0.12)        # 未显式给 → 按典型 pump.fun 池子比例估一个（真实 trending 行都会带这个字段）
+            return dict(symbol=symbol, price=price, market_cap=mcap, volume=vol, liquidity=liq,
                         price_change_percent1h=chg1h, price_change_percent5m=chg5m,
                         buys=buys, sells=sells, swaps=buys + sells, is_honeypot=honeypot,
                         renounced_mint=mint, renounced_freeze_account=freeze, burn_ratio=burn,
@@ -1272,10 +1274,10 @@ class LLMJudge:
 #    对已开仓的币，比对「当前 vs 建仓时」的安全/筹码快照，命中信号即累加 severity。
 # ──────────────────────────────────────────────────────────────────────────
 def assess_escape(cur_sec: dict, entry: dict):
-    """安全快照 diff（只用方向明确、口径稳定的字段：honeypot / renounced_mint / top10）。
+    """安全快照 diff（只用方向明确、口径稳定的字段：honeypot / renounced_mint / top10 / liquidity）。
 
     注意：不要用 burn_ratio——LP 销毁不可逆（"下降"现实中不会发生），且 token security 与
-    trending 行的 burn_ratio 口径不同，相减必误报。流动性撤离应看 liquidity，后续再加。
+    trending 行的 burn_ratio 口径不同，相减必误报。
     """
     sev, sigs = 0, []
     if cur_sec.get("honeypot") and not entry.get("honeypot"):
@@ -1285,6 +1287,13 @@ def assess_escape(cur_sec: dict, entry: dict):
     # top10 跨源（建仓 token security vs 监控 trending 行）有波动，阈值放宽到 +15% 减少误报
     if cur_sec.get("top10", 0) > entry.get("top10", 0) + 0.15:
         sev += 22; sigs.append((f"top10 集中度升至 {cur_sec.get('top10',0):.0%}", cur_sec.get("top10",0) > 0.5))
+    # 流动性撤池检测：只在两端都拿到真实读数（entry>0 且 cur_sec 里存在该字段，即持仓仍在本轮 trending 行内）
+    # 才比较，避免用缺失/未知数据造成误报；池子腰斩以上视为强撤池信号（正常波动很少到这个量级）。
+    entry_liq = entry.get("liquidity", 0)
+    cur_liq = cur_sec.get("liquidity")
+    if entry_liq > 0 and cur_liq is not None and cur_liq < entry_liq * 0.5:
+        sev += 50
+        sigs.append((f"流动性从 {entry_liq:.0f} 跌至 {cur_liq:.0f}（疑似撤池）← 逃生信号", True))
     if not sigs:
         sigs.append(("持仓正常监控中", False))
     return min(100, sev), sigs
@@ -1355,7 +1364,8 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         sec = {}
     entry = dict(honeypot=sec.get("honeypot", False), renounced_mint=sec.get("renounced_mint", False),
                  renounced_freeze=sec.get("renounced_freeze", False),
-                 burn_ratio=sec.get("burn_ratio", 0.0), top10=sec.get("top10", 0.0))
+                 burn_ratio=sec.get("burn_ratio", 0.0), top10=sec.get("top10", 0.0),
+                 liquidity=f.liquidity)          # 建仓时的池子深度，逃生监控用来识别撤池/rug
     try:
         entry_price = g.token_price(f.address)
     except Exception:
@@ -1835,7 +1845,8 @@ def _sec_from_row(row: dict) -> dict:
                 renounced_mint=_b(row.get("renounced_mint")),
                 renounced_freeze=_b(row.get("renounced_freeze_account")),
                 burn_ratio=_f(row.get("burn_ratio")),
-                top10=_f(row.get("top_10_holder_rate")))
+                top10=_f(row.get("top_10_holder_rate")),
+                liquidity=_f(row.get("liquidity")))
 
 def monitor_positions(chain: str, rows_by_addr: dict | None = None) -> list[dict]:
     rows_by_addr = rows_by_addr or {}
@@ -1911,7 +1922,8 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
                  renounced_mint=sec.get("renounced_mint", False),
                  renounced_freeze=sec.get("renounced_freeze", False),
                  burn_ratio=sec.get("burn_ratio", 0.0),
-                 top10=sec.get("top10", 0.0))
+                 top10=sec.get("top10", 0.0),
+                 liquidity=_f(info.get("liquidity")))  # token info 同 trending 行字段名；查不到则 0，逃生检查会自动跳过
     symbol = sanitize(info.get("symbol", ""))
     try:
         entry_price = g.token_price(address)         # 建仓价（逃生监控算涨跌基准）
