@@ -43,6 +43,7 @@ STATIC_DIR = HERE / "static"
 OUT_DIR = HERE / "outputs"
 LOG_PATH = OUT_DIR / "trade_decisions.jsonl"
 POSITIONS_PATH = OUT_DIR / "positions.json"   # 持仓落盘：reload/重启不丢，与筛选榜完全独立
+AUTO_TRADE_PATH = OUT_DIR / "auto_trade_state.json"   # AUTO 开关落盘：见下方 load/save_auto_trade_state
 TRENDING_CMDS_PATH = OUT_DIR / "trending_cmds.json"   # 按链热榜命令落盘：用户改过即持久，重启/刷新不回默认
 ENV_PATH = pathlib.Path.home() / ".config" / "gmgn" / ".env"
 
@@ -1481,13 +1482,25 @@ def _load_auto_traded_addresses() -> set[str]:
             out.add(rec["address"])
     return out
 
+def load_auto_trade_state() -> bool:
+    """AUTO 开关落盘读取（见 save_auto_trade_state）；文件不存在/损坏 → 安全默认 False。"""
+    if not AUTO_TRADE_PATH.exists():
+        return False
+    try:
+        data = json.loads(AUTO_TRADE_PATH.read_text(encoding="utf-8"))
+        return bool(data.get("auto_trade"))
+    except Exception:
+        return False
+
 class AppState:
     """链改为「请求维度」：不再有全局当前链，按链缓存 adapter + trending 结果。
     mode/risk/positions 仍全局（钱包级、跨链合一）。self.chain 仅作启动默认 + status 展示。"""
     def __init__(self):
         self.lock = threading.Lock()
         self.mode = "SHADOW"          # SHADOW | LIVE（钱包级安全设置，全局）
-        self.auto_trade = False       # SHADOW-only 自动交易开关；不落盘，重启回默认 False（同 mode 的安全默认哲学）
+        self.auto_trade = load_auto_trade_state()  # SHADOW-only 自动交易开关；落盘持久化，重启自动恢复上次状态
+                                       # （mode 本身仍不落盘、重启回默认 SHADOW——即使 auto_trade 恢复为 True，
+                                       # 也只在 mode=="SHADOW" 时才真正生效，LIVE 下这条路径全程不触发）
         self.auto_traded_addresses: set[str] = _load_auto_traded_addresses()  # 永久黑名单：同一地址只自动入场一次
         self.chain = CFG["chain"]     # 启动默认链（仅用于未带 chain 的请求兜底 + status 展示）
         self.live = False             # 是否已配 key（决定按链建 Live 还是 Mock 适配器）
@@ -1591,6 +1604,15 @@ def load_positions() -> list:
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+def save_auto_trade_state():
+    """AUTO 开关落盘：之前 systemctl restart（每次部署都会触发）会把它悄悄重置成 False，
+    自主交易循环停了都没人发现——用户明确要求持久化，重启后自动恢复上次的开关状态。"""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        AUTO_TRADE_PATH.write_text(json.dumps({"auto_trade": ST.auto_trade}), encoding="utf-8")
+    except Exception:
+        pass
 
 # 启动时把落盘的持仓加载回内存（reload/重启后持仓不丢，且与筛选榜无关）
 ST.positions = load_positions()
@@ -2182,6 +2204,7 @@ def api_config(cfg: ConfigIn):
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
         if ST.mode != "SHADOW" and ST.auto_trade:    # 自动交易仅 SHADOW；离开 SHADOW 就可见地关掉
             ST.auto_trade = False
+            save_auto_trade_state()
             log("AUTO_TOGGLE", "-", "mode 离开 SHADOW → auto_trade 自动关闭")
         try:
             ST.use_live()      # 配了 key 即走真实数据适配器（按链按需建，只读真实行情）
@@ -2199,6 +2222,7 @@ def api_mode(m: ModeIn):
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
         if ST.mode != "SHADOW" and ST.auto_trade:    # 自动交易仅 SHADOW；离开 SHADOW 就可见地关掉
             ST.auto_trade = False
+            save_auto_trade_state()
             log("AUTO_TOGGLE", "-", "mode 离开 SHADOW → auto_trade 自动关闭")
     return dict(ok=True, mode=ST.mode, trading_locked=LIVE_TRADING_DISABLED, auto_trade=ST.auto_trade)
 
@@ -2208,6 +2232,7 @@ def api_auto_trade(a: AutoTradeIn):
     _block_if_public()
     with ST.lock:
         ST.auto_trade = bool(a.enabled) and ST.mode == "SHADOW"
+        save_auto_trade_state()
         log("AUTO_TOGGLE", "-", f"auto_trade={ST.auto_trade}")
     return dict(ok=True, auto_trade=ST.auto_trade, mode=ST.mode)
 
