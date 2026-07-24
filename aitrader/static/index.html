@@ -700,6 +700,7 @@ const I18N={
     partial_lbl:'部分',
     stats_h3:'自动交易统计', stats_none:'暂无已平仓的自动交易',
     stats_total:(n)=>`${n} 笔`, stats_winrate:'胜率', stats_pnl:'累计 PnL',
+    period_day:'按日', period_week:'按周', period_month:'按月',
     stats_by_exit:'按离场方式', stats_by_conv:'按 LLM 置信度', stats_by_dev:'按 Dev 评分',
     exit_AUTO_SL:'止损', exit_AUTO_TP:'止盈', exit_AUTO_TRAIL:'移动止损', exit_AUTO_ESCAPE:'逃生信号', exit_unknown:'—',
     exit_AUTO_TP1_PARTIAL:'部分止盈+20%', exit_AUTO_TP2:'最终止盈+150%', exit_AUTO_TRAIL_BE:'保本/移动止损',
@@ -880,6 +881,7 @@ const I18N={
     partial_lbl:'partial',
     stats_h3:'Auto-trade stats', stats_none:'No closed auto-trades yet',
     stats_total:(n)=>`${n} trades`, stats_winrate:'win rate', stats_pnl:'total PnL',
+    period_day:'By day', period_week:'By week', period_month:'By month',
     stats_by_exit:'By exit reason', stats_by_conv:'By LLM conviction', stats_by_dev:'By dev score',
     exit_AUTO_SL:'stop-loss', exit_AUTO_TP:'take-profit', exit_AUTO_TRAIL:'trailing stop', exit_AUTO_ESCAPE:'escape signal', exit_unknown:'—',
     exit_AUTO_TP1_PARTIAL:'partial TP +20%', exit_AUTO_TP2:'final TP +150%', exit_AUTO_TRAIL_BE:'breakeven/trailing stop',
@@ -1060,6 +1062,7 @@ const I18N={
     partial_lbl:'частково',
     stats_h3:'Статистика автотрейду', stats_none:'Ще немає закритих угод автотрейду',
     stats_total:(n)=>`${n} угод`, stats_winrate:'вінрейт', stats_pnl:'сумарний PnL',
+    period_day:'По днях', period_week:'По тижнях', period_month:'По місяцях',
     stats_by_exit:'За причиною виходу', stats_by_conv:'За впевненістю LLM', stats_by_dev:'За dev-скором',
     exit_AUTO_SL:'стоп-лос', exit_AUTO_TP:'тейк-профіт', exit_AUTO_TRAIL:'трейлінг-стоп', exit_AUTO_ESCAPE:'сигнал втечі', exit_unknown:'—',
     exit_AUTO_TP1_PARTIAL:'частковий тейк +20%', exit_AUTO_TP2:'фінальний тейк +150%', exit_AUTO_TRAIL_BE:'беззбиток/трейлінг',
@@ -1692,8 +1695,10 @@ function toggleAuto(){
   if(goOn)confirmDialog(t('confirm_auto_title'),t('confirm_auto_msg'),()=>apply(true));
   else apply(false);
 }
+let autoStatsPeriod='day', lastAutoStats=null;
+function setStatsPeriod(p){autoStatsPeriod=p;if(lastAutoStats)renderAutoStats(lastAutoStats);}
 function renderAutoStats(s){
-  // 独立大卡片(左列，同筛选表同宽)：头部统计(笔数/W-L/胜率/PnL) + 逐笔成交真表，点行开该币 GMGN 图表
+  // 独立大卡片(左列，同筛选表同宽)：头部统计(笔数/W-L/胜率/PnL) + 按日/周/月胜率表 + 逐笔成交真表，点行开该币 GMGN 图表
   const box=document.getElementById('autostats'); if(!box)return;
   const cnt=document.getElementById('autoStatsCnt');
   if(!s||!s.total_trades){
@@ -1701,8 +1706,15 @@ function renderAutoStats(s){
     box.innerHTML=`<div class="posempty">${t('stats_none')}</div>`;
     return;
   }
+  lastAutoStats=s;
   if(cnt)cnt.textContent=t('stats_total',s.total_trades);
   const pnlCls=s.total_pnl_usd>=0?'up':'dn';
+  const periodArr=[...(s['by_'+autoStatsPeriod]||[])].reverse();   // 最近的时段排最上面
+  const periodRows=periodArr.map(p=>{
+    const wc=p.win_rate>=0.5?'up':'dn', pc=p.total_pnl_usd>=0?'up':'dn';
+    return `<tr><td>${p.key}</td><td>${p.n}</td><td class="pnl ${wc}">${(p.win_rate*100).toFixed(0)}%</td>
+      <td class="pnl ${pc}">${p.total_pnl_usd>=0?'+':''}$${p.total_pnl_usd}</td></tr>`;
+  }).join('') || `<tr><td colspan="4" class="posempty">${t('stats_none')}</td></tr>`;
   const rows=(s.recent||[]).map(r=>{
     const tag=t('exit_'+(r.exit_tag||'unknown'))||r.exit_tag||'';
     const pc=r.pnl>=0?'up':'dn';
@@ -1722,7 +1734,13 @@ function renderAutoStats(s){
       <span><b class="${s.win_rate>=0.5?'up':'dn'}">${(s.win_rate*100).toFixed(0)}%</b> ${t('stats_winrate')}</span>
       <span><b class="${pnlCls}">${s.total_pnl_usd>=0?'+':''}$${s.total_pnl_usd}</b> ${t('stats_pnl')}</span>
     </div>
-    <table class="astable"><tbody>${rows}</tbody></table>`;
+    <div class="seg2" style="margin:8px 0 6px">
+      <button class="${autoStatsPeriod==='day'?'on':''}" onclick="setStatsPeriod('day')">${t('period_day')}</button>
+      <button class="${autoStatsPeriod==='week'?'on':''}" onclick="setStatsPeriod('week')">${t('period_week')}</button>
+      <button class="${autoStatsPeriod==='month'?'on':''}" onclick="setStatsPeriod('month')">${t('period_month')}</button>
+    </div>
+    <table class="astable"><tbody>${periodRows}</tbody></table>
+    <table class="astable" style="margin-top:8px"><tbody>${rows}</tbody></table>`;
 }
 async function fetchAutoStats(){
   if(source!=='backend')return;

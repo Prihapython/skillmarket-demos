@@ -1638,6 +1638,25 @@ def _row_usd(r: dict) -> float:
     v = r.get("usd_notional")
     return v if v else CFG["auto_size_usd"]
 
+def _local_ts(r: dict) -> datetime.datetime | None:
+    """日志 ts 是 UTC ISO 字符串；按钮/时钟统一显示本地时区 UTC+3（见前端 tick()），
+    按日/周/月分桶也用同一偏移，避免日期边界跟 UI 时钟对不上。"""
+    try:
+        return datetime.datetime.fromisoformat(r["ts"]) + datetime.timedelta(hours=3)
+    except Exception:
+        return None
+
+def _period_key(r: dict, period: str) -> str:
+    dt = _local_ts(r)
+    if dt is None:
+        return "unknown"
+    if period == "day":
+        return dt.strftime("%Y-%m-%d")
+    if period == "week":
+        iso = dt.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    return dt.strftime("%Y-%m")  # month
+
 def _group_trades(rows: list[dict], keyfn) -> list[dict]:
     buckets: dict[str, list[dict]] = {}
     for r in rows:
@@ -1662,7 +1681,8 @@ def compute_auto_stats() -> dict:
     n = len(full_rows)
     if n == 0:
         return dict(total_trades=0, wins=0, losses=0, win_rate=0, total_pnl_usd=0, avg_pnl_pct=0,
-                    by_exit_tag=[], by_conviction=[], by_crowdedness=[], by_dev_bucket=[], recent=[])
+                    by_exit_tag=[], by_conviction=[], by_crowdedness=[], by_dev_bucket=[],
+                    by_day=[], by_week=[], by_month=[], recent=[])
     wins = sum(1 for r in full_rows if r.get("pnl", 0) > 0)
     losses = sum(1 for r in full_rows if r.get("pnl", 0) <= 0)
     total_usd = sum(r.get("pnl", 0) * _row_usd(r) for r in rows)
@@ -1673,6 +1693,9 @@ def compute_auto_stats() -> dict:
         by_conviction=_group_trades(full_rows, lambda r: _bucket_conviction((r.get("entry_signal") or {}).get("conviction"))),
         by_crowdedness=_group_trades(full_rows, lambda r: (r.get("entry_signal") or {}).get("crowdedness") or "unknown"),
         by_dev_bucket=_group_trades(full_rows, lambda r: _bucket_dev((r.get("entry_signal") or {}).get("dev_score"))),
+        by_day=sorted(_group_trades(full_rows, lambda r: _period_key(r, "day")), key=lambda x: x["key"]),
+        by_week=sorted(_group_trades(full_rows, lambda r: _period_key(r, "week")), key=lambda x: x["key"]),
+        by_month=sorted(_group_trades(full_rows, lambda r: _period_key(r, "month")), key=lambda x: x["key"]),
         recent=[dict(ts=r.get("ts"), symbol=r.get("symbol"), address=r.get("address"), chain=r.get("chain"),
                     pnl=r.get("pnl", 0), exit_tag=r.get("exit_tag"), entry_signal=r.get("entry_signal"),
                     partial=bool(r.get("partial")))
