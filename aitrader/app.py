@@ -125,6 +125,12 @@ CFG = {
     # 从未被任何门槛用过（真实事故：9 分钟新币 Gorou，图表几乎空白，conviction 却给到 0.95）。
     "min_auto_swaps": 50,            # swaps = buys+sells 之和，不是只看买入笔数
     "min_auto_volume_usd": 10000.0,  # 1h 成交额
+    # 用户复盘发现：连续几笔亏损的共同点不是"哪个指标不合格"，而是每个指标都刚好卡在及格线
+    # （sm_confluence 全部=1，即 hard_gates 的最低门槛；dev_score 半数正好=0.15，也是最低门槛）——
+    # 每项单独都"过关"，但没有一项有安全冗余，系统对"压线通过"和"轻松通过"一视同仁。
+    # 目标不是多交易，是高胜率——这里给自动交易额外加码，要求比人工流程的最低门槛更有把握。
+    "min_auto_sm_confluence": 2,     # 高于 hard_gates 共用的 min_smart_money_confluence(1)
+    "min_auto_dev_score": 0.30,      # 高于筛选流水线共用的 min_dev_score(0.15)
     # 自动交易离场（用户指定，2026-07-24 起改四段）：
     #   1) +20% 第一次部分止盈：卖原始仓位的 30%，锁定利润；
     #      剩余仓位止损立即上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
@@ -1382,6 +1388,12 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
                                               # 里扣 0.10 分，综合分仍可能远高于 min_dev_score 门槛而通过；
                                               # 真实事故：Vader，dev 历史 100 币 97% rug，且已卖出这个币，
                                               # dev_score=0.21 照样过关。这个信号单独就该硬拦，不该被平均掉。
+    if f.sm_confluence < CFG["min_auto_sm_confluence"]:
+        return                               # 聪明钱+KOL 计数刚好卡在 hard_gates 最低线(1)不是好现象——
+                                              # 真实事故：连续三笔亏损全部 sm_confluence==1，无任何安全冗余
+    if f.dev_eval is not None and f.dev_eval < CFG["min_auto_dev_score"]:
+        return                               # dev 评分刚好卡在筛选流水线最低线(0.15)同理——
+                                              # 三笔亏损里两笔 dev_score 正好等于 0.15
     if f.age_min > CFG["max_token_age_days"] * 1440:
         strong = (v.conviction >= CFG["age_exception_min_conviction"]
                   and pri >= CFG["age_exception_min_priority"])
