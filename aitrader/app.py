@@ -1442,9 +1442,17 @@ def _auto_decide_exit(p: dict):
         return None
     # 第一次部分止盈后：保本价/移动止损保护立即持续生效（不因等第二刀暂停）——
     # 剩余仓位止损 = max(保本价, 峰值价的移动止损)，只升不降 → 这笔交易此后不可能再亏钱
+    # 移动止损口径（用户明确要求）：固定"回撤 auto_trailing_pct 个百分点"，而不是"回撤峰值价格的
+    # auto_trailing_pct 比例"——后者在涨幅越大时允许回吐的百分点越多（如峰值+200%时止损才+125%，
+    # 回吐 75 点），前者无论峰值多高，回吐永远固定 25 点（峰值+200%止损在+175%）,对大涨幅锁盈更狠。
     peak = max(p.get("peak_price", 0.0), cur)
     p["peak_price"] = peak
-    stop_price = max(entry, peak * (1 - CFG["auto_trailing_pct"])) if entry > 0 else 0
+    if entry > 0:
+        peak_pct = peak / entry - 1
+        stop_pct = max(0.0, peak_pct - CFG["auto_trailing_pct"])   # 保本兜底：回撤后的止损不低于 0%
+        stop_price = entry * (1 + stop_pct)
+    else:
+        stop_price = 0
     if entry > 0 and cur > 0 and cur <= stop_price:
         p["pnl"] = max(pnl, stop_price / entry - 1)   # 同样按止损触发价成交，不按滑点后的更差价格
         return ("full", "AUTO_TRAIL_BE")

@@ -315,7 +315,7 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 - **离场**（`auto_manage_exits`，`monitor_positions` 之后单独一遍，三段式，用户明确指定）：
   1. 逃生 severity ≥ `escape_severity`(70) → 立即全仓离场（复用既有 `assess_escape`）。
   2. 部分止盈前：pnl ≤ `-hard_stop_pct`(-35%) → 全仓止损；pnl ≥ `auto_tp1_pct`(+20%) → 卖出 `auto_tp1_sell_frac`(30%)、锁定利润，剩余止损上移到保本价（此后这笔交易不可能再亏钱）。
-  3. 部分止盈后：剩余仓位止损 = `max(保本价, 峰值价×(1-auto_trailing_pct))`（`auto_trailing_pct=25%`，只升不降），**无固定金额硬止盈上限**——用户明确要求不设 tp_ladder 式的强制清仓价，让盈利尽量跑。
+  3. 部分止盈后：止损百分比 = `max(0, 峰值涨幅% - auto_trailing_pct个百分点)`，止损价 = `entry×(1+止损百分比)`（只升不降）——**固定百分点回撤，不是峰值价格的比例回撤**：无论峰值涨了多少，止损位永远只比峰值少 25 个百分点（如峰值+200%，止损在+175%），而不是"峰值价格打 75 折"（那样峰值+200%止损只能保住+125%，涨幅越大放弃的利润越多）；用户明确要求这个口径，因为涨幅越大越应该锁死更多利润，不该让"回撤比例"随涨幅一起放大。**无固定金额硬止盈上限**——用户明确要求不设 tp_ladder 式的强制清仓价，让盈利尽量跑。
   止损/移动止损触发时，实际记录的 pnl 会夹平到触发阈值（不会因扫描周期间的滑点比设定止损更差）。
 - **持仓新字段**（随 `positions.json` 免额外插件持久化）：`auto`、`entry_signal`(verdict/conviction/crowdedness/dev_score/priority/sm_confluence 的一次性入场快照)、`orig_size_sol`(建仓时的原始数量，部分止盈后 `size_sol` 会缩小)、`tp1_done`、`peak_price`。前端持仓卡片对 `auto=true` 显示 `AUTO` 徽章 + 已部分止盈态。
 - **统计数据源**：不新开文件，直接扩展 `do_sell`/`do_sell_partial` 写进 `trade_decisions.jsonl` 的 `SELL` 记录（带 `auto`/`exit_tag`(`AUTO_SL`/`AUTO_TP1_PARTIAL`/`AUTO_TRAIL_BE`/`AUTO_ESCAPE`)/`entry_signal`/`pnl`/`usd_notional`/`partial`），一笔仓位可能对应 2 条记录（部分止盈+最终离场）。`compute_auto_stats()` 只按**最终离场**（`partial!=true`）那条记录算笔数/胜率，避免部分止盈过的仓位被重复计成 2 笔；累计 $PnL 仍对全部记录求和（`usd_notional` 按占原始 $20 的比例折算，跨币种可直接加总）。这是 `trade_decisions.jsonl`（见 §5 点4「只写不读」）的第一个真正读取者。`GET /api/stats/auto` 按 exit_tag / LLM 置信度桶 / dev 评分桶 / **按日·周·月**（`by_day`/`by_week`/`by_month`，UTC ts + 3h 折算本地日历边界，与 UI 时钟一致；ISO 周号）分组。前端右下角新增紧凑统计卡片，含日/周/月切换表。
