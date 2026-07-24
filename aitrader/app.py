@@ -1812,6 +1812,24 @@ def _public_broadcast_loop():
             _PUBLIC_CACHE["err"] = str(e)
         stop.wait(DEFAULT_POLL_S)
 
+# ──────────────────────────────────────────────────────────────────────────
+# 8c. 后台自主交易循环（与是否有浏览器打开无关）
+#     此前 screen_once 只由浏览器的 /api/run 轮询触发——部署到服务器就是为了断电/关浏览器时
+#     机器人也能继续跑，但没人开着页面时后端其实完全静止，AUTO 开着也不会有任何新扫描/新交易/
+#     止盈止损检查。这里补一个不依赖任何客户端的后台线程，只要 AUTO 开着就自己按 DEFAULT_POLL_S
+#     跑 screen_once（复用同一套硬门槛/评分/LLM/自动开平仓逻辑，和浏览器触发的完全一样，
+#     ST.lock 保证不会跟浏览器发起的请求并发踩踏）。AUTO 关着时只空转睡眠，不烧 CLI 配额。
+# ──────────────────────────────────────────────────────────────────────────
+def _autonomous_trade_loop():
+    while True:
+        try:
+            if ST.mode == "SHADOW" and ST.auto_trade:
+                with ST.lock:
+                    screen_once("sol")   # 只扫 TRADEABLE_CHAINS 里唯一可交易的链
+        except Exception as e:
+            log("AUTOLOOP_ERR", "-", str(e))
+        time.sleep(DEFAULT_POLL_S)
+
 def _dev_reject_reason(f) -> str:
     """dev 评分过滤的拒绝理由（demo 风格：点明工厂号/换皮/喷币/已清仓）。"""
     dp = f.dev or {}
@@ -2365,6 +2383,9 @@ def _maybe_start_public_broadcast():
     # 公开演示模式：启动后台守护线程定时刷新真实筛选缓存（仅此线程触发 CLI）。
     if PUBLIC_DEMO:
         threading.Thread(target=_public_broadcast_loop, daemon=True).start()
+    # 自主交易循环：无论 PUBLIC_DEMO 与否、无论有没有浏览器连着，都启动——
+    # AUTO 开关本身已经是"是否真的跑"的开关（见 _autonomous_trade_loop 内的判断）。
+    threading.Thread(target=_autonomous_trade_loop, daemon=True).start()
 
 if __name__ == "__main__":
     import uvicorn
