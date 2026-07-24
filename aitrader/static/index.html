@@ -110,8 +110,11 @@ body.publicro #escCard{display:none !important}
 .h3gear:hover{border-color:var(--lime);color:var(--lime)}.h3gear svg{width:13px;height:13px}
 .card>h3 .scanning.on{opacity:1}
 .card>h3 .cnt{margin-left:auto;font-size:10px;color:var(--dim);font-family:var(--mono);font-weight:400}
-/* 所有卡片内容区都允许用户手动拖拽调整高度（内容常常比卡片默认高度多，如筛选结果表/多空持仓/多日统计） */
-.card .body{flex:1;overflow:auto;min-height:120px;max-height:80vh;resize:vertical}
+.card .body{flex:1;overflow:auto;min-height:120px}
+/* 拖拽调整卡片高度的手柄（原生 CSS resize 在 flex:1 子项上不可靠，改手写拖拽） */
+.rzhandle{flex-shrink:0;height:10px;cursor:ns-resize;display:flex;align-items:center;justify-content:center;background:var(--ink2);border-top:1px solid var(--line);touch-action:none;user-select:none}
+.rzhandle::before{content:'';width:34px;height:3px;border-radius:2px;background:var(--line);transition:.15s}
+.rzhandle:hover::before,.rzhandle.dragging::before{background:var(--lime)}
 
 /* pipeline table */
 table{width:100%;border-collapse:collapse;font-size:12px}
@@ -438,7 +441,7 @@ td{padding:5px 10px;vertical-align:middle}
     <div class="col">
       <div class="card" style="flex:1.6">
         <h3 id="ic-pipe"><span data-i18n="pipe_h3">筛选结果 · 待你决策</span><span class="scanning" id="scanning" data-i18n="scanning">◢ 扫描中…</span><span class="amt-wrap" data-i18n-title="amt_title"><span class="amt-lbl" data-i18n="amt_lbl">买入</span><input id="amtInput" class="amt-in" type="number" step="0.01" min="0" value="0.01" oninput="onAmt(this)"><span class="amt-lbl" id="amtUnit">SOL</span></span><span class="h3gear" id="pipeGear" data-i18n-title="pipegear_title"></span></h3>
-        <div class="body">
+        <div class="body" id="pipeBody">
           <table>
             <thead><tr>
               <th><span data-i18n="th_token">TOKEN</span> <span class="tokf" id="tokFilter"></span></th><th data-i18n="th_pipe">规则→排序→LLM</th><th data-i18n="th_safe">安全</th><th data-i18n="th_bund">捆绑</th><th data-i18n="th_dev">DEV</th><th data-i18n="th_t10">前10</th><th data-i18n="th_smart">聪明钱/KOL</th><th data-i18n="th_devhist">DEV史</th><th data-i18n="th_timing">时机</th><th>LLM</th><th data-i18n="th_pri">优先级</th><th data-i18n="th_dec">决策</th>
@@ -446,11 +449,13 @@ td{padding:5px 10px;vertical-align:middle}
             <tbody id="rows"></tbody>
           </table>
         </div>
+        <div class="rzhandle" data-target="pipeBody" data-i18n-title="rz_title"></div>
         <div class="detail" id="detail"></div>
       </div>
       <div class="card" style="flex:1" id="autoStatsCard">
         <h3 id="ic-autostats"><span data-i18n="stats_h3">自动交易统计</span> <span class="cnt" id="autoStatsCnt"></span></h3>
         <div class="body" id="autostats"></div>
+        <div class="rzhandle" data-target="autostats" data-i18n-title="rz_title"></div>
       </div>
     </div>
 
@@ -458,6 +463,7 @@ td{padding:5px 10px;vertical-align:middle}
       <div class="card" style="flex:1;min-height:170px" id="escCard">
         <h3 id="ic-esc"><span data-i18n="esc_h3">持仓逃生监控</span> <span class="cnt" id="escCnt"></span></h3>
         <div class="body" id="positions"></div>
+        <div class="rzhandle" data-target="positions" data-i18n-title="rz_title"></div>
       </div>
       <div class="card" style="flex:0 0 auto">
         <div class="riskmini" id="riskmini"></div>
@@ -702,6 +708,7 @@ const I18N={
     stats_h3:'自动交易统计', stats_none:'暂无已平仓的自动交易',
     stats_total:(n)=>`${n} 笔`, stats_winrate:'胜率', stats_pnl:'累计 PnL',
     period_day:'按日', period_week:'按周', period_month:'按月',
+    rz_title:'拖拽调整高度',
     stats_by_exit:'按离场方式', stats_by_conv:'按 LLM 置信度', stats_by_dev:'按 Dev 评分',
     exit_AUTO_SL:'止损', exit_AUTO_TP:'止盈', exit_AUTO_TRAIL:'移动止损', exit_AUTO_ESCAPE:'逃生信号', exit_unknown:'—',
     exit_AUTO_TP1_PARTIAL:'部分止盈+20%', exit_AUTO_TP2:'最终止盈+150%', exit_AUTO_TRAIL_BE:'保本/移动止损',
@@ -883,6 +890,7 @@ const I18N={
     stats_h3:'Auto-trade stats', stats_none:'No closed auto-trades yet',
     stats_total:(n)=>`${n} trades`, stats_winrate:'win rate', stats_pnl:'total PnL',
     period_day:'By day', period_week:'By week', period_month:'By month',
+    rz_title:'Drag to resize',
     stats_by_exit:'By exit reason', stats_by_conv:'By LLM conviction', stats_by_dev:'By dev score',
     exit_AUTO_SL:'stop-loss', exit_AUTO_TP:'take-profit', exit_AUTO_TRAIL:'trailing stop', exit_AUTO_ESCAPE:'escape signal', exit_unknown:'—',
     exit_AUTO_TP1_PARTIAL:'partial TP +20%', exit_AUTO_TP2:'final TP +150%', exit_AUTO_TRAIL_BE:'breakeven/trailing stop',
@@ -1064,6 +1072,7 @@ const I18N={
     stats_h3:'Статистика автотрейду', stats_none:'Ще немає закритих угод автотрейду',
     stats_total:(n)=>`${n} угод`, stats_winrate:'вінрейт', stats_pnl:'сумарний PnL',
     period_day:'По днях', period_week:'По тижнях', period_month:'По місяцях',
+    rz_title:'Потягніть, щоб змінити висоту',
     stats_by_exit:'За причиною виходу', stats_by_conv:'За впевненістю LLM', stats_by_dev:'За dev-скором',
     exit_AUTO_SL:'стоп-лос', exit_AUTO_TP:'тейк-профіт', exit_AUTO_TRAIL:'трейлінг-стоп', exit_AUTO_ESCAPE:'сигнал втечі', exit_unknown:'—',
     exit_AUTO_TP1_PARTIAL:'частковий тейк +20%', exit_AUTO_TP2:'фінальний тейк +150%', exit_AUTO_TRAIL_BE:'беззбиток/трейлінг',
@@ -2359,6 +2368,35 @@ async function autoConnect(){
     setSource('demo');
   }
 }
+function initResize(){
+  document.querySelectorAll('.rzhandle').forEach(h=>{
+    const target=document.getElementById(h.dataset.target);
+    if(!target)return;
+    let startY=0,startH=0,dragging=false;
+    const clientY=e=>e.touches?e.touches[0].clientY:e.clientY;
+    const onMove=e=>{
+      if(!dragging)return;
+      const newH=Math.max(120,Math.min(window.innerHeight*0.85,startH+(clientY(e)-startY)));
+      target.style.flex='0 0 auto';target.style.height=newH+'px';
+      e.preventDefault();
+    };
+    const onUp=()=>{
+      dragging=false;h.classList.remove('dragging');document.body.style.cursor='';
+      document.removeEventListener('mousemove',onMove);document.removeEventListener('mouseup',onUp);
+      document.removeEventListener('touchmove',onMove);document.removeEventListener('touchend',onUp);
+    };
+    const onDown=e=>{
+      dragging=true;h.classList.add('dragging');startY=clientY(e);startH=target.getBoundingClientRect().height;
+      document.body.style.cursor='ns-resize';
+      document.addEventListener('mousemove',onMove);document.addEventListener('mouseup',onUp);
+      document.addEventListener('touchmove',onMove,{passive:false});document.addEventListener('touchend',onUp);
+      e.preventDefault();
+    };
+    h.addEventListener('mousedown',onDown);
+    h.addEventListener('touchstart',onDown,{passive:false});
+  });
+}
+initResize();
 autoConnect();
 </script>
 </body>
