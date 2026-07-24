@@ -1459,7 +1459,10 @@ function renderFunnel(){
   // 闸门漏斗图已整块移除（与顶部 KPI 卡数字重复，用户明确要求删掉）；此函数只保留风控迷你条渲染
   // 用户要求：并发持仓/总敞口只显示当前值，不显示 "/上限"；连亏行、当日亏损行整条移除（对应限制已在后端撤销）。
   const bars=[[t('risk_open'),POS.length,RISK.openMax,'',false],[t('risk_expo'),+(+RISK.expo).toFixed(3),RISK.expoMax,' SOL',false]];
-  document.getElementById('riskmini').innerHTML=bars.map(b=>{const [label,val,max,unit,showMax]=b;const r=max?val/max:0,hot=showMax&&r>=1;
+  // showMax 只控制是否显示 "/上限" 文字，跟 hot（是否亮红色警告）是两回事——
+  // 之前误用同一个 flag 导致 showMax=false 时 hot 恒为 false，逼近/达到仓位或敞口上限时
+  // 再也不会有红色高亮提示了，这里用真实比例 r 单独判断 hot，跟是否显示分母文字无关。
+  document.getElementById('riskmini').innerHTML=bars.map(b=>{const [label,val,max,unit,showMax]=b;const r=max?val/max:0,hot=r>=1;
     const valTxt=showMax?`${val}${unit} / ${max}${unit}`:`${val}${unit}`;
     return `<div class="rkrow"><div class="h"><span>${label}</span><b class="${hot?'hot':''}">${valTxt}</b></div>
     <div class="t"><i class="${hot?'hot':''}" data-w="${Math.min(r,1)*100}"></i></div></div>`;}).join('');
@@ -1658,8 +1661,10 @@ function applyAutoLabel(){
 // 后端真实 auto_trade → 同步前端拨钮（如后端因切 LIVE / 重启而自动关闭）
 // 每轮都无条件按后端值重绘（不再"值没变就跳过"）——万一某次因为竞态/异常导致 DOM 和
 // autoTrade 变量不一致，之前的写法会一直卡在错误状态，永远不会自我修复；现在每轮强制对齐。
+let autoToggleInFlight=false;   // toggleAuto() 的 POST 还没返回时，忽略本轮 /api/run 带回的旧值，
+                                 // 避免它把 toggleAuto 乐观设置的新状态又刷回旧状态（转瞬即逝的错误闪烁）。
 function syncAutoTrade(v){
-  if(typeof v!=='boolean')return;
+  if(typeof v!=='boolean'||autoToggleInFlight)return;
   const was=autoTrade;
   autoTrade=v;
   applyAutoLabel();
@@ -1674,6 +1679,7 @@ function toggleAuto(){
     return;
   }
   const apply=async(target)=>{
+    autoToggleInFlight=true;
     try{
       const r=await fetch(API+'/api/auto_trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:target})});
       if(!r.ok)throw new Error(await errDetail(r));
@@ -1681,6 +1687,7 @@ function toggleAuto(){
       autoTrade=!!d.auto_trade;applyAutoLabel();
       toast(autoTrade?t('toast_auto_on'):t('toast_auto_off'),autoTrade?'err':'ok');
     }catch(e){toast(t('toast_auto_fail',e.message),'err');}
+    finally{autoToggleInFlight=false;}
   };
   if(goOn)confirmDialog(t('confirm_auto_title'),t('confirm_auto_msg'),()=>apply(true));
   else apply(false);

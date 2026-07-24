@@ -295,8 +295,8 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 - 共识：`min_smart_money_confluence=1`（=smart_degen+renowned）。
 - 排序：`rank_weights={mom5m:30,mom1h:12,buy_pressure:18,turnover:12,consensus:12,safety:10,dev:12}`；阴跌沉底 `momentum_reject_chg1h=-0.12/chg5m=-0.06`；金狗/接盘 `buy_ratio_pass=0.50/buy_ratio_reject=0.42`。
 - dev 评估：`dev_pool_n=24`（初排后取前 N 个查 dev 历史，>llm_max 以便 dev 重排 gate3 边界）、`dev_info_ttl_s=600`（dev 画像按地址缓存秒数）、`min_dev_score=0.15`（dev 评分过滤门：低于此分的工厂号/连环换皮直接砍）、`dev_sec_scan_n=3`（对 dev 最近 N 个发币逐个查 token security 做安全扫描）。
-- 风控：`max_concurrent_positions=20`（**感受阶段放宽**，真实上线前应调回 2~3）、`max_total_exposure_sol=1.0`、`daily_loss_cap_sol=0.5`、`kill_switch_consec_losses=3`。
-- SHADOW-only 自动交易（见 §10b）：`auto_size_usd=20.0`、`max_auto_positions=5`、`auto_reentry_cooldown_s=90.0`。
+- 风控：`max_concurrent_positions=20`（**感受阶段放宽**，真实上线前应调回 2~3）、`max_total_exposure_sol=1.0`。`daily_loss_cap_sol=0.5`、`kill_switch_consec_losses=3` 两项已按用户明确要求从 `RiskManager.gate()` 里移除（不再拦截下单），只保留字段用于展示，不再是硬控。
+- SHADOW-only 自动交易（见 §10b）：`auto_size_usd=20.0`、`max_auto_positions=5`；同地址永久黑名单（`ST.auto_traded_addresses`，非限时冷却）。
 - 安全护栏：`LIVE_TRADING_DISABLED`（app.py 顶部）。**当前为 `False`（已解锁真实交易）**：LIVE 模式 + 已配 `GMGN_PRIVATE_KEY` 时，「一键买入/平仓」会经签名密钥**真实发单、动用资金、不可逆**。仍是人在环（只有点按钮才成交），SHADOW 仍是默认安全态、需手动切 LIVE 才真发。置回 `True` 即可一键封死所有链上写。
   - **真实下单前置**：`~/.config/gmgn/.env` 的 `GMGN_PRIVATE_KEY` 必须非空（签名密钥），否则 `gmgn-cli swap/order` 报错；前端会显示「链上买入失败：…」清晰原因，不建仓。
   - **多链已对齐**（gmgn-cli 1.3.9 权威 Chain Currencies 表）：原生币 SOL=`So111…112`(9 位)、BSC/Base/ETH=`0x0000…0000`(18 位)；`--from` 按链用 `portfolio info` 自动解析。**EVM 各链尚未用真金白银实测**（私钥配好后建议先小额逐链验证）。
@@ -308,14 +308,14 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 ⚠️ **仅此一处豁免**：§2 的人在环铁律（「机器负责筛，人负责按下成交」）对**人工流程**依旧成立、未改——一键买入/平仓、LIVE 全程仍必须人点按钮。本节新增的是**第二条、完全独立的路径**：用户显式要求，仅在 **SHADOW（纸面模拟）**下，让机器自己开仓+离场，用于跑量积累「信号→结果」的统计数据。**任何时候 `ST.mode != "SHADOW"`，这条路径整体不生效**（`auto_open_position`/`auto_manage_exits` 双重自检 mode，且离开 SHADOW 时 `/api/mode`/`/api/config` 会顺带强制关闭 `ST.auto_trade`）。
 
 - **开关**：右上角新拨钮 `AUTO`（`ST.auto_trade`，内存态，不落盘，同 `ST.mode` 一样重启回默认 `False`）。`POST /api/auto_trade`。LIVE 下不可开（前端禁用 + 后端强制拒绝）。
-- **入场**：`screen_once` 里，决策为 `action=="ACTION"`（已过全部闸门）且 `ST.auto_trade` 为真 → `auto_open_position` 自动开仓，**固定 `auto_size_usd`($20) 名义仓位**（换算成原生币数量：`$20 / native_usd_price(chain)`，兜底表 `NATIVE_USD_FALLBACK` 防 Mock 模式无原生币报价查询报错）。同地址已持仓（人工或自动）不重复开；机器人有独立子额度 `max_auto_positions=5`（不挤占人工 `max_concurrent_positions`）；仍过一遍 `RiskManager.gate()`；同地址止损/逃生离场后 `auto_reentry_cooldown_s`(90s) 内不重新入场。
-- **离场**（`auto_manage_exits`，`monitor_positions` 之后单独一遍，全仓离场、不做部分止盈）：
-  1. 逃生 severity ≥ `escape_severity`(70) → 立即离场（复用既有 `assess_escape`）。
-  2. pnl ≤ `-hard_stop_pct`(-35%) → 止损。
-  3. pnl ≥ `tp_ladder` 最后一档(+150%) → 止盈。
-  4. 曾触及 `tp_ladder` 第一档(+60%) 后「武装」移动止损；此后从峰值价 `peak_price` 回撤 `trailing_pct`(25%) → 移动止损离场。
-- **持仓新字段**（随 `positions.json` 免额外插件持久化）：`auto`、`entry_signal`(verdict/conviction/crowdedness/dev_score/priority/sm_confluence 的一次性入场快照)、`tp_armed`、`peak_price`。前端持仓卡片对 `auto=true` 显示 `AUTO` 徽章 + 武装态。
-- **统计数据源**：不新开文件，直接扩展 `do_sell` 写进 `trade_decisions.jsonl` 的 `SELL` 记录（带 `auto`/`exit_tag`(`AUTO_SL`/`AUTO_TP`/`AUTO_TRAIL`/`AUTO_ESCAPE`)/`entry_signal`/`pnl`），一行即一笔完整已平仓交易，无需 BUY/SELL 关联查询——这是该文件（见 §5 点4「只写不读」）的第一个真正读取者。`GET /api/stats/auto`（`compute_auto_stats()`）按 exit_tag / LLM 置信度桶 / dev 评分桶分组，给胜率 + 累计 $PnL（固定 $20 名义让跨币种 $PnL 直接可加总）。前端右下角新增紧凑统计卡片。
+- **入场**：`screen_once` 里，决策为 `action=="ACTION"`（已过全部闸门）且 `ST.auto_trade` 为真 → `auto_open_position` 自动开仓，**固定 `auto_size_usd`($20) 名义仓位**（换算成原生币数量：`$20 / native_usd_price(chain)`，兜底表 `NATIVE_USD_FALLBACK` 防 Mock 模式无原生币报价查询报错）。同地址已持仓（人工或自动）不重复开；`ST.auto_traded_addresses`（启动时从日志历史 BUY 记录重建）确保同一地址**永久**只自动入场一次，不是限时冷却；机器人有独立子额度 `max_auto_positions=5`（不挤占人工 `max_concurrent_positions`）；仍过一遍 `RiskManager.gate()`；默认不追超过 `max_token_age_days`(3) 天的老币，除非 `conviction≥age_exception_min_conviction`(0.9) 且 `priority≥age_exception_min_priority`(80)。
+- **离场**（`auto_manage_exits`，`monitor_positions` 之后单独一遍，三段式，用户明确指定）：
+  1. 逃生 severity ≥ `escape_severity`(70) → 立即全仓离场（复用既有 `assess_escape`）。
+  2. 部分止盈前：pnl ≤ `-hard_stop_pct`(-35%) → 全仓止损；pnl ≥ `auto_tp1_pct`(+20%) → 卖出 `auto_tp1_sell_frac`(30%)、锁定利润，剩余止损上移到保本价（此后这笔交易不可能再亏钱）。
+  3. 部分止盈后：剩余仓位止损 = `max(保本价, 峰值价×(1-auto_trailing_pct))`（`auto_trailing_pct=25%`，只升不降），**无固定金额硬止盈上限**——用户明确要求不设 tp_ladder 式的强制清仓价，让盈利尽量跑。
+  止损/移动止损触发时，实际记录的 pnl 会夹平到触发阈值（不会因扫描周期间的滑点比设定止损更差）。
+- **持仓新字段**（随 `positions.json` 免额外插件持久化）：`auto`、`entry_signal`(verdict/conviction/crowdedness/dev_score/priority/sm_confluence 的一次性入场快照)、`orig_size_sol`(建仓时的原始数量，部分止盈后 `size_sol` 会缩小)、`tp1_done`、`peak_price`。前端持仓卡片对 `auto=true` 显示 `AUTO` 徽章 + 已部分止盈态。
+- **统计数据源**：不新开文件，直接扩展 `do_sell`/`do_sell_partial` 写进 `trade_decisions.jsonl` 的 `SELL` 记录（带 `auto`/`exit_tag`(`AUTO_SL`/`AUTO_TP1_PARTIAL`/`AUTO_TRAIL_BE`/`AUTO_ESCAPE`)/`entry_signal`/`pnl`/`usd_notional`/`partial`），一笔仓位可能对应 2 条记录（部分止盈+最终离场）。`compute_auto_stats()` 只按**最终离场**（`partial!=true`）那条记录算笔数/胜率，避免部分止盈过的仓位被重复计成 2 笔；累计 $PnL 仍对全部记录求和（`usd_notional` 按占原始 $20 的比例折算，跨币种可直接加总）。这是 `trade_decisions.jsonl`（见 §5 点4「只写不读」）的第一个真正读取者。`GET /api/stats/auto` 按 exit_tag / LLM 置信度桶 / dev 评分桶分组。前端右下角新增紧凑统计卡片。
 
 ---
 
@@ -339,7 +339,7 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 - **安全护栏 LIVE_TRADING_DISABLED**（见 §10）。
 - **GitHub Pages 演示**：static 自适应 DEMO + 演示横幅 + docs/ + pre-commit 同步（见 §7）。
 - 前端：见 §9（CA可点/年龄/即时tooltip/只看持仓/雷达/弱红联动/自定义确认弹窗/骨架loading/紧凑化等）。
-- **SHADOW-only 自动交易 + 按信号统计**（见 §10b）：`AUTO` 拨钮开关 → 按 ACTION 信号自动开 $20 纸面仓位，代码规则自动止损(-35%)/止盈(+150%)/移动止损(25%)/逃生离场；`GET /api/stats/auto` 按离场方式/LLM置信度桶/dev评分桶给胜率+累计PnL，前端右下角新增统计卡片。仅 SHADOW 生效，离开 SHADOW 自动关闭；人工一键买入/LIVE 全程仍人在环，未改。
+- **SHADOW-only 自动交易 + 按信号统计**（见 §10b）：`AUTO` 拨钮开关 → 按 ACTION 信号自动开 $20 纸面仓位，代码规则三段式离场：+20%部分止盈(卖30%+移保本)/无固定上限的25%移动止损/逃生离场，初始硬止损-35%；同地址永久只入场一次；`GET /api/stats/auto` 按离场方式/LLM置信度桶/dev评分桶给胜率+累计PnL，前端右下角新增统计卡片。仅 SHADOW 生效，离开 SHADOW 自动关闭；人工一键买入/LIVE 全程仍人在环，未改。
 
 **占位 / 待接入**
 - `LLMJudge.judge`：动能启发式占位 → 换真实 Claude/GPT（喂 `symbol_safe`+数值，绝不喂原始名；JSON 严格解析）。当前 llm_max=20。

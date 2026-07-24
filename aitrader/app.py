@@ -192,7 +192,7 @@ def write_env(api_key: str, signing_key: str, chain: str):
     body = (f"GMGN_API_KEY={api_key}\n"
             f'GMGN_PRIVATE_KEY="{sk}"\n'
             f"GMGN_CHAIN={chain}\n")
-    ENV_PATH.write_text(body)
+    ENV_PATH.write_text(body, encoding="utf-8")
     try:
         os.chmod(ENV_PATH, 0o600)  # 仅本人可读写
     except OSError:
@@ -202,7 +202,7 @@ def load_env() -> dict:
     if not ENV_PATH.exists():
         return {}
     out = {}
-    for line in ENV_PATH.read_text().splitlines():
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.strip().startswith("#"):
             k, v = line.split("=", 1)
             v = v.strip()
@@ -1348,6 +1348,12 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         entry_price = g.token_price(f.address)
     except Exception:
         entry_price = 0.0
+    if entry_price <= 0:
+        # 拿不到入场价就不开仓——entry_price=0 会让 monitor_positions 永远不更新 pnl/cur_price
+        # （两处更新都要求 ep>0），_auto_decide_exit 的止损/移动止损分支也都要求 entry>0 才能触发，
+        # 这样的仓位除了逃生信号或手动卖出，永远没有自动退出路径，变成永久占着子额度的"僵尸仓位"。
+        log("AUTO_BUY_SKIP", f.symbol_safe, "无法获取入场价格，跳过自动开仓")
+        return
     sig = dict(verdict=v.verdict, conviction=v.conviction, crowdedness=v.crowdedness,
                dev_score=f.dev_eval, priority=pri, sm_confluence=f.sm_confluence)
     ST.positions.append(dict(symbol=f.symbol_safe, address=f.address, size_sol=size_native,
@@ -1429,12 +1435,15 @@ class RiskManager:
 
 SUPPORTED_CHAINS = ("sol", "bsc", "base", "eth", "robinhood")
 
-def _load_auto_traded_addresses(max_lines: int = 20000) -> set[str]:
+def _load_auto_traded_addresses() -> set[str]:
     """启动时读一遍历史 BUY 记录，得到"曾经自动买过"的地址集合——用户明确要求同一个币不再二次
-    自动入场（哪怕上次是止损离场、冷却期已过），所以这是永久黑名单，不是限时冷却。"""
+    自动入场（哪怕上次是止损离场、冷却期已过），所以这是永久黑名单，不是限时冷却。不能像
+    _load_auto_sells 那样只看日志尾部 N 行：screen_once 每轮给每个候选币都写 SCREEN/FILTER，
+    正常运行几小时就能把旧的 BUY 记录挤出任何固定行数窗口，永久黑名单会在重启后悄悄失效。
+    这个函数只在启动时跑一次，全量读入的成本可以接受。"""
     if not LOG_PATH.exists():
         return set()
-    lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-max_lines:]
+    lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
     out: set[str] = set()
     for ln in lines:
         try:
@@ -1618,20 +1627,25 @@ def _group_trades(rows: list[dict], keyfn) -> list[dict]:
 
 def compute_auto_stats() -> dict:
     rows = _load_auto_sells()
-    n = len(rows)
+    # 一笔仓位若先部分止盈（partial=true）再全部离场，会在日志里留下 2 条 SELL 记录——
+    # 笔数/胜率必须只按"最终离场"那一条算（一笔仓位=一笔交易），否则每笔部分止盈过的
+    # 仓位都会被重复计成 2 笔交易，且部分止盈几乎总是正 pnl，会把胜率虚高。
+    # 已实现总盈亏($)不受影响，仍按全部记录求和——部分止盈锁定的利润是真实到手的钱。
+    full_rows = [r for r in rows if not r.get("partial")]
+    n = len(full_rows)
     if n == 0:
         return dict(total_trades=0, wins=0, losses=0, win_rate=0, total_pnl_usd=0, avg_pnl_pct=0,
                     by_exit_tag=[], by_conviction=[], by_crowdedness=[], by_dev_bucket=[], recent=[])
-    wins = sum(1 for r in rows if r.get("pnl", 0) > 0)
-    losses = sum(1 for r in rows if r.get("pnl", 0) <= 0)
+    wins = sum(1 for r in full_rows if r.get("pnl", 0) > 0)
+    losses = sum(1 for r in full_rows if r.get("pnl", 0) <= 0)
     total_usd = sum(r.get("pnl", 0) * _row_usd(r) for r in rows)
     return dict(
         total_trades=n, wins=wins, losses=losses, win_rate=round(wins / n, 3), total_pnl_usd=round(total_usd, 2),
-        avg_pnl_pct=round(sum(r.get("pnl", 0) for r in rows) / n, 4),
-        by_exit_tag=_group_trades(rows, lambda r: r.get("exit_tag") or "unknown"),
-        by_conviction=_group_trades(rows, lambda r: _bucket_conviction((r.get("entry_signal") or {}).get("conviction"))),
-        by_crowdedness=_group_trades(rows, lambda r: (r.get("entry_signal") or {}).get("crowdedness") or "unknown"),
-        by_dev_bucket=_group_trades(rows, lambda r: _bucket_dev((r.get("entry_signal") or {}).get("dev_score"))),
+        avg_pnl_pct=round(sum(r.get("pnl", 0) for r in full_rows) / n, 4),
+        by_exit_tag=_group_trades(full_rows, lambda r: r.get("exit_tag") or "unknown"),
+        by_conviction=_group_trades(full_rows, lambda r: _bucket_conviction((r.get("entry_signal") or {}).get("conviction"))),
+        by_crowdedness=_group_trades(full_rows, lambda r: (r.get("entry_signal") or {}).get("crowdedness") or "unknown"),
+        by_dev_bucket=_group_trades(full_rows, lambda r: _bucket_dev((r.get("entry_signal") or {}).get("dev_score"))),
         recent=[dict(ts=r.get("ts"), symbol=r.get("symbol"), address=r.get("address"), chain=r.get("chain"),
                     pnl=r.get("pnl", 0), exit_tag=r.get("exit_tag"), entry_signal=r.get("entry_signal"),
                     partial=bool(r.get("partial")))
@@ -1716,6 +1730,14 @@ def screen_once(chain: str) -> dict:
     rows_by_addr = {t["address"]: t for t in candidates if t.get("address")}
     positions_out = monitor_positions(chain, rows_by_addr)
     auto_manage_exits(chain)                 # 独立第二遍：止损/止盈/移动止损/逃生离场（仅 auto 持仓）
+    # auto_manage_exits 可能就地夹平 p["pnl"]（止损/移动止损按触发价成交，而非滑点后的更差价）
+    # 或直接平仓（从 ST.positions 弹出）——positions_out 是在这之前拍的快照，不会反映这些变化。
+    # 若不重新对齐，同一轮响应会出现"仓位卡片显示滑点前的更差 pnl"与"交易日志记录夹平后 pnl"
+    # 两个矛盾的数字。已平仓的持仓从快照里剔除，仍持有的按当前 p["pnl"] 刷新。
+    live_by_addr = {p["address"]: p for p in ST.positions if p.get("chain", "sol") == chain}
+    positions_out = [row for row in positions_out if row["address"] in live_by_addr]
+    for row in positions_out:
+        row["pnl"] = live_by_addr[row["address"]].get("pnl", row["pnl"])
 
     # 回传后端真实 mode：前端据此同步 LIVE/SHADOW 开关，避免重启后端后开关停留在 LIVE 误导
     return dict(decisions=decisions, portfolio=_portfolio(), positions=positions_out, mode=ST.mode,
@@ -1821,6 +1843,10 @@ def monitor_positions(chain: str, rows_by_addr: dict | None = None) -> list[dict
                     cur_sec = g.token_security(p["address"])
                     cur_price = g.token_price(p["address"])
                 except Exception as e:
+                    # 查询失败时也要把 severity 写回持仓本身，不能只体现在返回给前端的快照里——
+                    # 否则 p["severity"] 停留在上一轮的旧值，auto_manage_exits 紧接着会用这个陈旧值
+                    # 判断是否触发 AUTO_ESCAPE，与刚刚回给用户的 severity=0 自相矛盾。
+                    p["severity"] = 0
                     out.append(dict(symbol=p["symbol"], address=p["address"], size_sol=p["size_sol"],
                                     pnl=p.get("pnl", 0), severity=0,
                                     signals=[dict(t=f"监控查询失败：{e}", hot=False)]))
