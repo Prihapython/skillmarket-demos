@@ -1656,9 +1656,10 @@ function applyAutoLabel(){
   if(wrap){wrap.classList.toggle('on',autoTrade);wrap.classList.toggle('disabled',liveMode);}
 }
 // 后端真实 auto_trade → 同步前端拨钮（如后端因切 LIVE / 重启而自动关闭）
+// 每轮都无条件按后端值重绘（不再"值没变就跳过"）——万一某次因为竞态/异常导致 DOM 和
+// autoTrade 变量不一致，之前的写法会一直卡在错误状态，永远不会自我修复；现在每轮强制对齐。
 function syncAutoTrade(v){
   if(typeof v!=='boolean')return;
-  if(v===autoTrade)return;
   const was=autoTrade;
   autoTrade=v;
   applyAutoLabel();
