@@ -1680,10 +1680,15 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
 #      直接复用 do_sell 写进 SELL 记录里的 entry_signal + exit_tag，一行即一笔完整的已平仓交易，
 #      不需要额外的持久化文件，也不需要 BUY/SELL 关联查询。
 # ──────────────────────────────────────────────────────────────────────────
-def _load_auto_sells(max_lines: int = 20000) -> list[dict]:
+def _load_auto_sells() -> list[dict]:
+    """全量读日志算胜率——不能像之前那样只看尾部 N 行：自主循环每轮给 top_n_prefilter(100) 个
+    候选都写 SCREEN/FILTER，几分钟就能把任意固定行数窗口挤爆（真实事故：不到 1 小时日志涨到
+    2.9 万行，一笔+61.7%的真实盈利交易 ACTR 就因为在窗口外，胜率统计直接把这笔赢的漏掉了，
+    统计出来变成 0 胜）。SELL 记录在全部日志里占比很小，全量扫一遍的成本可以接受
+    （同 _load_auto_traded_addresses 的取舍，见其注释）。"""
     if not LOG_PATH.exists():
         return []
-    lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-max_lines:]
+    lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
     out = []
     for ln in lines:
         try:
