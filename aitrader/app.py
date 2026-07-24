@@ -1377,6 +1377,11 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         return                               # 流动性太薄，$20 建仓/平仓本身就会显著滑价，止损/止盈价格会失真
     if f.swaps < CFG["min_auto_swaps"] or f.vol_1h < CFG["min_auto_volume_usd"]:
         return                               # 成交笔数/成交额太小，buy_ratio 等比率型信号在个位数样本上是噪音不是信号
+    if f.dev and f.dev.get("exited"):
+        return                               # dev 已清仓本币（不是历史发币记录，是这一个币本身）——此前只在 dev_score
+                                              # 里扣 0.10 分，综合分仍可能远高于 min_dev_score 门槛而通过；
+                                              # 真实事故：Vader，dev 历史 100 币 97% rug，且已卖出这个币，
+                                              # dev_score=0.21 照样过关。这个信号单独就该硬拦，不该被平均掉。
     if f.age_min > CFG["max_token_age_days"] * 1440:
         strong = (v.conviction >= CFG["age_exception_min_conviction"]
                   and pri >= CFG["age_exception_min_priority"])
