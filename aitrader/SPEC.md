@@ -336,6 +336,7 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 - **逃生监控修误报**：删 burn_ratio 信号（不可逆+跨源口径），只留 honeypot/renounced_mint/top10。
 - **逃生监控新增流动性撤池检测**：建仓时（人工 `do_buy` 与自动 `auto_open_position` 均）记录 `entry.liquidity`；`assess_escape` 新增信号——当前 liquidity（仅在持仓仍在本轮 trending 行内、有真实读数时才比较）跌破建仓时一半 → +50 severity，标"疑似撤池"。此前该信号只是代码注释里的 TODO，从未真正接入。同时补上 `MockGMGN` 缺失的 `liquidity` 字段（此前恒为 0，会让 SHADOW 自动交易的最低流动性门槛在 Mock/demo 模式下把所有信号都拦掉）。
 - **多链切换**（SOL/BSC/Base/ETH）：**链改为请求维度**（无全局当前链）——按链缓存 adapter + 按链 trending 短缓存(3s，同链多 tab 共享一次 cli)；前端每 tab 用 sessionStorage 各自持链，N tab 各看各链互不干扰；后台 tab 暂停轮询省配额。按链记忆命令(ST.trending_cmds)、买入单位/数量按链。
+  ⚠️ `RiskManager` 的 `exposure`/`max_total_exposure_sol` 把所有持仓的 `size_sol` 直接加总，跨链单位不同（SOL/BNB/ETH 价值差几百倍）加总会失真——用户明确要求当前只交易 SOL，因此 `TRADEABLE_CHAINS=("sol",)` 硬拦非 SOL 的开仓（`do_buy` 抛 409、`auto_open_position` 静默跳过），其它链仍可正常筛选/查看，只是不能建仓。
 - **启动自动连真实数据**（env key → use_live → /api/status → 前端 autoConnect），api_key 可留空。
 - **热榜命令按链默认 + 齿轮可配**（/api/settings；sol 默认=pump platform 命令）。
 - **性能**：scanCycle 防重入 + 监控复用 trending 行 → `/api/run` 33s→~1s。

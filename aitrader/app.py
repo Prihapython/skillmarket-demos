@@ -1334,6 +1334,8 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     """SHADOW-only 自动入场；调用方须已持有 ST.lock（从 screen_once 内调用，api_run 持锁跑它）。"""
     if ST.mode != "SHADOW":                  # 硬安全阀：绝不在 LIVE 下自动开仓
         return
+    if chain not in TRADEABLE_CHAINS:        # 用户明确要求：只在 SOL 开仓（见 TRADEABLE_CHAINS 注释）
+        return
     if any(p["address"] == f.address and p.get("chain", "sol") == chain for p in ST.positions):
         return                               # 已持有（人工或自动）→ 不重复开仓
     if f.address in ST.auto_traded_addresses:
@@ -1456,6 +1458,11 @@ class RiskManager:
         return True, "ok"
 
 SUPPORTED_CHAINS = ("sol", "bsc", "base", "eth", "robinhood")
+# 用户明确要求：只在 SOL 开仓，其它链只能看筛选结果、不能建仓。
+# 原因：RiskManager 的 exposure/仓位数上限是跨仓位共享的原生币数量加总（"size_sol"字段），
+# 不同链的原生币单位不同（SOL/BNB/ETH 价值差几百倍），混着加总会让风控上限失真；
+# 限定单链最简单、最不容易出错，不需要额外的实时汇率换算。
+TRADEABLE_CHAINS = ("sol",)
 
 def _load_auto_traded_addresses() -> set[str]:
     """启动时读一遍历史 BUY 记录，得到"曾经自动买过"的地址集合——用户明确要求同一个币不再二次
@@ -1910,6 +1917,8 @@ def _mock_drift(p):
 # 12. 成交（人按下才发生）
 # ──────────────────────────────────────────────────────────────────────────
 def do_buy(chain: str, address: str, size_sol: float) -> dict:
+    if chain not in TRADEABLE_CHAINS:        # 用户明确要求：只在 SOL 开仓（见 TRADEABLE_CHAINS 注释）
+        raise HTTPException(409, f"暂不支持在 {chain} 开仓，目前仅 SOL 可交易")
     # 成交前再过一次组合风控（硬拦；与筛选时的提示分离）
     allow, rnote = ST.risk.gate(size_sol, len(ST.positions), ST.exposure())
     if not allow:
