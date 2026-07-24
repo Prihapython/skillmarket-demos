@@ -44,6 +44,7 @@ OUT_DIR = HERE / "outputs"
 LOG_PATH = OUT_DIR / "trade_decisions.jsonl"
 POSITIONS_PATH = OUT_DIR / "positions.json"   # 持仓落盘：reload/重启不丢，与筛选榜完全独立
 AUTO_TRADE_PATH = OUT_DIR / "auto_trade_state.json"   # AUTO 开关落盘：见下方 load/save_auto_trade_state
+AUTO_TRADED_ADDRS_PATH = OUT_DIR / "auto_traded_addresses.json"   # 永久黑名单落盘：独立于统计日志
 TRENDING_CMDS_PATH = OUT_DIR / "trending_cmds.json"   # 按链热榜命令落盘：用户改过即持久，重启/刷新不回默认
 ENV_PATH = pathlib.Path.home() / ".config" / "gmgn" / ".env"
 
@@ -131,6 +132,11 @@ CFG = {
     # 目标不是多交易，是高胜率——这里给自动交易额外加码，要求比人工流程的最低门槛更有把握。
     "min_auto_sm_confluence": 2,     # 高于 hard_gates 共用的 min_smart_money_confluence(1)
     "min_auto_dev_score": 0.30,      # 高于筛选流水线共用的 min_dev_score(0.15)
+    # crowdedness="early" 只看最近 5m/1h 动能，完全不知道这个币今天早些时候是否已经拉升-砸盘过
+    # 一轮——真实事故：BUNKEE 当前市值只有历史最高市值的 29%（今天已经从高点跌了 70%），
+    # 短期动能读数依然是"early"（真的在涨），照样买了第二轮反弹。用当前市值/历史最高市值的
+    # 比例单独硬拦：跌破这个比例说明主升浪已经走完，现在只是尸体反弹，不是新机会。
+    "min_auto_ath_ratio": 0.6,
     # 自动交易离场（用户指定，2026-07-24 起改四段）：
     #   1) +20% 第一次部分止盈：卖原始仓位的 30%，锁定利润；
     #      剩余仓位止损立即上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
@@ -786,7 +792,7 @@ def _security_unsafe(sec: dict, chain: str) -> str | None:
 @dataclass
 class TokenFeatures:
     address: str; symbol_raw: str; symbol_safe: str
-    price: float; mcap: float; vol_1h: float; age_min: float; chg_1h: float
+    price: float; mcap: float; vol_1h: float; age_min: float; chg_1h: float; ath_mcap: float = 0.0
     # 动能（趋势跟随）
     chg_5m: float = 0.0; buys: int = 0; sells: int = 0; swaps: int = 0
     liquidity: float = 0.0; buy_ratio: float = 0.5; turnover: float = 0.0
@@ -823,6 +829,7 @@ class FeatureExtractor:
             address=row["address"], symbol_raw=raw, symbol_safe=sanitize(raw),
             price=_f(row.get("price")), mcap=mcap,
             vol_1h=vol, age_min=age_min,
+            ath_mcap=_f(row.get("history_highest_market_cap")),
             # trending 的 price_change_percent1h 是百分比数值(46.96=+46.96%)，/100 统一为小数
             chg_1h=_f(row.get("price_change_percent1h")) / 100.0,
             chg_5m=_f(row.get("price_change_percent5m")) / 100.0,
@@ -1383,6 +1390,9 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         return                               # 流动性太薄，$20 建仓/平仓本身就会显著滑价，止损/止盈价格会失真
     if f.swaps < CFG["min_auto_swaps"] or f.vol_1h < CFG["min_auto_volume_usd"]:
         return                               # 成交笔数/成交额太小，buy_ratio 等比率型信号在个位数样本上是噪音不是信号
+    if f.ath_mcap > 0 and f.mcap / f.ath_mcap < CFG["min_auto_ath_ratio"]:
+        return                               # 当前市值/历史最高市值比例太低 → 主升浪已经走完，crowdedness="early"
+                                              # 只看得到"现在在涨"，看不到"这是死透后的反弹"（真实事故：BUNKEE）
     if f.dev and f.dev.get("exited"):
         return                               # dev 已清仓本币（不是历史发币记录，是这一个币本身）——此前只在 dev_score
                                               # 里扣 0.10 分，综合分仍可能远高于 min_dev_score 门槛而通过；
@@ -1431,6 +1441,7 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
                              auto=True, tp1_done=False, tp2_done=False, peak_price=entry_price,
                              entry_signal=sig))
     ST.auto_traded_addresses.add(f.address)
+    save_auto_traded_addresses()
     save_positions()
     log("BUY", f.symbol_safe, f"SHADOW AUTO 记录 {size_native} ({chain})",
         dict(address=f.address, size_sol=size_native, chain=chain, auto=True,
@@ -1526,12 +1537,9 @@ SUPPORTED_CHAINS = ("sol", "bsc", "base", "eth", "robinhood")
 # 限定单链最简单、最不容易出错，不需要额外的实时汇率换算。
 TRADEABLE_CHAINS = ("sol",)
 
-def _load_auto_traded_addresses() -> set[str]:
-    """启动时读一遍历史 BUY 记录，得到"曾经自动买过"的地址集合——用户明确要求同一个币不再二次
-    自动入场（哪怕上次是止损离场、冷却期已过），所以这是永久黑名单，不是限时冷却。不能像
-    _load_auto_sells 那样只看日志尾部 N 行：screen_once 每轮给每个候选币都写 SCREEN/FILTER，
-    正常运行几小时就能把旧的 BUY 记录挤出任何固定行数窗口，永久黑名单会在重启后悄悄失效。
-    这个函数只在启动时跑一次，全量读入的成本可以接受。"""
+def _scan_log_for_auto_buys() -> set[str]:
+    """从 trade_decisions.jsonl 全量扫一遍历史 BUY 记录（仅用于首次迁移到独立黑名单文件时兜底/
+    合并；见 load_auto_traded_addresses）。"""
     if not LOG_PATH.exists():
         return set()
     lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
@@ -1543,6 +1551,36 @@ def _load_auto_traded_addresses() -> set[str]:
             continue
         if rec.get("action") == "BUY" and rec.get("auto") and rec.get("address"):
             out.add(rec["address"])
+    return out
+
+def save_auto_traded_addresses():
+    """永久黑名单落盘（独立文件，不随 trade_decisions.jsonl 一起被统计重置清空）。
+    真实事故：之前黑名单只从日志里的 BUY 记录重建，用户每次"清空统计重新算胜率"都会
+    truncate 那份日志，副作用是把黑名单也一起清空了——BUNKEE 因此被同一个自动交易循环
+    买了两次。现在黑名单单独存一份，统计重置流程（archive+truncate 日志）碰不到它。"""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        AUTO_TRADED_ADDRS_PATH.write_text(
+            json.dumps(sorted(ST.auto_traded_addresses), ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def load_auto_traded_addresses() -> set[str]:
+    """优先读独立黑名单文件；文件不存在（老版本升级上来的第一次启动）就从日志历史 BUY 记录
+    兜底重建一次，并立刻写回独立文件，此后统计重置就不会再影响黑名单了。"""
+    if AUTO_TRADED_ADDRS_PATH.exists():
+        try:
+            data = json.loads(AUTO_TRADED_ADDRS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return set(data)
+        except Exception:
+            pass
+    out = _scan_log_for_auto_buys()
+    if out:
+        try:
+            AUTO_TRADED_ADDRS_PATH.write_text(json.dumps(sorted(out), ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
     return out
 
 def load_auto_trade_state() -> bool:
@@ -1564,7 +1602,7 @@ class AppState:
         self.auto_trade = load_auto_trade_state()  # SHADOW-only 自动交易开关；落盘持久化，重启自动恢复上次状态
                                        # （mode 本身仍不落盘、重启回默认 SHADOW——即使 auto_trade 恢复为 True，
                                        # 也只在 mode=="SHADOW" 时才真正生效，LIVE 下这条路径全程不触发）
-        self.auto_traded_addresses: set[str] = _load_auto_traded_addresses()  # 永久黑名单：同一地址只自动入场一次
+        self.auto_traded_addresses: set[str] = load_auto_traded_addresses()  # 永久黑名单：同一地址只自动入场一次
         self.chain = CFG["chain"]     # 启动默认链（仅用于未带 chain 的请求兜底 + status 展示）
         self.live = False             # 是否已配 key（决定按链建 Live 还是 Mock 适配器）
         self._adapters: dict[str, GMGNAdapter] = {}              # chain -> 适配器（缓存）
