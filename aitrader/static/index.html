@@ -111,6 +111,8 @@ body.publicro #escCard{display:none !important}
 .card>h3 .scanning.on{opacity:1}
 .card>h3 .cnt{margin-left:auto;font-size:10px;color:var(--dim);font-family:var(--mono);font-weight:400}
 .card .body{flex:1;overflow:auto;min-height:0}
+/* 统计卡 / 持仓逃生监控卡：内容常常比卡片高（多空/多日），允许用户手动拖拽调整高度 */
+#autostats,#positions{resize:vertical;overflow:auto;min-height:120px;max-height:80vh}
 
 /* pipeline table */
 table{width:100%;border-collapse:collapse;font-size:12px}
