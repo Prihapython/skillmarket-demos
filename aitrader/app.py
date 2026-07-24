@@ -56,10 +56,7 @@ CFG = {
     # 不再像旧版那样砍到极小（砍小反而只剩榜首最新/刷量币、聪明钱标记全为 0）。
     "top_n_prefilter": 100,        # 参与筛选的 trending 行数上限
     "llm_max": 20,                 # LLM 最多解释幸存者数（启发式占位不花钱，放大减少 gate3 误杀；接真实 LLM 再收紧）
-    "equity_sol": 10.0,
-    "risk_per_trade": 0.01,
     "hard_stop_pct": 0.35,
-    "max_per_trade_sol": 0.5,
     "max_total_exposure_sol": 1.0,
     "max_concurrent_positions": 20,   # 感受阶段放宽（SHADOW 不动真钱）；真实上线前按纪律调回（如 2~3）
     "daily_loss_cap_sol": 0.5,
@@ -95,12 +92,15 @@ CFG = {
     },
     "momentum_reject_chg1h": -0.12,  # 1h 跌超 12%
     "momentum_reject_chg5m": -0.06,  # 且 5m 仍在跌 → 判阴跌、LLM reject
+    # "early" 判定的最小动能门槛（而非仅看正负号）：没有真实的"该币自身 ATH 回撤"字段
+    # （trending 行只有 chg_1h/chg_5m，dev_ath_mc 是 dev 历史上其它币的战绩，不是本币），
+    # 纯符号判定(>0)会把"已死透、5m/1h 各微弹 1~2%"的死猫跳误判成 early、绕过 crowded 硬拦
+    # （真实事故：token"claude"已从 ATH 跌 98%）。用有意义的涨幅门槛堵住这个漏洞。
+    "early_min_chg5m": 0.03,         # 5m 至少 +3% 才算"真的在动"
+    "early_min_chg1h": 0.05,         # 1h 至少 +5% 才算"真的在动"
     # 金狗 vs 接盘：用买占比区分（暴涨不再一刀切，看买盘是否还撑得住）
     "buy_ratio_pass": 0.50,          # 买盘占优 → 可 pass（即使暴涨/late 也跟金狗）
     "buy_ratio_reject": 0.42,        # 卖压主导 → 判派发/接盘位，reject
-    # 退出阶梯
-    "tp_ladder": [(0.60, 0.40), (1.50, 0.30)],
-    "trailing_pct": 0.25,
     # 逃生预警阈值（severity 0-100）
     "escape_severity": 70,
     # SHADOW-only 自动交易：入场固定 $20 名义仓位；同一地址永远只自动入场一次
@@ -120,14 +120,20 @@ CFG = {
     #   流动性过低 → $20 的建仓/平仓本身就会显著滑点，止损/止盈价格失真。
     "max_auto_sniper_count": 5,
     "min_auto_liquidity_usd": 3000.0,
-    # 自动交易三段式离场（用户指定）：
-    #   1) +20% 部分止盈：卖 30%，锁定利润；
-    #   2) 剩余仓位止损上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
-    #   3) 剩余仓位此后只用移动止损 25%（保本价与移动止损取更高者）管理，只升不降，不设固定金额
-    #      的硬止盈上限——用户明确要求「不在 +150% 强制清仓，就是持续上移止损」，让盈利尽量跑。
-    # 初始硬止损 -35%（复用 hard_stop_pct）只在部分止盈发生前生效。
+    # 自动交易离场（用户指定，2026-07-24 起改四段）：
+    #   1) +20% 第一次部分止盈：卖原始仓位的 30%，锁定利润；
+    #      剩余仓位止损立即上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
+    #   2) +50% 第二次部分止盈：再卖原始仓位的 30%（与第一刀口径一致，不是"剩余仓位的 30%"）；
+    #      从第 1 步开始，保本价+移动止损的保护在整个过程中持续生效（不因等第二刀而暂停）；
+    #   3) 两刀之后剩下的 40%：只用移动止损 25%（保本价与移动止损取更高者）管理，只升不降，
+    #      不设固定金额的硬止盈上限——用户明确要求「不强制清仓，持续上移止损」，让盈利尽量跑。
+    # 初始硬止损 -35%（复用 hard_stop_pct）只在第一次部分止盈发生前生效。
+    # ⚠️ exit_plan() 展示给人工看的退出计划直接读这几个数字（见其函数注释）——保证人工界面
+    # 显示的"计划退出价位"与 auto 机器人实际执行的完全一致，不再各自维护一套不同的数字。
     "auto_tp1_pct": 0.20,
     "auto_tp1_sell_frac": 0.3,
+    "auto_tp2_pct": 0.50,
+    "auto_tp2_sell_frac": 0.3,      # 按"原始仓位"的比例算，与 auto_tp1_sell_frac 口径一致
     "auto_trailing_pct": 0.25,
 }
 # 各链「原生/币种」token 地址（买入时作 input、卖出时作 output）。
@@ -1256,7 +1262,10 @@ class LLMJudge:
             return LLMVerdict("reject", round(min(0.5, 0.2 + buy), 2), "distributing", flags,
                               f"卖压主导（买占比 {buy:.0%}），疑似拉高派发/接盘位，不追。")
         # 3) 暴涨仅作高位风险标签，不再一票否决
-        crowd = "late" if up1h >= 3.0 else ("early" if (up5 > 0 and up1h > 0) else "crowded")
+        #    early 要求两个时间窗都有"有意义"的涨幅（非仅符号为正），否则死猫跳（已从 ATH 大跌、
+        #    5m/1h 各微弹 1~2%）会被误判成 early、绕过 auto_open_position 的 crowded 硬拦。
+        crowd = "late" if up1h >= 3.0 else (
+            "early" if (up5 > CFG["early_min_chg5m"] and up1h > CFG["early_min_chg1h"]) else "crowded")
         if crowd == "late":
             flags.append(f"1h 已涨 {up1h:.0%}，高位追涨需谨慎")
         s_mom = _clamp((up5 + 0.05) / 0.25)     # -5%→0, +20%→1
@@ -1282,11 +1291,17 @@ def assess_escape(cur_sec: dict, entry: dict):
     注意：不要用 burn_ratio——LP 销毁不可逆（"下降"现实中不会发生），且 token security 与
     trending 行的 burn_ratio 口径不同，相减必误报。
     """
+    # 三个"口径稳定、方向明确"的信号（honeypot/mint找回/流动性腰斩）单独一个就该达到
+    # escape_severity(70) 立即触发全仓离场——不该要求先凑够两个信号才逃生。此前权重
+    # (60/55/50) 各自都低于 70，实际上从未让任何一个单一信号独立触发过"立即离场"，
+    # 必须叠加另一信号才行，削弱了本该是"发现真实 rug 立刻跑"的设计意图。
+    # top10 集中度是四者中最容易受口径漂移/正常波动误报的（见下方注释），故仍只作
+    # 佐证分、不单独触发。
     sev, sigs = 0, []
     if cur_sec.get("honeypot") and not entry.get("honeypot"):
-        sev += 60; sigs.append(("honeypot 标记新触发 ← 逃生信号", True))
+        sev += 75; sigs.append(("honeypot 标记新触发 ← 逃生信号", True))
     if entry.get("renounced_mint") and not cur_sec.get("renounced_mint"):
-        sev += 55; sigs.append(("增发权疑似找回（可砸盘）← 逃生信号", True))
+        sev += 70; sigs.append(("增发权疑似找回（可砸盘）← 逃生信号", True))
     # top10 跨源（建仓 token security vs 监控 trending 行）有波动，阈值放宽到 +15% 减少误报
     if cur_sec.get("top10", 0) > entry.get("top10", 0) + 0.15:
         sev += 22; sigs.append((f"top10 集中度升至 {cur_sec.get('top10',0):.0%}", cur_sec.get("top10",0) > 0.5))
@@ -1295,24 +1310,29 @@ def assess_escape(cur_sec: dict, entry: dict):
     entry_liq = entry.get("liquidity", 0)
     cur_liq = cur_sec.get("liquidity")
     if entry_liq > 0 and cur_liq is not None and cur_liq < entry_liq * 0.5:
-        sev += 50
+        sev += 70
         sigs.append((f"流动性从 {entry_liq:.0f} 跌至 {cur_liq:.0f}（疑似撤池）← 逃生信号", True))
     if not sigs:
         sigs.append(("持仓正常监控中", False))
     return min(100, sev), sigs
 
 # ──────────────────────────────────────────────────────────────────────────
-# 8. 仓位计算（固定分数法；数字由代码定，LLM 永不出数字）
+# 8. 仓位计算（数字由代码定，LLM 永不出数字）
 # ──────────────────────────────────────────────────────────────────────────
-def position_size() -> float:
-    risk_sol = CFG["equity_sol"] * CFG["risk_per_trade"]
-    size = min(risk_sol / CFG["hard_stop_pct"], CFG["max_per_trade_sol"])
-    return round(size, 4)
+def position_size(g: "GMGNAdapter", chain: str) -> float:
+    """人工买入的建议仓位——与 auto 机器人用同一套 $20 名义仓位公式（用户明确要求统一入场：
+    人工界面显示的建议数字要和 auto 实际会买的数字一致，不再各自维护一套）。
+    依赖 native_usd_price（8b 节定义），Python 按调用时解析名字，模块加载完成后调用不受定义顺序影响。"""
+    return round(CFG["auto_size_usd"] / native_usd_price(g, chain), 6)
 
 def exit_plan() -> dict:
-    tp = [f"+{int(g*100)}%→卖{int(p*100)}%" for g, p in CFG["tp_ladder"]]
+    """人工界面展示的"计划退出价位"——直接读 auto 机器人实际使用的同一套 CFG 数字
+    （auto_tp1_*/auto_tp2_*/auto_trailing_pct/hard_stop_pct），保证人工看到的计划与
+    auto 实际执行的退出逻辑永远是同一份数字，不会像过去那样各自维护、渐渐不一致。"""
+    tp = [f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%",
+          f"+{int(CFG['auto_tp2_pct']*100)}%→卖{int(CFG['auto_tp2_sell_frac']*100)}%"]
     return dict(hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%", tp_ladder=tp,
-                trailing=f"{int(CFG['trailing_pct']*100)}%")
+                trailing=f"{int(CFG['auto_trailing_pct']*100)}%")
 
 # ──────────────────────────────────────────────────────────────────────────
 # 8b. SHADOW-only 自动交易（人在环铁律的有意收窄豁免，仅纸面模拟；见 SPEC.md §2/§14）
@@ -1384,7 +1404,7 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     ST.positions.append(dict(symbol=f.symbol_safe, address=f.address, size_sol=size_native,
                              orig_size_sol=size_native, pnl=0.0, cycles=0, entry=entry, chain=chain,
                              entry_price=entry_price, cur_price=entry_price,
-                             auto=True, tp1_done=False, peak_price=entry_price,
+                             auto=True, tp1_done=False, tp2_done=False, peak_price=entry_price,
                              entry_signal=sig))
     ST.auto_traded_addresses.add(f.address)
     save_positions()
@@ -1392,6 +1412,7 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         dict(address=f.address, size_sol=size_native, chain=chain, auto=True,
              entry_signal=sig, hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%",
              tp1=f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%+保本",
+             tp2=f"+{int(CFG['auto_tp2_pct']*100)}%→卖{int(CFG['auto_tp2_sell_frac']*100)}%",
              trailing=f"{int(CFG['auto_trailing_pct']*100)}%（无固定止盈上限）"))
 
 def _auto_decide_exit(p: dict):
@@ -1412,13 +1433,23 @@ def _auto_decide_exit(p: dict):
         if pnl >= CFG["auto_tp1_pct"]:
             return ("partial", CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
         return None
-    # 部分止盈后：剩余仓位止损 = max(保本价, 峰值价的移动止损)，只升不降 → 这笔交易此后不可能再亏钱
+    # 第一次部分止盈后：保本价/移动止损保护立即持续生效（不因等第二刀暂停）——
+    # 剩余仓位止损 = max(保本价, 峰值价的移动止损)，只升不降 → 这笔交易此后不可能再亏钱
     peak = max(p.get("peak_price", 0.0), cur)
     p["peak_price"] = peak
     stop_price = max(entry, peak * (1 - CFG["auto_trailing_pct"])) if entry > 0 else 0
     if entry > 0 and cur > 0 and cur <= stop_price:
         p["pnl"] = max(pnl, stop_price / entry - 1)   # 同样按止损触发价成交，不按滑点后的更差价格
         return ("full", "AUTO_TRAIL_BE")
+    if not p.get("tp2_done") and pnl >= CFG["auto_tp2_pct"]:
+        # 第二次部分止盈：再卖掉"原始仓位"的 auto_tp2_sell_frac（口径与第一刀一致，不是"剩余仓位"的比例），
+        # 换算成对当前剩余 size_sol 的比例传给 do_sell_partial。
+        orig = p.get("orig_size_sol") or p.get("size_sol") or 0
+        cur_size = p.get("size_sol", 0)
+        target_abs = orig * CFG["auto_tp2_sell_frac"]
+        frac_of_current = min(1.0, target_abs / cur_size) if cur_size > 0 else 0
+        if frac_of_current > 0:
+            return ("partial", frac_of_current, "AUTO_TP2_PARTIAL")
     return None
 
 def auto_manage_exits(chain: str) -> None:
@@ -1784,7 +1815,7 @@ def screen_once(chain: str) -> dict:
         if v.conviction < CFG["min_llm_conviction"]:
             decisions.append(_reject(f, f"REJECT LLM：置信度 {v.conviction} 偏低", 4, v))
             continue
-        size = position_size()
+        size = position_size(g, chain)
         # 组合风控不在此阻断，只标 risk_warn（人在环：提示而非硬拦）
         allow, rnote = ST.risk.gate(size, n_pos, exposure)
         pri = priority_score(f, v.conviction, v.crowdedness, f.dev_eval)
@@ -1934,13 +1965,19 @@ def monitor_positions(chain: str, rows_by_addr: dict | None = None) -> list[dict
                     cur_sec = g.token_security(p["address"])
                     cur_price = g.token_price(p["address"])
                 except Exception as e:
-                    # 查询失败时也要把 severity 写回持仓本身，不能只体现在返回给前端的快照里——
-                    # 否则 p["severity"] 停留在上一轮的旧值，auto_manage_exits 紧接着会用这个陈旧值
-                    # 判断是否触发 AUTO_ESCAPE，与刚刚回给用户的 severity=0 自相矛盾。
-                    p["severity"] = 0
+                    # 查询失败：不覆盖 p["severity"]，沿用上一轮真实值（"不确定"≠"没事"）——
+                    # 之前这里强制清零，会让前端看到"一切正常"而内部又拿旧值判断 AUTO_ESCAPE，
+                    # 自相矛盾；更糟的是，真实 rug 发生时索引/RPC 也常跟着报错，清零正好在
+                    # 最需要提高警惕的时刻把信号抹掉。现在如实展示上一轮的值，并标注数据已过期，
+                    # 若该值已达 escape_severity，前端也按热色高亮、auto_manage_exits 仍会照常触发。
+                    stale = p.get("severity", 0)
                     out.append(dict(symbol=p["symbol"], address=p["address"], size_sol=p["size_sol"],
-                                    pnl=p.get("pnl", 0), severity=0,
-                                    signals=[dict(t=f"监控查询失败：{e}", hot=False)]))
+                                    pnl=p.get("pnl", 0), entry_price=p.get("entry_price", 0.0),
+                                    cur_price=p.get("cur_price", 0.0), severity=stale,
+                                    auto=bool(p.get("auto")), tp1_done=bool(p.get("tp1_done")),
+                                    tp2_done=bool(p.get("tp2_done")),
+                                    signals=[dict(t=f"⚠ 监控查询失败，数据可能过期：{e}",
+                                                  hot=stale >= CFG["escape_severity"])]))
                     continue
             severity, sigs = assess_escape(cur_sec, p["entry"])
             ep = p.get("entry_price", 0.0)
@@ -1961,6 +1998,7 @@ def monitor_positions(chain: str, rows_by_addr: dict | None = None) -> list[dict
                         pnl=p.get("pnl", 0), entry_price=p.get("entry_price", 0.0),
                         cur_price=p.get("cur_price", 0.0), severity=severity,
                         auto=bool(p.get("auto")), tp1_done=bool(p.get("tp1_done")),
+                        tp2_done=bool(p.get("tp2_done")),
                         signals=[dict(t=s[0], hot=s[1]) for s in sigs]))
     return out
 
@@ -2103,6 +2141,8 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
              auto=bool(p.get("auto")), exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
     p["size_sol"] = round(p["size_sol"] - sell_size, 6)
     p["tp1_done"] = True
+    if exit_tag == "AUTO_TP2_PARTIAL":
+        p["tp2_done"] = True
     p["peak_price"] = p.get("cur_price", p.get("entry_price", 0.0))   # 从此刻开始追踪移动止损
     save_positions()
     return dict(ok=True, symbol=p["symbol"])
