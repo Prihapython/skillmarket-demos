@@ -1324,6 +1324,9 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         return                               # 已持有（人工或自动）→ 不重复开仓
     if f.address in ST.auto_traded_addresses:
         return                               # 用户明确要求：同一地址永远只自动入场一次，不管上次结果如何
+    if v.crowdedness == "crowded":
+        return                               # LLM 已判定该币为"拥挤/迟到"（大概率已过高峰段），priority_score
+                                              # 不看 crowdedness，靠这里硬拦，避免追进已经死掉的顶部
     if f.age_min > CFG["max_token_age_days"] * 1440:
         strong = (v.conviction >= CFG["age_exception_min_conviction"]
                   and pri >= CFG["age_exception_min_priority"])
