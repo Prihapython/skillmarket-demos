@@ -45,6 +45,7 @@ LOG_PATH = OUT_DIR / "trade_decisions.jsonl"
 POSITIONS_PATH = OUT_DIR / "positions.json"   # 持仓落盘：reload/重启不丢，与筛选榜完全独立
 AUTO_TRADE_PATH = OUT_DIR / "auto_trade_state.json"   # AUTO 开关落盘：见下方 load/save_auto_trade_state
 AUTO_TRADED_ADDRS_PATH = OUT_DIR / "auto_traded_addresses.json"   # 永久黑名单落盘：独立于统计日志
+STATS_EPOCH_PATH = OUT_DIR / "stats_epoch.json"   # 胜率统计起算时间点：重置胜率≠删日志（见 stats_epoch/reset_stats_epoch）
 TRENDING_CMDS_PATH = OUT_DIR / "trending_cmds.json"   # 按链热榜命令落盘：用户改过即持久，重启/刷新不回默认
 ENV_PATH = pathlib.Path.home() / ".config" / "gmgn" / ".env"
 
@@ -1747,14 +1748,37 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
 #      直接复用 do_sell 写进 SELL 记录里的 entry_signal + exit_tag，一行即一笔完整的已平仓交易，
 #      不需要额外的持久化文件，也不需要 BUY/SELL 关联查询。
 # ──────────────────────────────────────────────────────────────────────────
+def stats_epoch() -> str:
+    """胜率统计起算时间点（UTC ISO 字符串）；文件不存在→空串（从最早的记录开始算）。
+    "重置胜率"= 把这个时间点设为当前时刻，之后统计只看这之后成交的单子——但日志本身一条不删，
+    entry_signal 历史全部保留供数据分析用。这样"清屏重新看胜率"和"销毁交易数据"彻底解耦。"""
+    if not STATS_EPOCH_PATH.exists():
+        return ""
+    try:
+        return str(json.loads(STATS_EPOCH_PATH.read_text(encoding="utf-8")).get("since", ""))
+    except Exception:
+        return ""
+
+def reset_stats_epoch() -> str:
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        STATS_EPOCH_PATH.write_text(json.dumps({"since": now}), encoding="utf-8")
+    except Exception:
+        pass
+    return now
+
 def _load_auto_sells() -> list[dict]:
     """全量读日志算胜率——不能像之前那样只看尾部 N 行：自主循环每轮给 top_n_prefilter(100) 个
     候选都写 SCREEN/FILTER，几分钟就能把任意固定行数窗口挤爆（真实事故：不到 1 小时日志涨到
     2.9 万行，一笔+61.7%的真实盈利交易 ACTR 就因为在窗口外，胜率统计直接把这笔赢的漏掉了，
     统计出来变成 0 胜）。SELL 记录在全部日志里占比很小，全量扫一遍的成本可以接受
-    （同 _load_auto_traded_addresses 的取舍，见其注释）。"""
+    （同 _load_auto_traded_addresses 的取舍，见其注释）。
+    只返回 stats_epoch 之后成交的 SELL——"重置胜率"靠推进 epoch 实现，不再 truncate 日志
+    （日志里的 entry_signal 是数据分析的唯一来源，绝不能因为清胜率就被删掉）。"""
     if not LOG_PATH.exists():
         return []
+    since = stats_epoch()
     lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
     out = []
     for ln in lines:
@@ -1763,6 +1787,8 @@ def _load_auto_sells() -> list[dict]:
         except Exception:
             continue
         if rec.get("action") == "SELL" and rec.get("auto"):
+            if since and str(rec.get("ts", "")) < since:
+                continue                       # epoch 之前的旧单：不计入当前胜率，但日志里仍保留
             out.append(rec)
     return out
 
@@ -2374,6 +2400,16 @@ def api_stats_auto():
     if PUBLIC_DEMO:
         raise HTTPException(403, "公开演示不展示本机自动交易统计")
     return JSONResponse(compute_auto_stats())
+
+@app.post("/api/stats/auto/reset")
+def api_stats_auto_reset():
+    """重置胜率显示：只把统计起算点推进到当前时刻，之后的胜率卡片从零开始算——
+    但 trade_decisions.jsonl 一条不删，历史 entry_signal 全部保留供数据分析（见 TESTING_PLAN.md）。
+    以前"清胜率"= archive+truncate 日志，会把正在采集的分析数据一起销毁，二者现已彻底解耦。"""
+    _block_if_public()
+    since = reset_stats_epoch()
+    log("STATS_RESET", "-", f"胜率统计起算点重置为 {since}（日志未删）")
+    return dict(ok=True, since=since)
 
 @app.post("/api/chain")
 def api_chain(c: ChainIn):

@@ -110,6 +110,9 @@ body.publicro #escCard{display:none !important}
 .h3gear:hover{border-color:var(--lime);color:var(--lime)}.h3gear svg{width:13px;height:13px}
 .card>h3 .scanning.on{opacity:1}
 .card>h3 .cnt{margin-left:auto;font-size:10px;color:var(--dim);font-family:var(--mono);font-weight:400}
+.card>h3 .cnt+.hreset{margin-left:10px}
+.card>h3 .hreset{margin-left:auto;cursor:pointer;color:var(--dim);font-size:10.5px;font-weight:700;border:1px solid var(--line);border-radius:6px;padding:2px 8px;transition:.15s;letter-spacing:.3px;flex-shrink:0}
+.card>h3 .hreset:hover{border-color:var(--amber);color:var(--amber)}
 .card .body{flex:1;overflow:auto;min-height:120px}
 /* 拖拽调整卡片高度的手柄（原生 CSS resize 在 flex:1 子项上不可靠，改手写拖拽）。
    之前太不显眼（10px/深色背景），内容拖得很高、下面全是空白时用户找不到手柄在哪——加高、加对比度、加常驻文字提示。 */
@@ -443,7 +446,7 @@ td{padding:5px 10px;vertical-align:middle}
   <div class="grid">
     <div class="col">
       <div class="card" style="flex:1" id="autoStatsCard">
-        <h3 id="ic-autostats"><span data-i18n="stats_h3">自动交易统计</span> <span class="cnt" id="autoStatsCnt"></span></h3>
+        <h3 id="ic-autostats"><span data-i18n="stats_h3">自动交易统计</span> <span class="cnt" id="autoStatsCnt"></span><span class="hreset" onclick="resetAutoStats()" data-i18n="stats_reset_btn" data-i18n-title="stats_reset_title">↺ 重置</span></h3>
         <div class="body" id="autostats"></div>
         <div class="rzhandle" data-target="autostats" data-i18n-title="rz_title"></div>
       </div>
@@ -711,6 +714,9 @@ const I18N={
     stats_h3:'自动交易统计', stats_none:'暂无已平仓的自动交易',
     stats_total:(n)=>`${n} 笔`, stats_winrate:'胜率', stats_pnl:'累计 PnL',
     period_day:'按日', period_week:'按周', period_month:'按月',
+    stats_reset_btn:'↺ 重置', stats_reset_title:'重置胜率显示',
+    stats_reset_msg:'把胜率统计的起算点设为现在，之后的胜率卡片从零开始算。<b>交易日志一条不删</b>，历史数据全部保留（供后续分析）。<br>确定重置显示吗？',
+    toast_stats_reset:'胜率显示已重置（日志保留）', toast_stats_reset_fail:(m)=>`重置失败：${m}`,
     rz_title:'拖拽调整高度', mcp_retry:'重试中',
     stats_by_exit:'按离场方式', stats_by_conv:'按 LLM 置信度', stats_by_dev:'按 Dev 评分',
     exit_AUTO_SL:'止损', exit_AUTO_TP:'止盈', exit_AUTO_TRAIL:'移动止损', exit_AUTO_ESCAPE:'逃生信号', exit_unknown:'—',
@@ -893,6 +899,9 @@ const I18N={
     stats_h3:'Auto-trade stats', stats_none:'No closed auto-trades yet',
     stats_total:(n)=>`${n} trades`, stats_winrate:'win rate', stats_pnl:'total PnL',
     period_day:'By day', period_week:'By week', period_month:'By month',
+    stats_reset_btn:'↺ Reset', stats_reset_title:'Reset win-rate display',
+    stats_reset_msg:'Sets the win-rate counter to start from now; the stats card restarts from zero. <b>No trade log is deleted</b> — all history is kept (for later analysis).<br>Reset the display?',
+    toast_stats_reset:'Win-rate display reset (log kept)', toast_stats_reset_fail:(m)=>`Reset failed: ${m}`,
     rz_title:'Drag to resize', mcp_retry:'RETRY',
     stats_by_exit:'By exit reason', stats_by_conv:'By LLM conviction', stats_by_dev:'By dev score',
     exit_AUTO_SL:'stop-loss', exit_AUTO_TP:'take-profit', exit_AUTO_TRAIL:'trailing stop', exit_AUTO_ESCAPE:'escape signal', exit_unknown:'—',
@@ -1075,6 +1084,9 @@ const I18N={
     stats_h3:'Статистика автотрейду', stats_none:'Ще немає закритих угод автотрейду',
     stats_total:(n)=>`${n} угод`, stats_winrate:'вінрейт', stats_pnl:'сумарний PnL',
     period_day:'По днях', period_week:'По тижнях', period_month:'По місяцях',
+    stats_reset_btn:'↺ Скинути', stats_reset_title:'Скинути показ вінрейту',
+    stats_reset_msg:'Ставить точку відліку вінрейту на зараз — картка статистики почне рахувати з нуля. <b>Журнал угод не видаляється</b>, вся історія зберігається (для подальшого аналізу).<br>Скинути показ?',
+    toast_stats_reset:'Показ вінрейту скинуто (журнал збережено)', toast_stats_reset_fail:(m)=>`Не вдалось скинути: ${m}`,
     rz_title:'Потягніть, щоб змінити висоту', mcp_retry:'ПОВТОР',
     stats_by_exit:'За причиною виходу', stats_by_conv:'За впевненістю LLM', stats_by_dev:'За dev-скором',
     exit_AUTO_SL:'стоп-лос', exit_AUTO_TP:'тейк-профіт', exit_AUTO_TRAIL:'трейлінг-стоп', exit_AUTO_ESCAPE:'сигнал втечі', exit_unknown:'—',
@@ -1777,6 +1789,17 @@ async function fetchAutoStats(){
     if(!r.ok)return;
     renderAutoStats(await r.json());
   }catch(e){/* 静默：统计面板非关键路径 */}
+}
+function resetAutoStats(){
+  if(source!=='backend'){toast(t('toast_be_switched'),'err');return;}
+  confirmDialog(t('stats_reset_title'),t('stats_reset_msg'),async()=>{
+    try{
+      const r=await fetch(API+'/api/stats/auto/reset',{method:'POST'});
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      toast(t('toast_stats_reset'),'ok');
+      fetchAutoStats();
+    }catch(e){toast(t('toast_stats_reset_fail',e.message),'err');}
+  });
 }
 // 右上角 MODE 图标点击切换：→LIVE 需二次确认(动真钱)，→SHADOW 直接切。均通知后端 /api/mode。
 function toggleMode(){

@@ -253,7 +253,10 @@ POST `/api/settings/reset {chain}` **重置该链回默认**（删除落盘覆�
 `enabled:true` 仅在 `ST.mode=="SHADOW"` 时真正生效（否则静默回 false）；`/api/mode`/`/api/config` 一旦让 mode 离开 SHADOW，会顺带强制关闭并写日志。`/api/status` 与每轮 `/api/run` 都回传 `auto_trade` 供前端同步。
 
 ### `GET /api/stats/auto`（自动交易统计，见 §10b）
-只读；返回 `compute_auto_stats()`，按 `outputs/trade_decisions.jsonl` 里 `action=="SELL" and auto==true` 的记录聚合。`PUBLIC_DEMO` 下 403（持仓/自身交易不对外，同 §7 约定）。
+只读；返回 `compute_auto_stats()`，按 `outputs/trade_decisions.jsonl` 里 `action=="SELL" and auto==true` 的记录聚合（仅 `stats_epoch` 之后成交的，见下）。`PUBLIC_DEMO` 下 403（持仓/自身交易不对外，同 §7 约定）。
+
+### `POST /api/stats/auto/reset`（重置胜率显示，不删数据）
+把 `outputs/stats_epoch.json` 的起算点设为当前时刻——之后胜率卡片只统计这之后成交的单子，从零开始。**`trade_decisions.jsonl` 一条不删**，历史 `entry_signal` 全部保留供数据分析（见 `TESTING_PLAN.md`）。此前"清胜率"= archive+truncate 日志，会把正在采集的分析数据一起销毁；现已彻底解耦（"清屏看胜率" vs "销毁交易数据"是两件事）。前端统计卡片标题栏 `↺ 重置` 按钮触发（带确认弹窗）。`PUBLIC_DEMO` 下 403。
 
 ---
 
