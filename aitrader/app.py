@@ -1433,8 +1433,17 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
         # 这样的仓位除了逃生信号或手动卖出，永远没有自动退出路径，变成永久占着子额度的"僵尸仓位"。
         log("AUTO_BUY_SKIP", f.symbol_safe, "无法获取入场价格，跳过自动开仓")
         return
+    # entry_signal 是这笔交易平仓后做"亏损复盘"时唯一能看到的入场快照——凡是自动入场时参与
+    # 拦截/评分的指标，都在这里存一份原始值，否则复盘时无法判断"快速止损的单子当时 sniper/
+    # 流动性/成交量到底多少"，只能瞎猜。字段名与 CFG 门槛一一对应，便于日后按维度分桶统计胜率。
     sig = dict(verdict=v.verdict, conviction=v.conviction, crowdedness=v.crowdedness,
-               dev_score=f.dev_eval, priority=pri, sm_confluence=f.sm_confluence)
+               dev_score=f.dev_eval, priority=pri, sm_confluence=f.sm_confluence,
+               sniper_count=f.sniper_count, liquidity=round(f.liquidity, 2),
+               vol_1h=round(f.vol_1h, 2), swaps=f.swaps, buy_ratio=round(f.buy_ratio, 4),
+               mcap=round(f.mcap, 2), ath_mcap=round(f.ath_mcap, 2),
+               ath_ratio=(round(f.mcap / f.ath_mcap, 4) if f.ath_mcap > 0 else None),
+               age_min=round(f.age_min, 1), chg_5m=round(f.chg_5m, 4), chg_1h=round(f.chg_1h, 4),
+               dev_exited=(bool(f.dev.get("exited")) if f.dev else None))
     ST.positions.append(dict(symbol=f.symbol_safe, address=f.address, size_sol=size_native,
                              orig_size_sol=size_native, pnl=0.0, cycles=0, entry=entry, chain=chain,
                              entry_price=entry_price, cur_price=entry_price,
