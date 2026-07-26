@@ -145,7 +145,15 @@ CFG = {
     #    门槛（sm_confluence≥1、dev_score≥0.15），让更宽的样本进来，攒够单量后用真实胜率数据判断
     #    "压线通过"是否真的更容易亏，再决定是否重新加码。原值：sm_confluence=2、dev_score=0.30。
     "min_auto_sm_confluence": 1,     # 数据采集期临时值；原值 2
-    "min_auto_dev_score": 0.15,      # 数据采集期临时值；原值 0.30
+    # dev_score 门槛（2026-07-26 按实盘数据定为 0.2；历史：直觉 0.30 → 采集期 0.15 → 现在 0.2）：
+    #   ⚠️ 反直觉但重要的区分——dev_score 不预测"赚不赚钱"，只预测"会不会被砸盘归零"：
+    #     · 按收益分桶完全没有区分度（<0.2 档 avgPnL +10.2%，>=0.5 档反而 -6.1%），
+    #       所以当初凭直觉加码到 0.30 是错的，会砍掉赚钱的一大片；
+    #     · 但按"灾难性亏损（AUTO_ESCAPE，约 -80%）"分桶就很清楚：
+    #       dev_score 正好卡在 0.15 地板上的 62 笔里出了 4 次（6.5%），
+    #       0.15 以上的 52 笔里只出了 1 次（1.9%）——地板档的暴雷率是 3 倍多。
+    #   所以只把地板抬高一档挡掉最脏的那批，不再往上加码。样本仅 5 次暴雷，后续继续观察。
+    "min_auto_dev_score": 0.2,
     # crowdedness="early" 只看最近 5m/1h 动能，完全不知道这个币今天早些时候是否已经拉升-砸盘过
     # 一轮——真实事故：BUNKEE 当前市值只有历史最高市值的 29%（今天已经从高点跌了 70%），
     # 短期动能读数依然是"early"（真的在涨），照样买了第二轮反弹。用当前市值/历史最高市值的
@@ -1455,7 +1463,14 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
                mcap=round(f.mcap, 2), ath_mcap=round(f.ath_mcap, 2),
                ath_ratio=(round(f.mcap / f.ath_mcap, 4) if f.ath_mcap > 0 else None),
                age_min=round(f.age_min, 1), chg_5m=round(f.chg_5m, 4), chg_1h=round(f.chg_1h, 4),
-               dev_exited=(bool(f.dev.get("exited")) if f.dev else None))
+               dev_exited=(bool(f.dev.get("exited")) if f.dev else None),
+               # 砸盘风险维度（2026-07-26 补记）：pump.fun 是 bonding curve，流动性由合约程序化托管，
+               # 没有"LP 被人抽走"这回事（实测 100 个热门币 burn_ratio/lock_percent 全是 0，无信息量）——
+               # 我们那几笔 -80% 不是撤池，是内部人把筹码砸进曲线。所以真正该盯的是"谁手里有货能砸"：
+               # rug_ratio（实测 89/100 非零，是这类字段里唯一有区分度的）+ 筹码集中度三件套。
+               # 这些此前从不入库，导致无法回测"rug_ratio 0.3-0.6 是不是真的更危险"，先记下来再谈调门槛。
+               rug_ratio=round(f.rug_ratio, 4), top10=round(f.top10, 4),
+               bundler=round(f.bundler, 4), dev_hold=round(f.dev_hold, 4))
     ST.positions.append(dict(symbol=f.symbol_safe, address=f.address, size_sol=size_native,
                              orig_size_sol=size_native, pnl=0.0, cycles=0, entry=entry, chain=chain,
                              entry_price=entry_price, cur_price=entry_price,
@@ -1831,6 +1846,34 @@ def _period_key(r: dict, period: str) -> str:
         return f"{iso[0]}-W{iso[1]:02d}"
     return dt.strftime("%Y-%m")  # month
 
+def _attach_trade_totals(rows: list[dict]) -> list[dict]:
+    """给每条"最终离场"记录挂上整笔交易的真实盈亏（$ 与等效百分比），返回最终离场记录列表。
+
+    为什么必须这么算：离场是分段的（+20% 卖 30%、+50% 再卖 30%），一笔仓位会在日志里留下
+    多条 SELL。胜负此前只看最后一条腿的 pnl，于是"先 +20% 落袋、剩余仓位回落到保本价出场"
+    这种**实际赚钱**的交易，因为最后一腿 pnl≈0 被判成亏损。实测 9 笔这种情况里 8 笔是盈利的，
+    其中 SECRETBULL 整笔赚了 $24.50 却计入亏损——胜率被系统性低估（49.6% → 实为 56.3%）。
+    按时间顺序累计部分止盈、遇到最终离场就结算并清零，这样同一地址若真发生二次交易也不会串账。
+    """
+    pend: dict[str, float] = {}
+    finals: list[dict] = []
+    for r in rows:
+        addr = r.get("address") or ""
+        usd = r.get("pnl", 0) * _row_usd(r)
+        if r.get("partial"):
+            pend[addr] = pend.get(addr, 0.0) + usd
+            continue
+        total = usd + pend.pop(addr, 0.0)
+        r["trade_pnl_usd"] = round(total, 4)
+        # 等效百分比：整笔交易盈亏 ÷ 建仓名义（$20），便于与单腿 pnl 同量纲比较
+        r["trade_pnl_pct"] = round(total / CFG["auto_size_usd"], 4) if CFG["auto_size_usd"] else 0.0
+        finals.append(r)
+    return finals
+
+def _is_win(r: dict) -> bool:
+    """整笔交易是否赚钱（含此前已落袋的部分止盈），而不是"最后一腿是否为正"。"""
+    return r.get("trade_pnl_usd", r.get("pnl", 0)) > 0
+
 def _group_trades(rows: list[dict], keyfn) -> list[dict]:
     buckets: dict[str, list[dict]] = {}
     for r in rows:
@@ -1838,10 +1881,10 @@ def _group_trades(rows: list[dict], keyfn) -> list[dict]:
     out = []
     for k, rs in buckets.items():
         n = len(rs)
-        wins = sum(1 for r in rs if r.get("pnl", 0) > 0)
-        total_usd = sum(r.get("pnl", 0) * _row_usd(r) for r in rs)
+        wins = sum(1 for r in rs if _is_win(r))
+        total_usd = sum(r.get("trade_pnl_usd", r.get("pnl", 0) * _row_usd(r)) for r in rs)
         out.append(dict(key=k, n=n, win_rate=round(wins / n, 3),
-                        avg_pnl_pct=round(sum(r.get("pnl", 0) for r in rs) / n, 4),
+                        avg_pnl_pct=round(sum(r.get("trade_pnl_pct", r.get("pnl", 0)) for r in rs) / n, 4),
                         total_pnl_usd=round(total_usd, 2)))
     return sorted(out, key=lambda x: -x["n"])
 
@@ -1851,18 +1894,18 @@ def compute_auto_stats() -> dict:
     # 笔数/胜率必须只按"最终离场"那一条算（一笔仓位=一笔交易），否则每笔部分止盈过的
     # 仓位都会被重复计成 2 笔交易，且部分止盈几乎总是正 pnl，会把胜率虚高。
     # 已实现总盈亏($)不受影响，仍按全部记录求和——部分止盈锁定的利润是真实到手的钱。
-    full_rows = [r for r in rows if not r.get("partial")]
+    full_rows = _attach_trade_totals(rows)     # 顺带把整笔盈亏挂到最终离场记录上（见其 docstring）
     n = len(full_rows)
     if n == 0:
         return dict(total_trades=0, wins=0, losses=0, win_rate=0, total_pnl_usd=0, avg_pnl_pct=0,
                     by_exit_tag=[], by_conviction=[], by_crowdedness=[], by_dev_bucket=[],
                     by_day=[], by_week=[], by_month=[], recent=[])
-    wins = sum(1 for r in full_rows if r.get("pnl", 0) > 0)
-    losses = sum(1 for r in full_rows if r.get("pnl", 0) <= 0)
+    wins = sum(1 for r in full_rows if _is_win(r))
+    losses = n - wins
     total_usd = sum(r.get("pnl", 0) * _row_usd(r) for r in rows)
     return dict(
         total_trades=n, wins=wins, losses=losses, win_rate=round(wins / n, 3), total_pnl_usd=round(total_usd, 2),
-        avg_pnl_pct=round(sum(r.get("pnl", 0) for r in full_rows) / n, 4),
+        avg_pnl_pct=round(sum(r.get("trade_pnl_pct", 0) for r in full_rows) / n, 4),
         by_exit_tag=_group_trades(full_rows, lambda r: r.get("exit_tag") or "unknown"),
         by_conviction=_group_trades(full_rows, lambda r: _bucket_conviction((r.get("entry_signal") or {}).get("conviction"))),
         by_crowdedness=_group_trades(full_rows, lambda r: (r.get("entry_signal") or {}).get("crowdedness") or "unknown"),
