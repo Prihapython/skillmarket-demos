@@ -112,19 +112,24 @@ CFG = {
     # 均已按用户要求移除（不再在 RiskManager.gate()/auto_open_position() 里拦截）——
     # 用户明确要求 SOL 上不受仓位数/敞口限制持续交易；CFG 里留着仅供前端展示参考数字。
     "max_auto_positions": 5,
-    # 入场年龄上限：默认不追超过 3 天的老币（早期动能大概率已过去），
-    # 除非信号极强（conviction 与优先级都很高）——用户明确要求的例外。
-    "max_token_age_days": 3,
-    "age_exception_min_conviction": 0.9,
-    "age_exception_min_priority": 80,
+    # 入场年龄上限（2026-07-26 按 114 笔实盘数据重设，原值 3 天 + conviction 例外）：
+    #   年龄是所有维度里最干净、最单调的预测因子，两次独立统计都一致：
+    #     <5min  avgPnL +13.7% (n=43) | 5-15min +8.3% (n=46)
+    #     15-60min -5.5% (n=15)       | >=60min -19.8% 胜率仅 20% (n=10)
+    #   15 分钟处有明显断层，超过 15 分钟的单子累计贡献 -280%，是最大的一处失血。
+    #   原来的"信号极强则放行"例外（conviction>=0.9 且 priority>=80）已删除：数据显示
+    #   conviction 根本不预测结果（0.9-0.95 桶 avgPnL -10.7%，反而是最差的一档），
+    #   这个例外实测放行了 4 笔、合计 -94.8%，正好漏的都是亏损档，留着会把新门槛架空。
+    "max_token_age_min": 15,
     # 自动入场额外硬拦（人工流程不受影响，仍只是 UI 提示）：
     #   狙击钱包过多 → 大概率是开盘秒买等拉盘就跑的老鼠仓，随时可能砸盘；
     #   流动性过低 → $20 的建仓/平仓本身就会显著滑点，止损/止盈价格失真。
-    # ⚠️ 数据采集期临时放宽（2026-07-25）：max_auto_sniper_count 5→30。真实市场热门币狙击钱包
-    #    普遍 14~49 个（观测值），门槛=5 是我当初凭直觉拍的、没有数据支撑，卡掉了约 69% 的候选，
-    #    导致 16h 只成交 2 笔、样本太小无法验证"狙击数到底跟胜负有没有关系"。放宽到 30 以覆盖大部分
-    #    真实分布、让这个维度的样本能进来被 entry_signal 记录，攒够单量后再按胜率数据回调。
-    "max_auto_sniper_count": 30,     # 数据采集期临时值；原值 5，攒够样本后按数据回调
+    # 狙击钱包上限（2026-07-26 按 114 笔实盘数据定档；历史：直觉值 5 → 采集期 30 → 现在 10）：
+    #     0 个    avgPnL  +9.5% (n=80) | 1-9 个  +19.4% (n=6，最佳档)
+    #     10-19 个 avgPnL -8.8% (n=16) | >=20 个  -4.2% (n=12)
+    #   10 处有断层：10 以上累计贡献 -191%。当初的 5 太严（把最赚的 1-9 档也砍了），
+    #   采集期的 30 太松（放进了整个亏损档），10 才是数据给出的分界。
+    "max_auto_sniper_count": 10,
     "min_auto_liquidity_usd": 3000.0,
     # 成交笔数/成交额过低 → 样本太小，buy_ratio 这种比率型信号在个位数笔数上纯属噪音
     # （2 买 1 卖 = 67% 买占比，跟真正有意义的买盘完全不是一回事）；vol_1h 无论对错此前
@@ -1413,11 +1418,9 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
                                               # 就随时可能砸盘；dev 已经出清、后续没有内部人能再靠抛售操纵价格，
                                               # 配合上面的 dev_score 门槛（历史记录不能太差）比"dev 还在场"更安全。
                                               # f.dev 为 None（没查到历史）按未知处理，同样不买。
-    if f.age_min > CFG["max_token_age_days"] * 1440:
-        strong = (v.conviction >= CFG["age_exception_min_conviction"]
-                  and pri >= CFG["age_exception_min_priority"])
-        if not strong:
-            return                           # 币太老（早期动能大概率已过），且信号不够强 → 不追
+    if f.age_min > CFG["max_token_age_min"]:
+        return                               # 超过 15 分钟的币实测系统性亏损（见 CFG 注释的分桶数据）；
+                                              # 无条件拦截——原先的 conviction 例外实测只漏亏损单，已删
     g = ST.adapter_for(chain)
     size_native = round(CFG["auto_size_usd"] / native_usd_price(g, chain), 6)
     allow, rnote = ST.risk.gate(size_native, len(ST.positions), ST.exposure())
