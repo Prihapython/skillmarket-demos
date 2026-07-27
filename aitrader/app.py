@@ -2618,6 +2618,7 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
                              live_strategy_id=live_strategy,
                              live_stop_id=None, live_stop_price=0.0,
                              entry_token_amount=entry_tokens,
+                             entry_signal=_manual_entry_signal(chain, address),
                              tp1_done=False, tp2_done=False, peak_price=entry_price))
     save_positions()
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
@@ -2770,6 +2771,39 @@ def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
         p["live_stop_price"] = 0.0
         log("LIVE_NO_STOPLOSS", p.get("symbol", ""),
             f"⚠ 止损挂单失败，本轮起由本地轮询兜底：{e}")
+
+def _manual_entry_signal(chain: str, address: str) -> dict | None:
+    """Знімок показників на вході для **ручної** покупки.
+
+    Авто-вхід пише entry_signal сам (див. auto_open_position), а ручний — ні,
+    тому всі LIVE-угоди виявились без сигналу й непридатними для розкладання
+    по бакетах. А саме LIVE-дані потрібні, щоб звірити SHADOW з реальністю
+    (Фаза 4) — без цього поля порівнювати нічого.
+
+    Беремо рядок з останнього непорожнього热榜 (він уже в пам'яті, зайвих
+    викликів API не буде). Немає в списку — повертаємо None, і угода
+    просто лишиться без сигналу, як раніше; це не привід валити покупку."""
+    try:
+        rows = ST._trending_last_good.get(chain) or []
+        row = next((r for r in rows if (r.get("address") or "").lower() == address.lower()), None)
+        if row is None:
+            return None
+        f = FeatureExtractor(ST.adapter_for(chain)).build_from_row(row)
+        return dict(manual=True,
+                    dev_score=f.dev_eval, sm_confluence=f.sm_confluence,
+                    sniper_count=f.sniper_count, liquidity=round(f.liquidity, 2),
+                    vol_1h=round(f.vol_1h, 2), swaps=f.swaps,
+                    buy_ratio=round(f.buy_ratio, 4), mcap=round(f.mcap, 2),
+                    ath_mcap=round(f.ath_mcap, 2),
+                    ath_ratio=(round(f.mcap / f.ath_mcap, 4) if f.ath_mcap > 0 else None),
+                    age_min=round(f.age_min, 1), chg_5m=round(f.chg_5m, 4),
+                    chg_1h=round(f.chg_1h, 4),
+                    dev_exited=(bool(f.dev.get("exited")) if f.dev else None),
+                    rug_ratio=round(f.rug_ratio, 4), top10=round(f.top10, 4),
+                    bundler=round(f.bundler, 4), dev_hold=round(f.dev_hold, 4))
+    except Exception as e:
+        log("ENTRY_SIGNAL_FAIL", address[:8], str(e))
+        return None
 
 def _cancel_live_strategy(g: "GMGNAdapter", p: dict) -> None:
     """全仓离场前撤掉 GMGN 侧挂着的止损/止盈策略单。
