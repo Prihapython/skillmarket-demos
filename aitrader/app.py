@@ -1743,9 +1743,13 @@ def _auto_decide_exit(p: dict):
     if not p.get("tp1_done"):
         # 部分止盈前：初始硬止损 -35% 保护全仓
         if pnl <= -CFG["hard_stop_pct"]:
-            # 扫描周期之间价格可能已经跌穿止损位很远（"滑点"）；真实止损单会在触发价附近成交，
-            # 不会让账面亏损远超设定的止损百分比——用户明确要求最大亏损就是 -35%，不是"看到多少算多少"。
-            p["pnl"] = max(pnl, -CFG["hard_stop_pct"])
+            # SHADOW：扫描周期之间价格可能已经跌穿止损位很远；真实止损单会在触发价附近成交，
+            # 所以纸面成绩按 -35% 记账，而不是"看到多少算多少"——这是**模拟**，不是观测。
+            # LIVE：绝不套这个夹子。实盘有真实成交价，夹一下就等于往账本里写一个没发生过的数字，
+            # 而 LIVE 存在的全部意义就是拿真实数据校准 SHADOW。2026-07-27 MANTEN 实测：
+            # 真实成交 -32.4%，夹完记成 -35.0% —— 这次偏向对我们有利，方向无所谓，记假就是错。
+            if not p.get("live"):
+                p["pnl"] = max(pnl, -CFG["hard_stop_pct"])
             return ("full", "AUTO_SL")
         if pnl >= CFG["auto_tp1_pct"]:
             return ("partial", CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
@@ -1759,7 +1763,9 @@ def _auto_decide_exit(p: dict):
     p["peak_price"] = peak
     stop_price = trailing_stop_price(p)
     if entry > 0 and cur > 0 and cur <= stop_price:
-        p["pnl"] = max(pnl, stop_price / entry - 1)   # 同样按止损触发价成交，不按滑点后的更差价格
+        # 同上：SHADOW 按触发价记账（模拟），LIVE 用真实价（观测）。见上面 AUTO_SL 分支的注释。
+        if not p.get("live"):
+            p["pnl"] = max(pnl, stop_price / entry - 1)
         return ("full", "AUTO_TRAIL_BE")
     if not p.get("tp2_done") and pnl >= CFG["auto_tp2_pct"]:
         # 第二次部分止盈：再卖掉"原始仓位"的 auto_tp2_sell_frac（口径与第一刀一致，不是"剩余仓位"的比例），
