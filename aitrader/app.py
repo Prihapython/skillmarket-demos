@@ -1794,7 +1794,19 @@ def auto_manage_exits(chain: str) -> None:
         g = ST.adapter_for(chain)
         for p in pool:
             _live_sync_from_chain(g, p)   # 先用链上余额确认 GMGN 那两刀成交了没有
+            if p.get("_chain_closed"):
+                continue                  # 已被条件单清空，下面统一收尾，不用再挂止损
             _live_arm_stop(g, p)          # 再把止损单对齐到规则算出的价格（tp1 之后才有动作）
+        # 链上已清零的仓位：记一笔 SELL 并移出持仓列表。
+        # 这一步不能省——GMGN 替我们平的仓，本地既没记账也没销仓，
+        # 统计里就会缺掉整笔交易，而列表里留着一个永远为 0 的幽灵仓位。
+        for p in [x for x in pool if x.get("_chain_closed")]:
+            log("SELL", p.get("symbol", ""), f"LIVE 链上条件单已全部平仓 PnL {p.get('pnl', 0):+.1%}",
+                dict(address=p["address"], chain=chain, size_sol=p.get("orig_size_sol", 0),
+                     pnl=p.get("pnl", 0), usd_notional=_sell_usd_notional(p, p.get("orig_size_sol", 0)),
+                     auto=bool(p.get("auto")), live=True, exit_tag="LIVE_CHAIN_CLOSED",
+                     entry_signal=p.get("entry_signal")))
+            ST.positions[:] = [x for x in ST.positions if x is not p]
         save_positions()
     for p in pool:
         decision = _auto_decide_exit(p)
@@ -2566,6 +2578,24 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
             time.sleep(1.5)
         if not entry_tokens:
             log("LIVE_BALANCE_FAIL", symbol, "建仓后多次读取 token 余额均为 0，链上校准将不可用")
+        # 用**实际成交价**覆盖建仓价。entry_price 原本取自下单前的行情快照，
+        # 而这几秒里价格照样在动：2026-07-27 实测 Couple 差了 7%。
+        # 它是保本止损、移动止损和 PnL 的共同基准——差 7% 就意味着"保本价"其实在真实成本
+        # 下方 7%，会在亏损处离场却记成保本。这次方向恰好有利（+8.1% 离场），纯属运气。
+        try:
+            fills = [x for x in (g.wallet_activity(wallet, limit=10).get("activities") or [])
+                     if x.get("event_type") == "buy"
+                     and ((x.get("token") or {}).get("address") or "").lower() == address.lower()]
+            if fills:
+                real = _f(fills[0].get("price_usd"))
+                if real > 0:
+                    if entry_price > 0 and abs(real / entry_price - 1) > 0.02:
+                        log("LIVE_ENTRY_PRICE_FIXED", symbol,
+                            f"建仓价按实际成交修正 {entry_price:.10g} → {real:.10g} "
+                            f"({(real / entry_price - 1) * 100:+.1f}%)")
+                    entry_price = real
+        except Exception as e:
+            log("LIVE_FILL_PRICE_FAIL", symbol, f"读取实际成交价失败，沿用下单前快照：{e}")
     else:
         filled = False
         live_strategy = None
@@ -2676,6 +2706,11 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     # 账面持仓量跟着链上走，否则后续按比例卖出的基数是错的
     if orig > 0 and p.get("orig_size_sol"):
         p["size_sol"] = round(p["orig_size_sol"] * left, 6)
+    # 链上已经清零 = GMGN 的条件单把仓位全部卖完了，我们没参与。
+    # 不标记的话仓位会以 size_sol=0 的状态永远挂在列表里：占着并发额度、
+    # 每轮白白去查余额和策略单，而且这笔交易的结果永远不会进统计。
+    if left <= 0.02 and orig > 0:
+        p["_chain_closed"] = True
 
 def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
     """把 GMGN 侧的止损单对齐到 trailing_stop_price() 算出的价格（只在第一次止盈后需要）。
