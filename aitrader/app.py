@@ -588,24 +588,36 @@ class LiveGMGN(GMGNAdapter):
         return _f(rows[0].get("balance")) if rows else 0.0
 
     def strategy_create_stop(self, wallet: str, base_token: str, quote_token: str,
-                             check_price: float, amount_in_percent: float,
+                             check_price: float, amount_in: int,
                              slippage: float, priority_fee=None, tip_fee=None) -> dict:
         """给**已持有**的仓位挂一个绝对价格的止损单（limit_order / stop_loss）。
 
         为什么用绝对价格而不是 condition_orders 的百分比：我们的移动止损是"峰值 - 25 个百分点"，
         换算成百分比会随峰值漂移；而 --check-price 直接吃价格，能一比一复刻规则。
-        峰值上移时由调用方撤单重挂。"""
+        峰值上移时由调用方撤单重挂。
+
+        ⚠️ 必须传 --amount-in（最小单位的整数），不能用 --amount-in-percent：
+        后者虽然在 --help 里列着，实测 API 报 400 "amount_in must be greater than zero"。
+        返回体是 {"order_id": "...", "is_update": false}。"""
         args = ["order", "strategy", "create", "--from", wallet,
                 "--base-token", base_token, "--quote-token", quote_token,
                 "--order-type", "limit_order", "--sub-order-type", "stop_loss",
                 "--check-price", f"{check_price:.12g}",
-                "--amount-in-percent", str(round(amount_in_percent, 4)),
+                "--amount-in", str(int(amount_in)),
                 "--slippage", str(slippage)]
         if priority_fee is not None:
             args += ["--priority-fee", str(priority_fee)]
         if tip_fee is not None:
             args += ["--tip-fee", str(tip_fee)]
         return self._cli(*args)
+
+    def token_decimals(self, token: str) -> int:
+        """token 精度。挂止损要把持仓量换算成最小单位整数，精度错一位就差 10 倍。"""
+        d = self.token_info(token)
+        for k in ("decimals", "decimal", "base_decimal"):
+            if d.get(k) is not None:
+                return int(_f(d[k]))
+        return 6      # pump.fun 系一律 6 位；取不到时按这个走，总好过报错中断止损
 
     def strategy_cancel(self, wallet: str, order_id: str, order_type: str = "smart_trade") -> dict:
         """撤掉挂在 GMGN 侧的止损/止盈策略单。逃生离场时必须先撤——否则我们已经清仓了，
@@ -2654,14 +2666,21 @@ def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
             return
         p["live_stop_id"] = None
     try:
+        # 卖掉当时链上还剩的全部（保本/移动止损都是全清语义）。用**实时余额**换算，
+        # 不用账面数字：GMGN 已经替我们卖掉过部分止盈，账面和链上随时可能对不上。
+        wallet = g.wallet_address()
+        bal = g.token_balance(wallet, p["address"])
+        if bal <= 0:
+            return                       # 链上已经没货了（可能刚被条件单清掉），没什么可保护的
+        dec = g.token_decimals(p["address"])
         r = g.strategy_create_stop(
-            wallet=g.wallet_address(), base_token=p["address"],
+            wallet=wallet, base_token=p["address"],
             quote_token=native_token(p.get("chain", "sol")),
             check_price=want,
-            amount_in_percent=100.0,        # 卖掉当时还剩的全部（保本/移动止损都是全清语义）
+            amount_in=int(bal * (10 ** dec)),
             slippage=CFG["live_slippage_sell"],
             priority_fee=CFG["live_priority_fee_sol"], tip_fee=CFG["live_tip_fee_sol"])
-        sid = r.get("order_id") or r.get("strategy_order_id")
+        sid = r.get("order_id")
         if not sid:
             raise RuntimeError(f"返回里没有 order_id：{r}")
         p["live_stop_id"] = sid
