@@ -187,8 +187,17 @@ CFG = {
     # 2% 是用户在 GMGN 手动下单实测能成交的值，作为起点；不是拍脑袋的"大滑点更保险"。
     # ⚠️ 滑点是**上限不是手续费**：调高不等于多付钱，只是允许更差的成交价才不回滚。
     #    真正要用数据定的是"我们的入场条件下失败率多少"，见 WALLET_PLAN.md 阶段 3。
-    "live_slippage_buy": 2.0,
-    "live_slippage_sell": 2.0,
+    # 2.0 → 5.0（2026-07-27，实盘 3 单定的，不是拍脑袋）：
+    #   Fartci  5分钟 +360%  实测滑点 0.62%  成交
+    #   L'Eon   5分钟  +21%  实测滑点 1.93%  成交（已经贴着 2% 上限）
+    #   CSC     5分钟  +58%  超过 2%        **失败回滚**
+    # 我们的入场条件天然偏向"正在快速上涨"，报价到上链之间几秒钟价格就能跑掉 2%，
+    # 卡在 2% 等于系统性错过涨得最快的那批——而那批正是策略想要的。
+    # ⚠️ 代价不是白拿的：上限放宽不会多付固定费用，但确实允许更差的成交价。
+    #    5% 是覆盖已观测到的 1.93% 再留出余量，不是"越大越保险"；
+    #    继续记录每单实际滑点，若长期远低于 5% 就调回来（见 WALLET_PLAN 阶段 3）。
+    "live_slippage_buy": 5.0,
+    "live_slippage_sell": 5.0,
     # SOL 上挂条件单（--condition-orders）时，priority-fee 与 tip-fee 是**必填**，不是可选优化。
     "live_priority_fee_sol": 0.0001,
     "live_tip_fee_sol": 0.0001,
@@ -2621,11 +2630,20 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     # 建仓当时可能因为策略入库延迟没查到（swap 响应里本来就没有这个字段）。
     # 不补的后果很具体：仓位被当成"无保护"，本地逻辑会跟 GMGN 抢着卖，
     # 涨到 +20% 时两边各卖 30% = 卖掉 60%。所以每轮都尝试认领一次。
-    if not p.get("live_strategy_id") and CFG["live_condition_orders"]:
+    if CFG["live_condition_orders"]:
+        # **每轮都查**，不是只在缺失时查。止损不只会创建失败，还会**触发时失败**：
+        # 2026-07-27 实测 CSC —— 建仓时 status=check（已武装），价格跌穿 -35% 时变成 failed，
+        # 币根本没卖出去，等我们发现已经 -40%。原来的写法只在 live_strategy_id 为空时回查，
+        # 所以一旦认定"有保护"就永远不再复核，本地逻辑一直让路，等于两边都没人管。
         sid = _find_live_strategy(g, g.wallet_address(), p["address"], tries=1)
-        if sid:
+        if sid and not p.get("live_strategy_id"):
             p["live_strategy_id"] = sid
             log("LIVE_STRATEGY_RECLAIMED", p.get("symbol", ""), f"补回条件单 {sid}")
+        elif not sid and p.get("live_strategy_id"):
+            # 之前有、现在没了（或止损已 failed）→ 立刻交还给本地逻辑，别再让路
+            p["live_strategy_id"] = None
+            log("LIVE_STOPLOSS_LOST", p.get("symbol", ""),
+                "⚠ 链上止损已失效（触发失败或被撤），本地逻辑接管")
 
     # ── 自愈 2：补回建仓数量 ─────────────────────────────────────────────
     # 建仓后立刻读余额常常拿到 0（成交与索引之间有延迟）。只要还没发生过部分止盈，
