@@ -352,7 +352,7 @@ class GMGNAdapter:
     def wallet_address(self) -> str: raise NotImplementedError
     def portfolio_info(self) -> dict: raise NotImplementedError   # Key 绑定的钱包 + 原生币余额
     def holdings(self, wallet, limit=20) -> dict: raise NotImplementedError  # 钱包持仓（只读）
-    def token_balance(self, wallet, token) -> dict: raise NotImplementedError  # 单币余额（链上校准用）
+    def token_balance(self, wallet, token) -> float: raise NotImplementedError  # 单币余额（链上校准用）
 
 
 class LiveGMGN(GMGNAdapter):
@@ -560,18 +560,32 @@ class LiveGMGN(GMGNAdapter):
 
     def order_get(self, order_id):  return self._cli("order", "get", "--order-id", order_id)
 
-    def strategy_list(self, wallet: str, base_token: str | None = None) -> dict:
-        """挂在 GMGN 侧的未触发策略单（--type open 为默认）。"""
-        args = ["order", "strategy", "list", "--from", wallet]
+    def strategy_list(self, wallet: str, base_token: str | None = None,
+                      group_tag: str = "STMix") -> dict:
+        """挂在 GMGN 侧的未触发策略单（--type open 为默认）。
+
+        --group-tag 是**必填**（API 返回 400 "group_tag is required"）：
+        STMix = 跟随买单的条件单（我们建仓时挂的那组）；LimitOrder = 独立的限价/止损单
+        （_live_arm_stop 挂的那种）。"""
+        args = ["order", "strategy", "list", "--from", wallet, "--group-tag", group_tag]
         if base_token:
             args += ["--base-token", base_token]
         return self._cli(*args)
 
-    def token_balance(self, wallet: str, token: str) -> dict:
-        """单个 token 的钱包余额。用来**从链上**确认部分止盈到底成交了没有——
+    def token_balance(self, wallet: str, token: str) -> float:
+        """单个 token 的钱包余额（已解析成数字）。用来**从链上**确认部分止盈到底成交了没有——
         我们自己的 tp1_done 标记在 LIVE 下不可信：那一刀是 GMGN 条件单在链上执行的，
-        我们没参与，本地无从知晓。余额才是唯一的事实来源。"""
-        return self._cli("portfolio", "token-balance", "--wallet", wallet, "--token", token)
+        我们没参与，本地无从知晓。余额才是唯一的事实来源。
+
+        ⚠️ 返回结构是 {"balances":[{"balance":"11.89",...}]}——**列表**，不是顶层 balance 字段。
+        2026-07-27 实盘第一单就栽在这里：按顶层取值拿到 None→0，entry_token_amount 记成 0，
+        整个链上校准被静默跳过。所以这里直接返回数字，不把解析责任丢给调用方。"""
+        r = self._cli("portfolio", "token-balance", "--wallet", wallet, "--token", token)
+        rows = r.get("balances") or []
+        for row in rows:
+            if (row.get("token_address") or "").lower() == token.lower():
+                return _f(row.get("balance"))
+        return _f(rows[0].get("balance")) if rows else 0.0
 
     def strategy_create_stop(self, wallet: str, base_token: str, quote_token: str,
                              check_price: float, amount_in_percent: float,
@@ -840,9 +854,9 @@ class MockGMGN(GMGNAdapter):
     def holdings(self, wallet, limit=20) -> dict:
         return dict(holdings=[])
 
-    def token_balance(self, wallet, token) -> dict:
+    def token_balance(self, wallet, token) -> float:
         # SHADOW 走不到链上校准（_live_sync_from_chain 只处理 live 仓位），这里只为接口完整
-        return dict(balance="0")
+        return 0.0
 
     def swap(self, **kw):
         return dict(order_id="MOCK-" + str(random.randint(10000, 99999)),
@@ -2495,23 +2509,35 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
         # 条件单是 best-effort：官方文档明说"swap 成功但策略创建失败时，swap 结果照样返回成功"。
         # 不显式检查就会出现最危险的情况——**有仓位、没止损，而且界面显示一切正常**。
         if conds:
-            strategy_id = order.get("strategy_order_id")
-            if strategy_id:
-                live_strategy = strategy_id
-            else:
-                live_strategy = None
+            # swap 的响应里**没有** strategy_order_id（文档提到该字段，实盘首单实测并未返回）。
+            # 只看响应会把"挂上了"误判成"没挂上"——2026-07-27 首单就是这样虚惊一场，
+            # 更糟的是仓位被标成"无保护"，本地逻辑会跟 GMGN 抢着卖，造成双重卖出。
+            # 唯一可靠的确认方式是回查 strategy list（group_tag=STMix 即跟随买单的那组）。
+            live_strategy = _find_live_strategy(g, wallet, address)
+            if not live_strategy:
                 log("LIVE_NO_STOPLOSS", symbol,
-                    "⚠ 条件单创建失败：该仓位当前**没有链上止损**，只剩本地轮询兜底，请尽快人工处理")
-                status_msg += " · ⚠ 止损未挂上"
+                    "⚠ 条件单未确认：该仓位可能**没有链上止损**，暂由本地轮询兜底，请尽快人工核实")
+                status_msg += " · ⚠ 止损未确认"
         else:
             live_strategy = None
         # 记下**实际到手的 token 数量**：后续判断"GMGN 那两刀成交了没有"全靠拿当前余额跟它比。
         # 读不到就置 None —— _live_sync_from_chain 会因此跳过校准（宁可不校准，也不能拿错基数瞎判）。
-        try:
-            entry_tokens = _f(g.token_balance(wallet, address).get("balance"))
-        except Exception as e:
-            entry_tokens = None
-            log("LIVE_BALANCE_FAIL", symbol, f"建仓后读取 token 余额失败，链上校准将不可用：{e}")
+        # 成交确认与 token 到账/被索引之间有延迟，立刻读常常拿到 0；重试几次再放弃。
+        # 记成 0 比记成 None 更糟——None 会跳过校准，0 会让 left=amt/0 的分母保护把校准也关掉，
+        # 两者都等于"链上校准静默失效"，所以这里宁可多花几秒也要拿到真实数字。
+        entry_tokens = None
+        for _try in range(4):
+            try:
+                v = g.token_balance(wallet, address)
+            except Exception as e:
+                log("LIVE_BALANCE_FAIL", symbol, f"读取 token 余额失败：{e}")
+                v = 0.0
+            if v > 0:
+                entry_tokens = v
+                break
+            time.sleep(1.5)
+        if not entry_tokens:
+            log("LIVE_BALANCE_FAIL", symbol, "建仓后多次读取 token 余额均为 0，链上校准将不可用")
     else:
         filled = False
         live_strategy = None
@@ -2534,6 +2560,24 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
     log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})", dict(size_sol=size_sol, chain=chain, **exit_plan()))
     return dict(ok=True, status=status_msg, filled=filled, symbol=symbol)
 
+def _find_live_strategy(g: "GMGNAdapter", wallet: str, token: str, tries: int = 3) -> str | None:
+    """回查该 token 上仍然 open 的条件单组，返回 order_id。
+
+    存在的理由：swap 响应里拿不到 strategy_order_id，只能反查。策略入库有延迟，
+    所以重试几次——**查不到就当没有**，宁可让本地逻辑接管（多一层保护），
+    也不能假设挂上了（那会让两边同时卖）。"""
+    for _try in range(tries):
+        try:
+            r = g.strategy_list(wallet, base_token=token, group_tag="STMix")
+            for o in (r.get("list") or []):
+                if (o.get("base_token") or "").lower() == token.lower() \
+                        and o.get("status") == "open" and o.get("order_id"):
+                    return o["order_id"]
+        except Exception as e:
+            log("STRATEGY_LIST_FAIL", token[:8], str(e))
+        time.sleep(1.5)
+    return None
+
 def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     """用**链上真实余额**校准 LIVE 仓位的阶段标记。
 
@@ -2542,13 +2586,30 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     tp1_done 为前提——不校准，保本止损就永远不会生效，等于白写。
 
     判据是余额相对建仓量的比例，容差 5%：链上余额会有 dust/精度误差，卡死等值必然误判。"""
-    if not p.get("live") or p.get("entry_token_amount") is None:
+    if not p.get("live"):
         return
     try:
-        bal = g.token_balance(g.wallet_address(), p["address"])
+        amt = g.token_balance(g.wallet_address(), p["address"])
     except Exception:
         return                      # 读不到就保持现状，下一轮再试；绝不因为读不到而"假设已成交"
-    amt = _f(bal.get("balance") if isinstance(bal, dict) else 0)
+
+    # ── 自愈 1：补回丢失的策略单 id ──────────────────────────────────────
+    # 建仓当时可能因为策略入库延迟没查到（swap 响应里本来就没有这个字段）。
+    # 不补的后果很具体：仓位被当成"无保护"，本地逻辑会跟 GMGN 抢着卖，
+    # 涨到 +20% 时两边各卖 30% = 卖掉 60%。所以每轮都尝试认领一次。
+    if not p.get("live_strategy_id") and CFG["live_condition_orders"]:
+        sid = _find_live_strategy(g, g.wallet_address(), p["address"], tries=1)
+        if sid:
+            p["live_strategy_id"] = sid
+            log("LIVE_STRATEGY_RECLAIMED", p.get("symbol", ""), f"补回条件单 {sid}")
+
+    # ── 自愈 2：补回建仓数量 ─────────────────────────────────────────────
+    # 建仓后立刻读余额常常拿到 0（成交与索引之间有延迟）。只要还没发生过部分止盈，
+    # **当前余额就是建仓数量**，可以安全地拿来当基准；一旦 tp1 发生过就不能这么推断了。
+    if not _f(p.get("entry_token_amount")) and amt > 0 and not p.get("tp1_done"):
+        p["entry_token_amount"] = amt
+        log("LIVE_ENTRY_AMOUNT_RECLAIMED", p.get("symbol", ""), f"建仓数量补记为 {amt}")
+
     orig = _f(p.get("entry_token_amount"))
     if orig <= 0:
         return
