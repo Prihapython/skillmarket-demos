@@ -466,6 +466,10 @@ td{padding:5px 10px;vertical-align:middle}
     </div>
 
     <div class="col">
+      <div class="card" id="myWalletCard" style="flex:0 0 auto">
+        <h3><span data-i18n="mw_h3">我的钱包 · 真实余额</span> <span class="cnt" id="mwCnt"></span></h3>
+        <div class="body" id="mywallet"></div>
+      </div>
       <div class="card" style="flex:1;min-height:170px" id="escCard">
         <h3 id="ic-esc"><span data-i18n="esc_h3">持仓逃生监控</span> <span class="cnt" id="escCnt"></span></h3>
         <div class="body" id="positions"></div>
@@ -569,6 +573,16 @@ const I18N={
     log_h3:'实时决策日志 · trade_decisions.jsonl',
     funneltog_title:'展开 / 收起',
     esc_h3:'持仓逃生监控',
+    mw_h3:'我的钱包 · 真实余额',
+    mw_empty:'未绑定钱包（检查 GMGN API Key 的 Trading Wallets）',
+    mw_err:'读取钱包失败',
+    mw_stale:'数据已过期',
+    mw_trade:'下单钱包',
+    mw_ambiguous:'绑定了多个同链钱包，未指定用哪个下单 — 请在 outputs/trade_wallets.json 指定',
+    mw_holdings:'持仓',
+    mw_unreal:'未实现',
+    confirm_live_type:'切换到实盘将动用真实资金。请输入 LIVE 确认：',
+    confirm_live_bad:'确认串不匹配，仍停留在模拟盘',
     funnel_h3:'闸门漏斗 · ',
     cfg_h2:'配置 · GMGN 凭据',
     cfg_apikey_ph:'留空 = 沿用 ~/.config/gmgn/.env 已有 key',
@@ -754,6 +768,16 @@ const I18N={
     log_h3:'Live Decision Log · trade_decisions.jsonl',
     funneltog_title:'Expand / collapse',
     esc_h3:'Position Escape Monitor',
+    mw_h3:'My Wallet · Real Balance',
+    mw_empty:'No wallet bound (check Trading Wallets on your GMGN API Key)',
+    mw_err:'Failed to read wallet',
+    mw_stale:'stale data',
+    mw_trade:'trading wallet',
+    mw_ambiguous:'Multiple wallets bound on this chain and none selected — set one in outputs/trade_wallets.json',
+    mw_holdings:'holdings',
+    mw_unreal:'unrealized',
+    confirm_live_type:'Switching to LIVE will spend real funds. Type LIVE to confirm:',
+    confirm_live_bad:'Confirmation did not match — staying in SHADOW',
     funnel_h3:'Gate Funnel · ',
     cfg_h2:'Configure · GMGN Credentials',
     cfg_apikey_ph:'Leave empty = reuse existing key in ~/.config/gmgn/.env',
@@ -1184,6 +1208,7 @@ function switchChain(ch){
   loadingScreen=true;                            // 切链先回骨架，别拿旧链数据糊脸
   toast(t('toast_chain_switched',CHAIN_LABEL[ch]),'ok');
   if(source==='backend'&&bePolling)scanCycle(); else renderAll(true);
+  if(source==='backend'){MW=null;renderMyWallet();loadMyWallet(true);}   // 钱包按链绑定，切链必须重拉
 }
 /* CA 缩写：前 5 … 后 4；GMGN 代币页链接 */
 const shortCA=a=>a?(a.length>11?a.slice(0,5)+'…'+a.slice(-4):a):'';
@@ -1499,6 +1524,42 @@ function renderFunnel(){
     document.querySelectorAll('#riskmini .t i').forEach(i=>i.style.width=i.dataset.w+'%');},90));
 }
 
+/* ── 我的钱包（只读真实余额）──
+   与 SHADOW 统计刻意分开渲染：SHADOW 是纸面成绩，这里是链上真金白银，混在一个数字里会骗人。
+   后端 /api/mywallets 自带 45s 缓存，这里按 30s 轮询即可（不跟随扫描节奏，免得白烧配额）。*/
+let MW=null, mwTimer=null;
+async function loadMyWallet(force){
+  if(source==='demo') return;            // 纯静态 Demo 没有后端，别发请求
+  try{
+    const r=await fetch(API+'/api/mywallets?chain='+encodeURIComponent(curChain)+(force?'&refresh=true':''));
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    MW=await r.json();
+  }catch(e){ MW={error:String(e.message||e)}; }
+  renderMyWallet();
+}
+function renderMyWallet(){
+  const box=document.getElementById('mywallet'); if(!box) return;
+  const cnt=document.getElementById('mwCnt');
+  if(!MW){ box.innerHTML=''; if(cnt)cnt.textContent=''; return; }
+  if(MW.error){ box.innerHTML=`<div class="muted">${t('mw_err')}: ${esc(MW.error)}</div>`; if(cnt)cnt.textContent=''; return; }
+  const ws=MW.wallets||[];
+  if(cnt) cnt.textContent=ws.length?String(ws.length):'';
+  if(!ws.length){ box.innerHTML=`<div class="muted">${t('mw_empty')}</div>`; return; }
+  const warn=MW.ambiguous?`<div class="muted" style="color:#e5a13a">⚠ ${t('mw_ambiguous')}</div>`:'';
+  const stale=MW.stale?`<span class="muted"> · ${t('mw_stale')}</span>`:'';
+  box.innerHTML=warn+ws.map(w=>{
+    const short=w.address.slice(0,4)+'…'+w.address.slice(-4);
+    const tag=w.is_trading_wallet?`<span class="cnt">${t('mw_trade')}</span>`:'';
+    const up=w.unrealized_usd, upTxt=up?`<b class="${up>=0?'up':'dn'}">${up>=0?'+':''}$${Math.abs(up).toFixed(2)}</b>`:'—';
+    return `<div class="rkrow" style="padding:6px 0">
+      <div class="h"><span title="${esc(w.address)}">${short} ${tag}${stale}</span>
+        <b>${(+w.native_balance).toFixed(4)} ${esc(w.native_symbol||'')}</b></div>
+      <div class="h muted"><span>${t('mw_holdings')}: $${(+w.holdings_usd).toFixed(2)} · ${w.holdings.length}</span>
+        <span>${t('mw_unreal')}: ${upTxt}</span></div>
+    </div>`;
+  }).join('');
+}
+
 function renderAll(flash){renderKpis(flash);renderRows();renderDetail();renderPositions();renderFunnel();}
 
 /* ── log ── */
@@ -1597,8 +1658,12 @@ function setSource(s){
     else{toast(t('toast_be_switched'),'ok');openCfg();}
     resetWalletView();   // 切回真实后端：清掉 DEMO 假数据，避免误认成真实查询结果
     fetchAutoStats();
+    loadMyWallet(true);                                   // 真实余额：切过来立刻拉一次
+    if(!mwTimer) mwTimer=setInterval(loadMyWallet,30000);  // 之后 30s 一次（后端另有 45s 缓存兜底）
   }
-  else{mcp.textContent='DEMO';mcp.style.color='var(--amber)';loadingScreen=false;T=freshSeed();POS=seedPositions();RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};sel=-1;cycles=1;renderAll(false);if(feed)feed.innerHTML='';logScreen();
+  else{
+    if(mwTimer){clearInterval(mwTimer);mwTimer=null;}
+    MW=null;renderMyWallet();          // DEMO 不展示真实余额：宁可空着，也不能拿假数字冒充链上钱mcp.textContent='DEMO';mcp.style.color='var(--amber)';loadingScreen=false;T=freshSeed();POS=seedPositions();RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};sel=-1;cycles=1;renderAll(false);if(feed)feed.innerHTML='';logScreen();
     showWalletDemo();   // 切到 DEMO：钱包评估也给一份假地址+假结果，只演示布局
     autoTrade=false;applyAutoLabel();renderAutoStats(null);   // DEMO 无后端自动交易，拨钮回默认关闭
   }
@@ -1810,16 +1875,25 @@ function toggleMode(){
     else{liveMode=false;applyLiveLabel();}
     return;
   }
-  const apply=async(target)=>{
+  const apply=async(target,confirmStr)=>{
     try{
-      const r=await fetch(API+'/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:target?'LIVE':'SHADOW'})});
+      const r=await fetch(API+'/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:target?'LIVE':'SHADOW',confirm:confirmStr||''})});
       if(!r.ok)throw new Error(await errDetail(r));
       const d=await r.json();
       liveMode=(d.mode==='LIVE');applyLiveLabel();
       toast(liveMode?t('toast_mode_live'):t('toast_mode_shadow'),liveMode?'err':'ok');
     }catch(e){toast(t('toast_mode_fail',e.message),'err');}
   };
-  if(goLive)confirmDialog(t('confirm_live_title'),t('confirm_live_msg'),()=>apply(true));
+  // 进 LIVE：弹窗之外还要**手打 LIVE**。单纯点确认太容易误触，而误触意味着真实资金开始动。
+  // 出 LIVE 不加任何摩擦——收紧安全方向的操作永远该是最省事的那个。
+  if(goLive){
+    confirmDialog(t('confirm_live_title'),t('confirm_live_msg'),()=>{
+      const s=window.prompt(t('confirm_live_type'));
+      if(s===null)return;                                   // 取消 = 留在 SHADOW
+      if(s.trim().toUpperCase()!=='LIVE'){toast(t('confirm_live_bad'),'err');return;}
+      apply(true,s.trim().toUpperCase());
+    });
+  }
   else apply(false);
 }
 const val=id=>document.getElementById(id).value.trim();

@@ -47,6 +47,7 @@ AUTO_TRADE_PATH = OUT_DIR / "auto_trade_state.json"   # AUTO 开关落盘：见�
 AUTO_TRADED_ADDRS_PATH = OUT_DIR / "auto_traded_addresses.json"   # 永久黑名单落盘：独立于统计日志
 STATS_EPOCH_PATH = OUT_DIR / "stats_epoch.json"   # 胜率统计起算时间点：重置胜率≠删日志（见 stats_epoch/reset_stats_epoch）
 TRENDING_CMDS_PATH = OUT_DIR / "trending_cmds.json"   # 按链热榜命令落盘：用户改过即持久，重启/刷新不回默认
+TRADE_WALLETS_PATH = OUT_DIR / "trade_wallets.json"   # {chain: address} 指定用哪个绑定钱包下单（见 wallet_address）
 ENV_PATH = pathlib.Path.home() / ".config" / "gmgn" / ".env"
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -179,6 +180,36 @@ CFG = {
     "auto_tp2_pct": 0.50,
     "auto_tp2_sell_frac": 0.3,      # 按"原始仓位"的比例算，与 auto_tp1_sell_frac 口径一致
     "auto_trailing_pct": 0.25,
+
+    # ── LIVE 下单参数（SHADOW 完全用不到）──────────────────────────────────
+    # 滑点：gmgn-cli 的 --slippage 单位是**百分数**（30 = 30%），不是小数。
+    # 旧代码硬编码 0.01/0.02 实为 0.01%/0.02%，任何 meme 都不可能成交。
+    # 2% 是用户在 GMGN 手动下单实测能成交的值，作为起点；不是拍脑袋的"大滑点更保险"。
+    # ⚠️ 滑点是**上限不是手续费**：调高不等于多付钱，只是允许更差的成交价才不回滚。
+    #    真正要用数据定的是"我们的入场条件下失败率多少"，见 WALLET_PLAN.md 阶段 3。
+    "live_slippage_buy": 2.0,
+    "live_slippage_sell": 2.0,
+    # SOL 上挂条件单（--condition-orders）时，priority-fee 与 tip-fee 是**必填**，不是可选优化。
+    "live_priority_fee_sol": 0.0001,
+    "live_tip_fee_sol": 0.0001,
+    # 把止损/止盈挂到 GMGN 侧（<0.3s 触发），而不是靠我们 5.6s 的轮询——
+    # 那几笔 -80% 就是秒级砸盘，轮询根本追不上（见 CONTEXT.md「关于亏损性质的重要发现」）。
+    "live_condition_orders": True,
+    # 移动止盈的回撤比例（占**峰值价格**的百分数）。
+    # 我们自己的规则是"回撤固定 25 个**百分点**"，两者数学上不等价：
+    #   我们的规则换算成价格回撤 d = 0.25/(1+峰值涨幅)，随涨幅变化，**不是常数**，
+    #   而 GMGN 的 drawdown_rate 在建单时就固定死了，表达不了。
+    # 取 16.7% = 0.25/1.5：在移动止盈刚开始生效那一刻（+50% 第二次止盈后）与我们的规则**完全一致**，
+    # 涨幅更高时它比我们的规则**更松**——这正是我们要的：它只是兜底网，永远不会抢在我们前面平仓。
+    # 移动止损重挂的滞后阈值：止损价变化不到这个比例就不重挂，省掉无谓的撤单+建单两次 API。
+    # 峰值只升不降 → 止损价只升不降，所以这里不会出现来回抖动，只是"攒够一步再走"。
+    "live_stop_resync_pct": 0.02,
+    # ── LIVE 容量上限 ───────────────────────────────────────────────────────
+    # ⚠️ 只作用于 LIVE。SHADOW 侧的数量类上限是**用户明确要求移除**的（为了不拖慢统计积累），
+    #    这里绝不能顺手加回去——那会直接改变正在收集的样本。
+    # 真金白银阶段的逻辑相反：样本再多也不值得赔钱，先按最小规模验证机制是否可靠。
+    "live_max_positions": 3,
+    "live_size_usd": 5.0,       # 验证期单笔上限（SHADOW 是 $20）；跑通后再谈放大
 }
 # 各链「原生/币种」token 地址（买入时作 input、卖出时作 output）。
 # 地址来自 gmgn-cli 权威 Chain Currencies 表，绝不能凭记忆改（错一个字符会静默失败）。
@@ -194,6 +225,11 @@ NATIVE_TOKEN = {
 }
 # 原生币最小单位精度：SOL=9(lamports)，EVM 原生币=18(wei)。买入金额 = size * 10**decimals。
 NATIVE_DECIMALS = {"sol": 9, "bsc": 18, "base": 18, "eth": 18, "robinhood": 18}
+# 原生币符号：读 portfolio info 余额时按符号匹配，**不能**按地址匹配——GMGN 两个接口对原生 SOL
+# 用了不同的占位地址：swap 要规范 wSOL(...112)，portfolio info 却返回 ...111。改 NATIVE_TOKEN
+# 会连带弄坏下单，所以只在读余额这一侧按符号认。
+NATIVE_SYMBOL = {"sol": "SOL", "bsc": "BNB", "base": "ETH", "eth": "ETH", "robinhood": "ETH"}
+def native_symbol(chain): return NATIVE_SYMBOL.get(chain, "SOL")
 def native_token(chain): return NATIVE_TOKEN.get(chain, NATIVE_TOKEN["sol"])
 def native_decimals(chain): return NATIVE_DECIMALS.get(chain, 9)
 
@@ -287,6 +323,17 @@ def save_trending_cmds(cmds: dict):
     except Exception:
         pass
 
+def load_trade_wallets() -> dict:
+    """{chain: address} —— 同一 Key 绑定多个同链钱包时，指定用哪个下单（见 wallet_address）。
+    存的是公开地址，不是密钥，所以放 outputs/ 而不是 .env。"""
+    if not TRADE_WALLETS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(TRADE_WALLETS_PATH.read_text(encoding="utf-8"))
+        return {k: v for k, v in data.items() if isinstance(v, str) and v} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 # ──────────────────────────────────────────────────────────────────────────
 # 2. GMGN 适配器
 # ──────────────────────────────────────────────────────────────────────────
@@ -303,6 +350,9 @@ class GMGNAdapter:
     def swap(self, **kw) -> dict: raise NotImplementedError
     def order_get(self, order_id) -> dict: raise NotImplementedError
     def wallet_address(self) -> str: raise NotImplementedError
+    def portfolio_info(self) -> dict: raise NotImplementedError   # Key 绑定的钱包 + 原生币余额
+    def holdings(self, wallet, limit=20) -> dict: raise NotImplementedError  # 钱包持仓（只读）
+    def token_balance(self, wallet, token) -> dict: raise NotImplementedError  # 单币余额（链上校准用）
 
 
 class LiveGMGN(GMGNAdapter):
@@ -439,25 +489,55 @@ class LiveGMGN(GMGNAdapter):
             args += ["--cursor", cursor]
         return self._cli(*args)
 
-    def wallet_address(self) -> str:
-        """取绑定到 API Key 的本链钱包地址（swap 的 --from 必须与 Key 绑定一致）。
-        portfolio info 不接受 --chain，一次返回所有链，按 self.chain 命中。"""
-        if self.chain in self._wallet_cache:
-            return self._wallet_cache[self.chain]
-        # portfolio info 无 --chain 参数：直接调，不经 _cli（_cli 会硬加 --chain）
+    def portfolio_info(self) -> dict:
+        """API Key 绑定的全部钱包 + 原生币余额。portfolio info 不接受 --chain（一次返回所有链），
+        故直接调 subprocess，不经 _cli（_cli 会硬加 --chain）。"""
         out = subprocess.run([GMGN_CLI, "portfolio", "info", "--raw"],
                              capture_output=True, text=True, encoding="utf-8", timeout=25, env=self.env)
         if out.returncode != 0:
             raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-        data = json.loads(out.stdout)
-        for w in data.get("wallets", []):
-            if w.get("chain") == self.chain and w.get("address"):
-                self._wallet_cache[self.chain] = w["address"]
-                return w["address"]
-        raise RuntimeError(f"未找到 {self.chain} 链绑定钱包（检查 API Key 绑定）")
+        return self._check_code(json.loads(out.stdout))
+
+    def holdings(self, wallet: str, limit: int = 20) -> dict:
+        """钱包持仓（含每个 token 的 PnL）。只读，不需要签名密钥。"""
+        return self._cli("portfolio", "holdings", "--wallet", wallet, "--limit", str(limit))
+
+    def wallet_address(self) -> str:
+        """取本链用于下单的钱包地址（swap 的 --from 必须与 Key 绑定一致）。
+
+        绑定多个钱包时**绝不猜**：早期实现取「列表里第一个」，而 API 返回顺序没有任何保证，
+        一旦 Key 上绑了多个同链钱包，就会静默地用错钱包下单（钱在 A、下单从 B）。
+        现在的规则：配置里指定了就用指定的（并校验它确实已绑定）；没指定且只有一个 → 用它；
+        没指定却有多个 → 直接报错，让人去 TRADE_WALLETS_PATH 里明确写死。"""
+        if self.chain in self._wallet_cache:
+            return self._wallet_cache[self.chain]
+        found = [w["address"] for w in self.portfolio_info().get("wallets", [])
+                 if w.get("chain") == self.chain and w.get("address")]
+        if not found:
+            raise RuntimeError(f"未找到 {self.chain} 链绑定钱包（检查 API Key 绑定）")
+        want = load_trade_wallets().get(self.chain)
+        if want:
+            if want not in found:
+                raise RuntimeError(
+                    f"配置的 {self.chain} 交易钱包 {want} 未绑定到当前 API Key（已绑定：{', '.join(found)}）")
+            addr = want
+        elif len(found) == 1:
+            addr = found[0]
+        else:
+            raise RuntimeError(
+                f"{self.chain} 链绑定了多个钱包（{', '.join(found)}），无法确定用哪个下单。"
+                f"请在 {TRADE_WALLETS_PATH.name} 里指定 {{\"{self.chain}\": \"<address>\"}}")
+        self._wallet_cache[self.chain] = addr
+        return addr
 
     def swap(self, from_wallet, input_token, output_token, amount=None,
-             percent=None, slippage=0.01):
+             percent=None, slippage=None, priority_fee=None, tip_fee=None,
+             condition_orders=None, sell_ratio_type=None, anti_mev=True):
+        """⚠️ --slippage 的单位是**百分数**（gmgn-cli: "e.g. 30 = 30%"），不是小数。
+        历史上这里默认 0.01 意为 1%，实际被当成 0.01% —— 任何 meme 都不可能成交。
+        现在不再给默认值：调用方必须显式传 CFG 里的值，避免同样的误读再发生一次。"""
+        if slippage is None:
+            raise ValueError("swap() 必须显式传 slippage（百分数，如 2.0 = 2%）")
         # amount 与 percent 互斥：买入用 amount(最小单位)；卖出用 percent(币种非 currency 时)。
         args = ["swap", "--from", from_wallet, "--input-token", input_token,
                 "--output-token", output_token, "--slippage", str(slippage)]
@@ -465,8 +545,60 @@ class LiveGMGN(GMGNAdapter):
             args += ["--percent", str(percent)]
         else:
             args += ["--amount", str(amount)]
+        if anti_mev:
+            args += ["--anti-mev"]                 # 抗夹子，默认开；高滑点上限主要靠它兜住
+        # SOL 上挂条件单时 priority-fee / tip-fee 是必填项，缺了整单会被拒
+        if priority_fee is not None:
+            args += ["--priority-fee", str(priority_fee)]
+        if tip_fee is not None:
+            args += ["--tip-fee", str(tip_fee)]
+        if condition_orders:
+            args += ["--condition-orders", json.dumps(condition_orders, separators=(",", ":"))]
+            if sell_ratio_type:
+                args += ["--sell-ratio-type", sell_ratio_type]
         return self._cli(*args)
+
     def order_get(self, order_id):  return self._cli("order", "get", "--order-id", order_id)
+
+    def strategy_list(self, wallet: str, base_token: str | None = None) -> dict:
+        """挂在 GMGN 侧的未触发策略单（--type open 为默认）。"""
+        args = ["order", "strategy", "list", "--from", wallet]
+        if base_token:
+            args += ["--base-token", base_token]
+        return self._cli(*args)
+
+    def token_balance(self, wallet: str, token: str) -> dict:
+        """单个 token 的钱包余额。用来**从链上**确认部分止盈到底成交了没有——
+        我们自己的 tp1_done 标记在 LIVE 下不可信：那一刀是 GMGN 条件单在链上执行的，
+        我们没参与，本地无从知晓。余额才是唯一的事实来源。"""
+        return self._cli("portfolio", "token-balance", "--wallet", wallet, "--token", token)
+
+    def strategy_create_stop(self, wallet: str, base_token: str, quote_token: str,
+                             check_price: float, amount_in_percent: float,
+                             slippage: float, priority_fee=None, tip_fee=None) -> dict:
+        """给**已持有**的仓位挂一个绝对价格的止损单（limit_order / stop_loss）。
+
+        为什么用绝对价格而不是 condition_orders 的百分比：我们的移动止损是"峰值 - 25 个百分点"，
+        换算成百分比会随峰值漂移；而 --check-price 直接吃价格，能一比一复刻规则。
+        峰值上移时由调用方撤单重挂。"""
+        args = ["order", "strategy", "create", "--from", wallet,
+                "--base-token", base_token, "--quote-token", quote_token,
+                "--order-type", "limit_order", "--sub-order-type", "stop_loss",
+                "--check-price", f"{check_price:.12g}",
+                "--amount-in-percent", str(round(amount_in_percent, 4)),
+                "--slippage", str(slippage)]
+        if priority_fee is not None:
+            args += ["--priority-fee", str(priority_fee)]
+        if tip_fee is not None:
+            args += ["--tip-fee", str(tip_fee)]
+        return self._cli(*args)
+
+    def strategy_cancel(self, wallet: str, order_id: str, order_type: str = "smart_trade") -> dict:
+        """撤掉挂在 GMGN 侧的止损/止盈策略单。逃生离场时必须先撤——否则我们已经清仓了，
+        策略单还挂着，后续会对着空仓位（或我们之后又买的同一个币）乱触发。
+        注意参数名是 --order-id，不是 --strategy-id（见 `gmgn-cli order strategy cancel --help`）。"""
+        return self._cli("order", "strategy", "cancel", "--from", wallet,
+                         "--order-id", order_id, "--order-type", order_type)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -697,6 +829,20 @@ class MockGMGN(GMGNAdapter):
 
     def wallet_address(self) -> str:
         return "MOCKWALLET1111111111111111111111111111111111"
+
+    def portfolio_info(self) -> dict:
+        # 与 LiveGMGN 同构：免 key 演示时「我的钱包」卡片也有东西可渲染。
+        # MockGMGN 不分链（无 self.chain），固定按 sol 合成即可。
+        return dict(wallets=[dict(chain="sol", address=self.wallet_address(),
+                                  balances=[dict(symbol="SOL", token_address=native_token("sol"),
+                                                 balance="12.5", usd_value="1875")])])
+
+    def holdings(self, wallet, limit=20) -> dict:
+        return dict(holdings=[])
+
+    def token_balance(self, wallet, token) -> dict:
+        # SHADOW 走不到链上校准（_live_sync_from_chain 只处理 live 仓位），这里只为接口完整
+        return dict(balance="0")
 
     def swap(self, **kw):
         return dict(order_id="MOCK-" + str(random.randint(10000, 99999)),
@@ -1370,6 +1516,57 @@ def position_size(g: "GMGNAdapter", chain: str) -> float:
     依赖 native_usd_price（8b 节定义），Python 按调用时解析名字，模块加载完成后调用不受定义顺序影响。"""
     return round(CFG["auto_size_usd"] / native_usd_price(g, chain), 6)
 
+def trailing_stop_price(p: dict) -> float:
+    """第一次部分止盈之后，这笔仓位的止损价 —— **全系统唯一定义**。
+
+    规则（用户指定）：止损 = max(保本价, 峰值涨幅 - auto_trailing_pct 个百分点)，只升不降。
+    注意第二次止盈**不改止损规则**，只是多卖 30%，所以 tp1 之后自始至终就这一个公式。
+
+    本地轮询（_auto_decide_exit）与挂到 GMGN 的止损单（_live_arm_stop）都调这里，
+    绝不各自再算一遍——`exit_plan()` 的注释里已经吃过"两处各维护一份、慢慢就不一致"的亏，
+    而这次不一致的后果是真金白银按错价格离场。
+
+    返回 0 表示无法计算（没有入场价），调用方须据此跳过止损逻辑，而不是当成"止损价=0"。"""
+    entry = p.get("entry_price", 0.0)
+    if entry <= 0:
+        return 0.0
+    peak = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0), entry)
+    peak_pct = peak / entry - 1
+    stop_pct = max(0.0, peak_pct - CFG["auto_trailing_pct"])   # 保本兜底：回撤后的止损不低于 0%
+    return entry * (1 + stop_pct)
+
+def build_condition_orders() -> list[dict]:
+    """把我们的退出阶梯翻译成 GMGN 侧的条件单（挂在交易所侧，<0.3s 触发）。
+
+    用 sell_ratio_type=buy_amount：sell_ratio 是"占最初买入量"的比例——与我们
+    auto_tp1_sell_frac / auto_tp2_sell_frac 的口径（占原始仓位）一致；换成 hold_amount
+    会变成"占触发时持仓量"的比例，两刀叠加后卖出的绝对量就对不上了。
+
+    price_scale 语义（来自 gmgn-swap SKILL.md，不要凭直觉改）：
+      profit_stop / profit_stop_trace → 相对入场的**涨幅**百分数（"100" = +100%）
+      loss_stop                       → 相对入场的**跌幅**百分数（"35" = 跌 35%）
+
+    移动止盈是**近似**：见 CFG live_trailing_drawdown_pct 注释——我们的规则是回撤固定
+    百分点，GMGN 只能表达固定的价格回撤比例，取值刻意偏松，只作兜底，不抢在本地逻辑前面。"""
+    orders = [
+        # 硬止损：第一次部分止盈前保护全仓
+        dict(order_type="loss_stop", side="sell",
+             price_scale=str(round(CFG["hard_stop_pct"] * 100, 4)), sell_ratio="100"),
+        dict(order_type="profit_stop", side="sell",
+             price_scale=str(round(CFG["auto_tp1_pct"] * 100, 4)),
+             sell_ratio=str(round(CFG["auto_tp1_sell_frac"] * 100, 4))),
+        dict(order_type="profit_stop", side="sell",
+             price_scale=str(round(CFG["auto_tp2_pct"] * 100, 4)),
+             sell_ratio=str(round(CFG["auto_tp2_sell_frac"] * 100, 4))),
+    ]
+    # 这里**故意不挂**移动止盈（profit_stop_trace）。
+    # 它的 drawdown_rate 是"占峰值价格的比例"，而我们的规则是"回撤固定百分点"，
+    # 换算系数 0.25/(1+峰值涨幅) 随峰值变化、不是常数，建单时写死必然跑偏。
+    # 取而代之：第一次止盈发生后，由 _live_arm_stop() 按 trailing_stop_price() 算出的
+    # **绝对价格**挂 limit_order/stop_loss，峰值上移就重挂——这样能精确复刻规则，
+    # 而不是拿一个近似值凑合。
+    return orders
+
 def exit_plan() -> dict:
     """人工界面展示的"计划退出价位"——直接读 auto 机器人实际使用的同一套 CFG 数字
     （auto_tp1_*/auto_tp2_*/auto_trailing_pct/hard_stop_pct），保证人工看到的计划与
@@ -1386,7 +1583,9 @@ def exit_plan() -> dict:
 #       1) 逃生 severity≥escape_severity → 任何阶段都立即全仓离场；
 #       2) 部分止盈前：pnl≤-hard_stop_pct → 全仓止损；pnl≥auto_tp1_pct(+20%) → 卖出
 #          auto_tp1_sell_frac(30%)、锁定利润，剩余仓位止损上移到保本价(entry_price)；
-#       3) 部分止盈后：剩余仓位止损 = max(保本价, 峰值价×(1-auto_trailing_pct))，只升不降
+#       3) 部分止盈后：剩余仓位止损 = max(保本价, 峰值涨幅 - auto_trailing_pct 个百分点)，只升不降
+#          （注意：是回撤固定**百分点**，不是回撤峰值价格的 auto_trailing_pct **比例**——
+#           以 _auto_decide_exit 的实现为准，见其内部注释）
 #          （保证不再亏钱），无固定金额硬止盈上限——不强制清仓，只靠移动止损让盈利奔跑。
 # ──────────────────────────────────────────────────────────────────────────
 def native_usd_price(g: "GMGNAdapter", chain: str) -> float:
@@ -1516,12 +1715,7 @@ def _auto_decide_exit(p: dict):
     # 回吐 75 点），前者无论峰值多高，回吐永远固定 25 点（峰值+200%止损在+175%）,对大涨幅锁盈更狠。
     peak = max(p.get("peak_price", 0.0), cur)
     p["peak_price"] = peak
-    if entry > 0:
-        peak_pct = peak / entry - 1
-        stop_pct = max(0.0, peak_pct - CFG["auto_trailing_pct"])   # 保本兜底：回撤后的止损不低于 0%
-        stop_price = entry * (1 + stop_pct)
-    else:
-        stop_price = 0
+    stop_price = trailing_stop_price(p)
     if entry > 0 and cur > 0 and cur <= stop_price:
         p["pnl"] = max(pnl, stop_price / entry - 1)   # 同样按止损触发价成交，不按滑点后的更差价格
         return ("full", "AUTO_TRAIL_BE")
@@ -1538,15 +1732,40 @@ def _auto_decide_exit(p: dict):
 
 def auto_manage_exits(chain: str) -> None:
     """独立于 monitor_positions 的第二遍：该函数会 do_sell()/do_sell_partial()（改 ST.positions），
-    不能在 monitor_positions 自己的 for 循环里做，否则边遍历边改会错乱/漏项。只在 SHADOW 且开关打开时运行——
-    开关关闭必须是真正的killswitch，已开的 auto 仓位也不再被自动管理（否则关闭开关后机器人仍会继续
-    部分止盈/移动止损/平仓，用户会看到"开关是关的但仓位还在自己动"的困惑现象）。"""
-    if ST.mode != "SHADOW" or not ST.auto_trade:
-        return
-    for p in [p for p in ST.positions if p.get("chain", "sol") == chain and p.get("auto")]:
+    不能在 monitor_positions 自己的 for 循环里做，否则边遍历边改会错乱/漏项。
+
+    两种模式下管的东西不一样，**入场与离场必须分开授权**：
+
+    - SHADOW：由 auto_trade 开关控制，管所有 auto 仓位。开关关闭是真 killswitch，已开的仓位
+      也不再自动管理（否则会出现"开关是关的但仓位还在自己动"的困惑现象）。
+    - LIVE：**永远管**，不看 auto_trade 开关，管所有 live 仓位。理由是不对称的——
+      自动**开仓**风险由我们承担，可以拒绝；自动**平仓**是保护，关掉它等于让真金白银的仓位
+      裸奔。auto_open_position 仍然硬拦 LIVE（见其首行），所以这里不会导致自动入场。
+      价格类退出正常由 GMGN 条件单在链上完成（更快），本地这遍主要兜两件事：
+      逃生信号（honeypot/流动性崩塌——条件单只看价格，看不见这些）和条件单没挂上的情况。"""
+    if ST.mode == "SHADOW":
+        if not ST.auto_trade:
+            return
+        pool = [p for p in ST.positions if p.get("chain", "sol") == chain and p.get("auto")]
+    else:
+        pool = [p for p in ST.positions if p.get("chain", "sol") == chain and p.get("live")]
+        g = ST.adapter_for(chain)
+        for p in pool:
+            _live_sync_from_chain(g, p)   # 先用链上余额确认 GMGN 那两刀成交了没有
+            _live_arm_stop(g, p)          # 再把止损单对齐到规则算出的价格（tp1 之后才有动作）
+        save_positions()
+    for p in pool:
         decision = _auto_decide_exit(p)
         if not decision:
             continue
+        # LIVE 且该阶段**确实有链上保护**时，价格类退出归 GMGN 管，本地只负责逃生。
+        # 不这样分工就会双重卖出——涨到 +20% 时 GMGN 卖 30%，本地这遍看到 pnl>=20% 又卖 30%。
+        # 保护来源随阶段变化：第一次止盈前是建仓时挂的条件单组；之后是 _live_arm_stop 挂的
+        # 绝对价格止损单。任一环节失败（对应 id 为空）→ 本地立刻接管完整逻辑，不会裸奔。
+        if p.get("live") and decision[-1] != "AUTO_ESCAPE":
+            protected = p.get("live_stop_id") if p.get("tp1_done") else p.get("live_strategy_id")
+            if protected:
+                continue
         try:
             if decision[0] == "full":
                 do_sell(p["address"], exit_tag=decision[1])
@@ -2043,11 +2262,25 @@ def _public_broadcast_loop():
 #     ST.lock 保证不会跟浏览器发起的请求并发踩踏）。AUTO 关着时只空转睡眠，不烧 CLI 配额。
 # ──────────────────────────────────────────────────────────────────────────
 def _autonomous_trade_loop():
+    """后台自治线程。两种模式跑的东西不同，**关键是 LIVE 也必须跑**：
+
+    - SHADOW + auto_trade：跑完整 screen_once（选币 → 自动入场 → 管理离场）。
+    - LIVE：**不选币**（LIVE 下自动入场本来就被硬拦，扫市场纯属白烧配额），
+      只做 monitor_positions + auto_manage_exits。
+
+    这条 LIVE 分支是必需的：原先整个循环只在 SHADOW 下运行，意味着 LIVE 仓位仅在浏览器
+    轮询 /api/run 时才被检查一次——关掉页面，真金白银的仓位就再没有任何逃生监控。
+    价格类止损有 GMGN 条件单在链上兜底，但 honeypot / 流动性崩塌这类信号只有我们看得见。"""
     while True:
         try:
             if ST.mode == "SHADOW" and ST.auto_trade:
                 with ST.lock:
                     screen_once("sol")   # 只扫 TRADEABLE_CHAINS 里唯一可交易的链
+            elif ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+                with ST.lock:
+                    if any(p.get("live") for p in ST.positions):
+                        monitor_positions("sol")     # 刷新价格 + 逃生 severity
+                        auto_manage_exits("sol")
         except Exception as e:
             log("AUTOLOOP_ERR", "-", str(e))
         time.sleep(DEFAULT_POLL_S)
@@ -2192,6 +2425,20 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
     if not allow:
         log("BUY_BLOCK", address[:8], rnote)
         raise HTTPException(409, rnote)
+    # LIVE 专属容量上限（SHADOW 不受影响，见 CFG live_max_positions 注释）。
+    # 超限**报错而不是悄悄改小**：静默改数量会让人以为买了 $20 实际买了 $5，比拒绝更糟。
+    if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+        n_live = sum(1 for p in ST.positions if p.get("live"))
+        if n_live >= CFG["live_max_positions"]:
+            raise HTTPException(409, f"LIVE 持仓已达上限 {CFG['live_max_positions']} 笔（当前 {n_live}）")
+        try:
+            max_native = CFG["live_size_usd"] / native_usd_price(ST.adapter_for(chain), chain)
+        except Exception:
+            max_native = 0
+        if max_native > 0 and size_sol > max_native * 1.01:   # 1% 容差：价格换算本身有抖动
+            raise HTTPException(
+                409, f"LIVE 单笔上限 ${CFG['live_size_usd']}（≈{max_native:.4f} {chain.upper()}），"
+                     f"本次 {size_sol} 超限")
     g = ST.adapter_for(chain)
     info = g.token_info(address)
     sec  = g.token_security(address)             # 已归一化安全快照（建仓基线，逃生 diff 用）
@@ -2209,11 +2456,17 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
 
     # LIVE 且未锁：真实买入（input=本链原生币，output=目标币，amount=最小单位）。
     if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+        conds = build_condition_orders() if CFG["live_condition_orders"] else None
         try:
             wallet = g.wallet_address()              # 绑定 Key 的本链钱包，--from 必须一致
             amount = int(size_sol * (10 ** native_decimals(chain)))
             order = g.swap(from_wallet=wallet, input_token=native_token(chain),
-                           output_token=address, amount=amount, slippage=0.01)
+                           output_token=address, amount=amount,
+                           slippage=CFG["live_slippage_buy"],
+                           priority_fee=CFG["live_priority_fee_sol"],
+                           tip_fee=CFG["live_tip_fee_sol"],
+                           condition_orders=conds,
+                           sell_ratio_type="buy_amount" if conds else None)
         except Exception as e:                       # gmgn-cli 报错(如缺签名密钥)→ 不建仓，回清晰错误
             log("BUY_FAIL", symbol, str(e))
             raise HTTPException(502, f"链上买入失败：{e}")
@@ -2239,17 +2492,144 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
             log("BUY_FAIL", symbol, f"swap {status} {h}")
             raise HTTPException(502, f"链上买入未成交（{status}）" + (f" · {h}" if h else ""))
         status_msg = ("已成交" if filled else "已提交·待确认") + (f" · {h}" if h else "")
+        # 条件单是 best-effort：官方文档明说"swap 成功但策略创建失败时，swap 结果照样返回成功"。
+        # 不显式检查就会出现最危险的情况——**有仓位、没止损，而且界面显示一切正常**。
+        if conds:
+            strategy_id = order.get("strategy_order_id")
+            if strategy_id:
+                live_strategy = strategy_id
+            else:
+                live_strategy = None
+                log("LIVE_NO_STOPLOSS", symbol,
+                    "⚠ 条件单创建失败：该仓位当前**没有链上止损**，只剩本地轮询兜底，请尽快人工处理")
+                status_msg += " · ⚠ 止损未挂上"
+        else:
+            live_strategy = None
+        # 记下**实际到手的 token 数量**：后续判断"GMGN 那两刀成交了没有"全靠拿当前余额跟它比。
+        # 读不到就置 None —— _live_sync_from_chain 会因此跳过校准（宁可不校准，也不能拿错基数瞎判）。
+        try:
+            entry_tokens = _f(g.token_balance(wallet, address).get("balance"))
+        except Exception as e:
+            entry_tokens = None
+            log("LIVE_BALANCE_FAIL", symbol, f"建仓后读取 token 余额失败，链上校准将不可用：{e}")
     else:
         filled = False
+        live_strategy = None
+        entry_tokens = None
         status_msg = "SHADOW（未真实发送，需切 LIVE + 配签名密钥）"
 
     ST.positions.append(dict(symbol=symbol, address=address, size_sol=round(size_sol, 4),
                              pnl=0.0, cycles=0, entry=entry, chain=chain,
-                             entry_price=entry_price, cur_price=entry_price))
+                             entry_price=entry_price, cur_price=entry_price,
+                             orig_size_sol=round(size_sol, 4),
+                             # LIVE 仓位也要被本地退出逻辑管理（逃生信号 GMGN 条件单看不到）；
+                             # 记下策略单 id，逃生离场前要先撤，否则策略单会对着空仓乱触发。
+                             live=(ST.mode == "LIVE" and not LIVE_TRADING_DISABLED),
+                             live_strategy_id=live_strategy,
+                             live_stop_id=None, live_stop_price=0.0,
+                             entry_token_amount=entry_tokens,
+                             tp1_done=False, tp2_done=False, peak_price=entry_price))
     save_positions()
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
     log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})", dict(size_sol=size_sol, chain=chain, **exit_plan()))
     return dict(ok=True, status=status_msg, filled=filled, symbol=symbol)
+
+def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
+    """用**链上真实余额**校准 LIVE 仓位的阶段标记。
+
+    为什么必须这么做：LIVE 下 +20%/+50% 那两刀是 GMGN 条件单在链上执行的，我们没参与，
+    本地的 tp1_done/tp2_done 永远是 False。而"第一次止盈后止损抬到保本"这条规则恰恰以
+    tp1_done 为前提——不校准，保本止损就永远不会生效，等于白写。
+
+    判据是余额相对建仓量的比例，容差 5%：链上余额会有 dust/精度误差，卡死等值必然误判。"""
+    if not p.get("live") or p.get("entry_token_amount") is None:
+        return
+    try:
+        bal = g.token_balance(g.wallet_address(), p["address"])
+    except Exception:
+        return                      # 读不到就保持现状，下一轮再试；绝不因为读不到而"假设已成交"
+    amt = _f(bal.get("balance") if isinstance(bal, dict) else 0)
+    orig = _f(p.get("entry_token_amount"))
+    if orig <= 0:
+        return
+    left = amt / orig
+    p["chain_left_ratio"] = round(left, 4)
+    # 剩余 ≤ 75% → 第一刀（卖 30%）已成交；≤ 45% → 第二刀也成交了
+    if not p.get("tp1_done") and left <= (1 - CFG["auto_tp1_sell_frac"] + 0.05):
+        p["tp1_done"] = True
+        p["peak_price"] = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0))
+        log("LIVE_TP1_DETECTED", p.get("symbol", ""),
+            f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到保本")
+    if not p.get("tp2_done") and left <= (1 - CFG["auto_tp1_sell_frac"] - CFG["auto_tp2_sell_frac"] + 0.05):
+        p["tp2_done"] = True
+        log("LIVE_TP2_DETECTED", p.get("symbol", ""), f"链上余额剩 {left:.0%} → 第二次止盈已成交")
+    # 账面持仓量跟着链上走，否则后续按比例卖出的基数是错的
+    if orig > 0 and p.get("orig_size_sol"):
+        p["size_sol"] = round(p["orig_size_sol"] * left, 6)
+
+def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
+    """把 GMGN 侧的止损单对齐到 trailing_stop_price() 算出的价格（只在第一次止盈后需要）。
+
+    重挂有代价（撤单+建单两次 API，各自可能失败），所以加滞后：止损价没动到
+    live_stop_resync_pct 以上就不动。峰值只升不降 → 止损价只升不降 → 不会来回抖。
+
+    失败处理刻意不对称：**撤单失败就不建新单**（否则同一仓位挂两个止损，会双重卖出）；
+    建单失败则清空 live_stop_id 并记 LIVE_NO_STOPLOSS —— 本地轮询会立刻接管
+    （auto_manage_exits 里"没有 strategy id 就走完整本地逻辑"那条分支），不会出现裸奔。"""
+    if not p.get("live") or not p.get("tp1_done"):
+        return
+    want = trailing_stop_price(p)
+    if want <= 0:
+        return
+    cur_armed = _f(p.get("live_stop_price"))
+    if cur_armed > 0 and abs(want - cur_armed) / cur_armed < CFG["live_stop_resync_pct"]:
+        return                      # 变化太小，不值得为它烧两次 API
+    old = p.get("live_stop_id")
+    if old:
+        try:
+            g.strategy_cancel(g.wallet_address(), old, order_type="limit_order")
+        except Exception as e:
+            log("STRATEGY_CANCEL_FAIL", p.get("symbol", ""), f"止损重挂时撤单失败，保留旧单：{e}")
+            return
+        p["live_stop_id"] = None
+    try:
+        r = g.strategy_create_stop(
+            wallet=g.wallet_address(), base_token=p["address"],
+            quote_token=native_token(p.get("chain", "sol")),
+            check_price=want,
+            amount_in_percent=100.0,        # 卖掉当时还剩的全部（保本/移动止损都是全清语义）
+            slippage=CFG["live_slippage_sell"],
+            priority_fee=CFG["live_priority_fee_sol"], tip_fee=CFG["live_tip_fee_sol"])
+        sid = r.get("order_id") or r.get("strategy_order_id")
+        if not sid:
+            raise RuntimeError(f"返回里没有 order_id：{r}")
+        p["live_stop_id"] = sid
+        p["live_stop_price"] = want
+        log("LIVE_STOP_ARMED", p.get("symbol", ""),
+            f"止损已挂 @ {want:.10g}（{(want / p['entry_price'] - 1):+.1%}）")
+    except Exception as e:
+        p["live_stop_id"] = None
+        p["live_stop_price"] = 0.0
+        log("LIVE_NO_STOPLOSS", p.get("symbol", ""),
+            f"⚠ 止损挂单失败，本轮起由本地轮询兜底：{e}")
+
+def _cancel_live_strategy(g: "GMGNAdapter", p: dict) -> None:
+    """全仓离场前撤掉 GMGN 侧挂着的止损/止盈策略单。
+
+    撤单失败**不阻断离场**——逃生场景下"卖不出去"比"留了个孤儿策略单"严重得多，
+    所以只记日志。孤儿单的后果有限：仓位已清空，它触发时无货可卖会自己失败；
+    真正的风险是之后又买同一个币，故买入时的黑名单（一个币只进一次）同时也在挡这个。"""
+    if not p.get("live"):
+        return
+    for key, otype in (("live_strategy_id", "smart_trade"), ("live_stop_id", "limit_order")):
+        sid = p.get(key)
+        if not sid:
+            continue
+        try:
+            g.strategy_cancel(g.wallet_address(), sid, order_type=otype)
+            p[key] = None
+        except Exception as e:
+            log("STRATEGY_CANCEL_FAIL", p.get("symbol", ""), f"{key}={sid} · {e}")
 
 def do_sell(address: str, exit_tag: str | None = None) -> dict:
     """exit_tag：非空时说明这是 auto_manage_exits 触发的自动离场（AUTO_SL/AUTO_TP/AUTO_TRAIL/
@@ -2261,10 +2641,13 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
     pchain = p.get("chain", "sol")               # 用持仓自带链，避免用错链的 adapter/原生币
     if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
         g = ST.adapter_for(pchain)
+        _cancel_live_strategy(g, p)   # 先撤挂单再清仓：顺序反了会留下对空仓乱触发的策略单
         # 清仓：input=持仓币(非 currency，可用 percent)，output=该链原生币，percent=100 全清。
         try:
             g.swap(from_wallet=g.wallet_address(), input_token=address,
-                   output_token=native_token(pchain), percent=100, slippage=0.02)
+                   output_token=native_token(pchain), percent=100,
+                   slippage=CFG["live_slippage_sell"],
+                   priority_fee=CFG["live_priority_fee_sol"])
         except Exception as e:                       # 卖出失败→保留持仓，回清晰错误
             log("SELL_FAIL", p["symbol"], str(e))
             raise HTTPException(502, f"链上卖出失败：{e}")
@@ -2291,14 +2674,28 @@ def _sell_usd_notional(p: dict, sell_size_sol: float) -> float:
     return round(min(1.0, sell_size_sol / orig) * CFG["auto_size_usd"], 4)
 
 def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
-    """SHADOW-only 部分止盈：卖掉仓位的 frac 比例，持仓保留（size_sol 按比例减少），不 pop。
-    只从 auto_manage_exits 调用（已在 mode==SHADOW 下才会触发），故这里不处理 LIVE 真实 swap。"""
+    """部分止盈：卖掉当前仓位的 frac 比例，持仓保留（size_sol 按比例减少），不 pop。
+
+    LIVE 下真实发单（--percent 按"当前持仓量"的比例算，与这里的 frac 口径一致）。
+    正常情况下 LIVE 的部分止盈由 GMGN 条件单在链上完成，走不到这里；这条路径是**兜底**——
+    条件单没挂上（best-effort 失败）时，本地轮询仍能把阶梯执行掉，不至于只剩全仓止损。"""
     idx = next((i for i, p in enumerate(ST.positions) if p["address"] == address), None)
     if idx is None:
         raise HTTPException(404, "未找到该持仓")
     p = ST.positions[idx]
     pnl = p.get("pnl", 0)
     sell_size = round(p["size_sol"] * frac, 6)
+    if p.get("live") and ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+        pchain = p.get("chain", "sol")
+        g = ST.adapter_for(pchain)
+        try:
+            g.swap(from_wallet=g.wallet_address(), input_token=address,
+                   output_token=native_token(pchain), percent=round(frac * 100, 4),
+                   slippage=CFG["live_slippage_sell"],
+                   priority_fee=CFG["live_priority_fee_sol"])
+        except Exception as e:      # 部分止盈失败→保留原仓位不动，等下一轮重试；不改账目
+            log("SELL_FAIL", p["symbol"], f"部分止盈 {frac:.0%} · {e}")
+            raise HTTPException(502, f"链上部分止盈失败：{e}")
     usd_notional = _sell_usd_notional(p, sell_size)
     if pnl < 0:                     # 部分止盈按定义 pnl>0 触发，这里只是防御性保留同样的风控记账逻辑
         ST.risk.consec_losses += 1
@@ -2368,6 +2765,12 @@ class ChainIn(BaseModel):
 
 class ModeIn(BaseModel):
     mode: str                # "LIVE" | "SHADOW"
+    # 切到 LIVE 必须显式带上这个确认串（前端弹窗要求用户手打）。
+    # 单纯"点一下按钮 + 一个 confirm 弹窗"太容易误触，而误触的代价是真实资金开始动。
+    # 切回 SHADOW 不需要——收紧安全方向的操作永远不该有摩擦。
+    confirm: str = ""
+
+LIVE_CONFIRM_PHRASE = "LIVE"
 
 class AutoTradeIn(BaseModel):
     enabled: bool             # SHADOW-only 自动交易开关
@@ -2427,6 +2830,9 @@ def api_mode(m: ModeIn):
     """切实盘/模拟盘（右上角图标按钮）。LIVE 仅在未锁时生效；不写 env。"""
     _block_if_public()
     want_live = m.mode.upper() == "LIVE"
+    # 进 LIVE 要手打确认串；出 LIVE 不要。安全方向的操作不设摩擦，危险方向才设。
+    if want_live and m.confirm.strip().upper() != LIVE_CONFIRM_PHRASE:
+        raise HTTPException(400, f"切换到实盘需确认：请输入 {LIVE_CONFIRM_PHRASE}")
     with ST.lock:
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
         if ST.mode != "SHADOW" and ST.auto_trade:    # 自动交易仅 SHADOW；离开 SHADOW 就可见地关掉
@@ -2602,6 +3008,75 @@ def api_unmonitor(s: SellIn):
     _block_if_public()
     with ST.lock:
         return do_unmonitor(s.address)
+
+_MYWALLETS_CACHE: dict = {"t": 0.0, "data": None}
+MYWALLETS_TTL = 45.0     # 真实余额没必要秒级刷新；前端每轮都问，缓存避免把配额打在这上面
+
+@app.get("/api/mywallets")
+def api_mywallets(chain: str = "sol", refresh: bool = False):
+    """真实钱包（只读）：Key 绑定的本链钱包 + 原生币余额 + 持仓。
+
+    刻意只读——不签名、不下单，因此 PUBLIC_DEMO 下也不属于写操作。但余额属于隐私，
+    公开演示页不广播（与 /api/positions 同一原则）。"""
+    if PUBLIC_DEMO:
+        return dict(wallets=[], disabled="public_demo")
+    ch = valid_chain(chain)
+    now = time.time()
+    if not refresh and _MYWALLETS_CACHE["data"] is not None \
+            and now - _MYWALLETS_CACHE["t"] < MYWALLETS_TTL \
+            and _MYWALLETS_CACHE["data"].get("chain") == ch:
+        return _MYWALLETS_CACHE["data"]
+
+    g = ST.adapter_for(ch)
+    try:
+        info = g.portfolio_info()
+    except Exception as e:
+        # 网络/配额抖动不该让整块 UI 报红：回上一次已知结果并标记 stale
+        if _MYWALLETS_CACHE["data"] is not None:
+            return {**_MYWALLETS_CACHE["data"], "stale": True, "error": str(e)}
+        raise HTTPException(502, f"读取钱包失败：{e}")
+
+    nsym = native_symbol(ch)
+    want = load_trade_wallets().get(ch)
+    rows = [w for w in info.get("wallets", [])
+            if w.get("chain") == ch and w.get("address")]
+    # 哪个钱包会真正下单：与 wallet_address() 同一套规则（配置优先 → 唯一则用它 → 多个且未配置=不确定）
+    if want:
+        trading = want
+    elif len(rows) == 1:
+        trading = rows[0]["address"]
+    else:
+        trading = None            # 多个且未指定：前端据此提示「需在配置里指定」
+    out = []
+    for w in rows:
+        addr = w["address"]
+        nat = next((b for b in w.get("balances", []) if (b.get("symbol") or "").upper() == nsym), None)
+        toks = []
+        try:
+            h = g.holdings(addr, limit=20)
+            for t in (h.get("holdings") or h.get("data") or []):
+                if not isinstance(t, dict):
+                    continue
+                tk = t.get("token") or {}
+                toks.append(dict(symbol=sanitize(tk.get("symbol") or t.get("symbol") or ""),
+                                 address=tk.get("address") or t.get("address") or "",
+                                 usd_value=_f(t.get("usd_value")),
+                                 unrealized=_f(t.get("unrealized_profit")),
+                                 realized=_f(t.get("realized_profit"))))
+        except Exception:
+            pass          # 持仓读不到不影响余额展示；卡片按空持仓渲染
+        out.append(dict(address=addr,
+                        native_symbol=(nat or {}).get("symbol", ""),
+                        native_balance=_f((nat or {}).get("balance")),
+                        native_usd=_f((nat or {}).get("usd_value")),
+                        is_trading_wallet=(addr == trading),
+                        holdings=toks,
+                        holdings_usd=round(sum(t["usd_value"] for t in toks), 2),
+                        unrealized_usd=round(sum(t["unrealized"] for t in toks), 2)))
+    data = dict(chain=ch, wallets=out, configured_trade_wallet=want,
+                trading_wallet=trading, ambiguous=(trading is None and len(rows) > 1), ts=int(now))
+    _MYWALLETS_CACHE.update(t=now, data=data)
+    return data
 
 @app.get("/api/positions")
 def api_positions(chain: str = "sol"):
