@@ -2582,9 +2582,21 @@ def _find_live_strategy(g: "GMGNAdapter", wallet: str, token: str, tries: int = 
         try:
             r = g.strategy_list(wallet, base_token=token, group_tag="STMix")
             for o in (r.get("list") or []):
-                if (o.get("base_token") or "").lower() == token.lower() \
-                        and o.get("status") == "open" and o.get("order_id"):
-                    return o["order_id"]
+                if (o.get("base_token") or "").lower() != token.lower() \
+                        or o.get("status") != "open" or not o.get("order_id"):
+                    continue
+                # 组的 status=open **不代表**里面每一条都挂上了：2026-07-27 实测一个薄流动性
+                # 新币，两条止盈 status=check（已武装），止损却是 status=failed —— 组仍然显示
+                # open。只看组状态就会把"有止盈、没止损"当成已保护，本地逻辑随之让路，
+                # 结果是最不能接受的那种：亏损方向完全裸奔。
+                # 判据只认止损：止盈没挂上顶多少赚，止损没挂上是要命的。
+                subs = o.get("condition_orders") or []
+                sl = [c for c in subs if c.get("order_type") in ("loss_stop", "loss_stop_trace")]
+                if sl and all(c.get("status") == "failed" for c in sl):
+                    log("LIVE_NO_STOPLOSS", token[:8],
+                        f"⚠ 条件单组 {o['order_id']} 已挂但**止损全部 failed**（止盈正常）→ 视为无保护，交本地逻辑接管")
+                    return None
+                return o["order_id"]
         except Exception as e:
             log("STRATEGY_LIST_FAIL", token[:8], str(e))
         time.sleep(1.5)
