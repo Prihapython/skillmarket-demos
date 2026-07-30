@@ -2499,6 +2499,13 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
             raise HTTPException(
                 409, f"LIVE 单笔上限 ${CFG['live_size_usd']}（≈{max_native:.4f} {chain.upper()}），"
                      f"本次 {size_sol} 超限")
+    # Звіт по воротах авто-бота — **не блокує**, лише фіксує відхилення від стратегії.
+    # Без нього LIVE-угоди відбирались за критеріями людини й були непорівнянні з SHADOW.
+    gates = auto_gate_report(chain, address)
+    if gates and not gates["pass"]:
+        log("MANUAL_OFF_STRATEGY", address[:8],
+            "⚠ не пройшов би ворота бота: " + " · ".join(gates["failed"]))
+
     g = ST.adapter_for(chain)
     info = g.token_info(address)
     sec  = g.token_security(address)             # 已归一化安全快照（建仓基线，逃生 diff 用）
@@ -2619,11 +2626,17 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
                              live_stop_id=None, live_stop_price=0.0,
                              entry_token_amount=entry_tokens,
                              entry_signal=_manual_entry_signal(chain, address),
+                             auto_gates=gates,
                              tp1_done=False, tp2_done=False, peak_price=entry_price))
     save_positions()
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
-    log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})", dict(size_sol=size_sol, chain=chain, **exit_plan()))
-    return dict(ok=True, status=status_msg, filled=filled, symbol=symbol)
+    log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})",
+        dict(size_sol=size_sol, chain=chain, auto_gates=gates, **exit_plan()))
+    off = (gates or {}).get("failed") or []
+    if off:
+        status_msg += " · ⚠ поза стратегією: " + "; ".join(off)
+    return dict(ok=True, status=status_msg, filled=filled, symbol=symbol,
+                off_strategy=off)
 
 def _find_live_strategy(g: "GMGNAdapter", wallet: str, token: str, tries: int = 3) -> str | None:
     """回查该 token 上仍然 open 的条件单组，返回 order_id。
@@ -2771,6 +2784,51 @@ def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
         p["live_stop_price"] = 0.0
         log("LIVE_NO_STOPLOSS", p.get("symbol", ""),
             f"⚠ 止损挂单失败，本轮起由本地轮询兜底：{e}")
+
+def auto_gate_report(chain: str, address: str) -> dict | None:
+    """Чи пройшов би цей токен ворота авто-бота? Повертає {'pass':bool,'failed':[...]}.
+
+    Навіщо: ручна покупка (`do_buy`) не перевіряє майже нічого — тільки ланцюг і ліміти
+    LIVE. Тому LIVE-угоди відбирались за критеріями людини, а не бота, і **порівнювати
+    їх із SHADOW було б безглуздо**: різниця показала б смак у доборі токенів,
+    а не реальність виконання. Тут ті самі пороги, що в auto_open_position.
+
+    Це **звіт, а не заборона** — рішення лишається за людиною. Але тепер видно,
+    коли ми свідомо відступаємо від стратегії, а не робимо це не помічаючи."""
+    try:
+        rows = ST._trending_last_good.get(chain) or []
+        row = next((r for r in rows if (r.get("address") or "").lower() == address.lower()), None)
+        if row is None:
+            return None
+        g = ST.adapter_for(chain)
+        f = FeatureExtractor(g).build_from_row(row)
+        # dev-профіль у trending-рядку відсутній: бот тягне його окремо і лише для топ-24
+        # (див. screen_once). Без цього кроку обидві dev-перевірки завжди «провалювались» —
+        # не тому, що токен поганий, а тому, що дані не запитані. Кеш 10 хв, тож дешево.
+        f.dev = get_dev_profile(g, chain, f.address)
+        f.dev_eval = dev_score(f.dev) if f.dev else None
+        bad = []
+        if f.address in ST.auto_traded_addresses:      bad.append("вже торгували цим токеном")
+        if f.sniper_count > CFG["max_auto_sniper_count"]:
+            bad.append(f"снайперів {f.sniper_count} > {CFG['max_auto_sniper_count']}")
+        if f.liquidity < CFG["min_auto_liquidity_usd"]:
+            bad.append(f"ліквідність ${f.liquidity:,.0f} < ${CFG['min_auto_liquidity_usd']:,.0f}")
+        if f.swaps < CFG["min_auto_swaps"] or f.vol_1h < CFG["min_auto_volume_usd"]:
+            bad.append(f"угод {f.swaps} / обсяг ${f.vol_1h:,.0f} нижче мінімуму")
+        if f.ath_mcap > 0 and f.mcap / f.ath_mcap < CFG["min_auto_ath_ratio"]:
+            bad.append(f"від ATH {f.mcap / f.ath_mcap:.0%} < {CFG['min_auto_ath_ratio']:.0%}")
+        if f.sm_confluence < CFG["min_auto_sm_confluence"]:
+            bad.append(f"консенсус {f.sm_confluence} < {CFG['min_auto_sm_confluence']}")
+        if f.dev_eval is not None and f.dev_eval < CFG["min_auto_dev_score"]:
+            bad.append(f"dev-скор {f.dev_eval:.2f} < {CFG['min_auto_dev_score']}")
+        if not (f.dev and f.dev.get("exited")):
+            bad.append("dev ще НЕ вийшов з токена (або історія невідома)")
+        if f.age_min > CFG["max_token_age_min"]:
+            bad.append(f"вік {f.age_min:.0f}хв > {CFG['max_token_age_min']}хв")
+        return dict(**{"pass": not bad}, failed=bad)
+    except Exception as e:
+        log("GATE_REPORT_FAIL", address[:8], str(e))
+        return None
 
 def _manual_entry_signal(chain: str, address: str) -> dict | None:
     """Знімок показників на вході для **ручної** покупки.
