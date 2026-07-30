@@ -1879,11 +1879,13 @@ def auto_manage_exits(chain: str) -> None:
             # і якщо тут знову взяти orig_size_sol, та сама позиція порахується двічі.
             rest = max(0.0, 1.0 - _f(p.get("chain_sold_frac")))
             orig_sol = _f(p.get("orig_size_sol"))
+            exit_ctx = _capture_exit_context(g, p)   # той самий знімок, що й у do_sell — це теж «зловив падіння»
             log("SELL", p.get("symbol", ""), f"LIVE 链上条件单已全部平仓 PnL {p.get('pnl', 0):+.1%}",
                 dict(address=p["address"], chain=chain, size_sol=round(orig_sol * rest, 6),
                      pnl=p.get("pnl", 0), usd_notional=round(CFG["auto_size_usd"] * rest, 4),
                      auto=bool(p.get("auto")), live=True, exit_tag="LIVE_CHAIN_CLOSED",
-                     entry_signal=p.get("entry_signal")))
+                     entry_signal=p.get("entry_signal"),
+                     **({"exit_context": exit_ctx} if exit_ctx else {})))
             if p.get("live"):
                 send_telegram(
                     f"{'🟢' if p.get('pnl', 0) >= 0 else '🔴'} ВИХІД (LIVE)\n"
@@ -3363,10 +3365,16 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
     else:
         ST.risk.consec_losses = 0
     usd_notional = _sell_usd_notional(p, p["size_sol"])   # auto 部分止盈过的仓位，剩余部分只值原 $20 的一部分
+    # Знімок ринку для СПРАВЖНІХ виходів (не ручний клік, не тейк) — щоб згодом можна було
+    # відрізнити відкат від краху за даними (обсяг/ліквідність у момент падіння), а не на око.
+    # Рахуємо і в SHADOW теж: реальних виходів мало, паперових — сотні, вибірка звідти.
+    exit_ctx = (_capture_exit_context(ST.adapter_for(pchain), p)
+                if exit_tag in ("AUTO_SL", "AUTO_TRAIL_BE", "AUTO_ESCAPE", "AUTO_SL_LATE") else None)
     log("SELL", p["symbol"], f"{ST.mode} 平仓 PnL {pnl:+.1%}" + (f" · {exit_tag}" if exit_tag else ""),
         dict(address=p["address"], chain=pchain, size_sol=p["size_sol"], pnl=pnl, usd_notional=usd_notional,
              auto=bool(p.get("auto")), live=bool(p.get("live")),   # без цього真钱 угода не потрапляє в реальну статистику
-             exit_tag=exit_tag, entry_signal=p.get("entry_signal")))
+             exit_tag=exit_tag, entry_signal=p.get("entry_signal"),
+             **({"exit_context": exit_ctx} if exit_ctx else {})))
     if p.get("live"):
         send_telegram(
             f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
@@ -3375,6 +3383,34 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
     ST.positions.pop(idx)
     save_positions()
     return dict(ok=True, symbol=p["symbol"])
+
+def _capture_exit_context(g: "GMGNAdapter", p: dict) -> dict | None:
+    """Знімок ринку в момент СПРАВЖНЬОГО виходу (стоп/трейлінг/escape, не ручний клік
+    і не тейк) — щоб згодом відрізняти «це був відкат» від «це був крах» за даними,
+    а не на око. 2026-07-30: LEMO впала на -25% за хвилину після тейку1 і зловила наш
+    беззбитковий стоп, а за 10 хв виросла ще ×5 — обсяг у момент падіння був НИЖЧЕ
+    фонового, що радше ознака затишшя, ніж паніки. Одна точка нічого не доводить;
+    щоб перевірити, чи обсяг/ліквідність/частка покупців справді відрізняють відкат
+    від краху, треба зібрати це на десятках виходів — звідси й ця функція.
+
+    Один додатковий виклик API, лише на повних виходах (не щоцикл) — і **ніколи**
+    не блокує сам продаж: помилка тут проковтується, вихід відбувається в будь-якому разі."""
+    try:
+        info = g.token_info(p["address"])
+        pr = info.get("price") or {}
+        entry = _f(p.get("entry_price"))
+        peak = _f(p.get("peak_price")) or entry
+        cur = _f(p.get("cur_price")) or entry
+        return dict(
+            liquidity=_f(info.get("liquidity")),
+            vol_1m=_f(pr.get("volume_1m")), vol_5m=_f(pr.get("volume_5m")), vol_1h=_f(pr.get("volume_1h")),
+            buys_5m=pr.get("buys_5m"), sells_5m=pr.get("sells_5m"),
+            buys_1h=pr.get("buys_1h"), sells_1h=pr.get("sells_1h"),
+            drop_from_peak_pct=round((cur - peak) / peak, 4) if peak > 0 else None,
+            gain_at_exit_pct=round((cur - entry) / entry, 4) if entry > 0 else None,
+        )
+    except Exception:
+        return None
 
 def _mcap_line(p: dict) -> str:
     """Капіталізація на момент виходу для Telegram — рахуємо з circulating_supply,
