@@ -1641,8 +1641,10 @@ def native_usd_price(g: "GMGNAdapter", chain: str) -> float:
 
 def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int) -> None:
     """SHADOW-only 自动入场；调用方须已持有 ST.lock（从 screen_once 内调用，api_run 持锁跑它）。"""
-    if ST.mode != "SHADOW":                  # 硬安全阀：绝不在 LIVE 下自动开仓
-        return
+    # 2026-07-27：用户明确要求解锁 LIVE 自动开仓（此前这里是「绝不在 LIVE 下自动开仓」的硬阀）。
+    # 现在 LIVE + auto_trade 会**真实下单**，走 do_buy（条件单、成交价回填、链上校准都在那边）。
+    if ST.mode == "LIVE" and LIVE_TRADING_DISABLED:
+        return                               # 只剩顶层总闸还能拦（app.py 顶部的 LIVE_TRADING_DISABLED）
     if chain not in TRADEABLE_CHAINS:        # 用户明确要求：只在 SOL 开仓（见 TRADEABLE_CHAINS 注释）
         return
     if any(p["address"] == f.address and p.get("chain", "sol") == chain for p in ST.positions):
@@ -1717,16 +1719,31 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
                # 这些此前从不入库，导致无法回测"rug_ratio 0.3-0.6 是不是真的更危险"，先记下来再谈调门槛。
                rug_ratio=round(f.rug_ratio, 4), top10=round(f.top10, 4),
                bundler=round(f.bundler, 4), dev_hold=round(f.dev_hold, 4))
-    ST.positions.append(dict(symbol=f.symbol_safe, address=f.address, size_sol=size_native,
-                             orig_size_sol=size_native, pnl=0.0, cycles=0, entry=entry, chain=chain,
-                             entry_price=entry_price, cur_price=entry_price,
-                             auto=True, tp1_done=False, tp2_done=False, peak_price=entry_price,
-                             entry_signal=sig))
+    if ST.mode == "LIVE":
+        # LIVE：**真实下单**。走 do_buy 而不是自己拼一条持仓——条件单、成交价回填、
+        # 链上余额校准、策略单认领全在那边，复制一份必然会漂移。
+        # do_buy 里的 live_size_usd / live_max_positions 是给人工路径的手动上限，
+        # 自动路径有自己的 auto_size_usd / max_auto_positions，所以传 from_auto=True 跳过。
+        try:
+            do_buy(chain, f.address, size_native, from_auto=True)
+        except Exception as e:
+            log("AUTO_BUY_FAIL", f.symbol_safe, str(e))
+            return
+        pos = next((p for p in ST.positions if p["address"] == f.address), None)
+        if pos is not None:
+            pos["auto"] = True
+            pos["entry_signal"] = sig        # do_buy 拼的是人工版快照，这里换成完整的自动版
+    else:
+        ST.positions.append(dict(symbol=f.symbol_safe, address=f.address, size_sol=size_native,
+                                 orig_size_sol=size_native, pnl=0.0, cycles=0, entry=entry, chain=chain,
+                                 entry_price=entry_price, cur_price=entry_price,
+                                 auto=True, tp1_done=False, tp2_done=False, peak_price=entry_price,
+                                 entry_signal=sig))
     ST.auto_traded_addresses.add(f.address)
     save_auto_traded_addresses()
     save_positions()
-    log("BUY", f.symbol_safe, f"SHADOW AUTO 记录 {size_native} ({chain})",
-        dict(address=f.address, size_sol=size_native, chain=chain, auto=True,
+    log("BUY", f.symbol_safe, f"{ST.mode} AUTO {'成交' if ST.mode == 'LIVE' else '记录'} {size_native} ({chain})",
+        dict(address=f.address, size_sol=size_native, chain=chain, auto=True, live=(ST.mode == "LIVE"),
              entry_signal=sig, hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%",
              tp1=f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%+保本",
              tp2=f"+{int(CFG['auto_tp2_pct']*100)}%→卖{int(CFG['auto_tp2_sell_frac']*100)}%",
@@ -2274,7 +2291,7 @@ def screen_once(chain: str) -> dict:
             exec=exit_plan()))
         log("SCREEN", f.symbol_safe, "通过闸门 · 待决策",
             dict(size_sol=size, priority=pri, risk_warn=(not allow)))
-        if ST.auto_trade:                    # SHADOW-only 自动交易开关打开 → 自动开 $20 纸面仓位
+        if ST.auto_trade:                    # AUTO 打开 → 自动开仓（SHADOW=纸面，LIVE=真实资金）
             auto_open_position(chain, f, v, pri)
 
     # 持仓逃生监控（与筛选同一轮跑）；把本轮热榜行喂进去，持仓在榜则零额外 cli
@@ -2333,7 +2350,8 @@ def _autonomous_trade_loop():
     价格类止损有 GMGN 条件单在链上兜底，但 honeypot / 流动性崩塌这类信号只有我们看得见。"""
     while True:
         try:
-            if ST.mode == "SHADOW" and ST.auto_trade:
+            if ST.auto_trade and (ST.mode == "SHADOW"
+                                  or (ST.mode == "LIVE" and not LIVE_TRADING_DISABLED)):
                 with ST.lock:
                     screen_once("sol")   # 只扫 TRADEABLE_CHAINS 里唯一可交易的链
             elif ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
@@ -2477,7 +2495,7 @@ def _mock_drift(p):
 # ──────────────────────────────────────────────────────────────────────────
 # 12. 成交（人按下才发生）
 # ──────────────────────────────────────────────────────────────────────────
-def do_buy(chain: str, address: str, size_sol: float) -> dict:
+def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -> dict:
     if chain not in TRADEABLE_CHAINS:        # 用户明确要求：只在 SOL 开仓（见 TRADEABLE_CHAINS 注释）
         raise HTTPException(409, f"暂不支持在 {chain} 开仓，目前仅 SOL 可交易")
     # 成交前再过一次组合风控（硬拦；与筛选时的提示分离）
@@ -2487,7 +2505,9 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
         raise HTTPException(409, rnote)
     # LIVE 专属容量上限（SHADOW 不受影响，见 CFG live_max_positions 注释）。
     # 超限**报错而不是悄悄改小**：静默改数量会让人以为买了 $20 实际买了 $5，比拒绝更糟。
-    if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+    # 手动路径的上限。自动路径不受它约束——它有自己的 auto_size_usd / max_auto_positions，
+    # 两套限额叠加会让自动开仓被静默拒绝（\$20 的自动仓位撞上 \$5 的手动上限）。
+    if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED and not from_auto:
         n_live = sum(1 for p in ST.positions if p.get("live"))
         if n_live >= CFG["live_max_positions"]:
             raise HTTPException(409, f"LIVE 持仓已达上限 {CFG['live_max_positions']} 笔（当前 {n_live}）")
@@ -3064,10 +3084,7 @@ def api_config(cfg: ConfigIn):
         # 安全护栏：LIVE_TRADING_DISABLED 为真时，即使请求 LIVE 也强制 SHADOW（绝不上链）
         want_live = cfg.mode.upper() == "LIVE"
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
-        if ST.mode != "SHADOW" and ST.auto_trade:    # 自动交易仅 SHADOW；离开 SHADOW 就可见地关掉
-            ST.auto_trade = False
-            save_auto_trade_state()
-            log("AUTO_TOGGLE", "-", "mode 离开 SHADOW → auto_trade 自动关闭")
+        # 2026-07-27：不再因为离开 SHADOW 就强制关掉 AUTO——LIVE 自动交易已按用户要求解锁。
         try:
             ST.use_live()      # 配了 key 即走真实数据适配器（按链按需建，只读真实行情）
         except Exception:
@@ -3085,18 +3102,17 @@ def api_mode(m: ModeIn):
         raise HTTPException(400, f"切换到实盘需确认：请输入 {LIVE_CONFIRM_PHRASE}")
     with ST.lock:
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
-        if ST.mode != "SHADOW" and ST.auto_trade:    # 自动交易仅 SHADOW；离开 SHADOW 就可见地关掉
-            ST.auto_trade = False
-            save_auto_trade_state()
-            log("AUTO_TOGGLE", "-", "mode 离开 SHADOW → auto_trade 自动关闭")
+        # 2026-07-27：不再因为离开 SHADOW 就强制关掉 AUTO——LIVE 自动交易已按用户要求解锁。
     return dict(ok=True, mode=ST.mode, trading_locked=LIVE_TRADING_DISABLED, auto_trade=ST.auto_trade)
 
 @app.post("/api/auto_trade")
 def api_auto_trade(a: AutoTradeIn):
-    """SHADOW-only 自动交易开关（右上角新增的小拨钮）。LIVE 模式下请求打开会被拒绝生效。"""
+    """自动交易开关（右上角小拨钮）。**在 SHADOW 与 LIVE 下都生效**：
+    SHADOW = 纸面自动交易（采集统计）；LIVE = **真实资金自动交易**。
+    2026-07-27 按用户明确要求解锁 LIVE 自动开仓，此前这里只允许 SHADOW。"""
     _block_if_public()
     with ST.lock:
-        ST.auto_trade = bool(a.enabled) and ST.mode == "SHADOW"
+        ST.auto_trade = bool(a.enabled)      # 2026-07-27：AUTO 在 LIVE 下也生效（用户明确要求解锁）
         save_auto_trade_state()
         log("AUTO_TOGGLE", "-", f"auto_trade={ST.auto_trade}")
     return dict(ok=True, auto_trade=ST.auto_trade, mode=ST.mode)
