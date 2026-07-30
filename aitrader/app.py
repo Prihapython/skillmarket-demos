@@ -2087,7 +2087,7 @@ def reset_stats_epoch() -> str:
         pass
     return now
 
-def _load_auto_sells() -> list[dict]:
+def _load_auto_sells(live: bool | None = None) -> list[dict]:
     """全量读日志算胜率——不能像之前那样只看尾部 N 行：自主循环每轮给 top_n_prefilter(100) 个
     候选都写 SCREEN/FILTER，几分钟就能把任意固定行数窗口挤爆（真实事故：不到 1 小时日志涨到
     2.9 万行，一笔+61.7%的真实盈利交易 ACTR 就因为在窗口外，胜率统计直接把这笔赢的漏掉了，
@@ -2105,10 +2105,22 @@ def _load_auto_sells() -> list[dict]:
             rec = json.loads(ln)
         except Exception:
             continue
-        if rec.get("action") == "SELL" and rec.get("auto"):
-            if since and str(rec.get("ts", "")) < since:
-                continue                       # epoch 之前的旧单：不计入当前胜率，但日志里仍保留
-            out.append(rec)
+        if rec.get("action") != "SELL":
+            continue
+        # 纸面与真钱**必须分开统计**。以前这里只看 `auto`，于是：
+        #   · LIVE 自动交易也带 auto=True → 真实成交被混进纸面胜率，事后无从拆开；
+        #   · 手动 LIVE 交易 auto=False   → 真实成交干脆不进任何统计。
+        # LIVE 存在的意义就是拿真实结果校准纸面结果，混在一起就什么都校准不了。
+        is_live = bool(rec.get("live"))
+        if live is True and not is_live:
+            continue
+        if live is False and (is_live or not rec.get("auto")):
+            continue
+        if live is None and not (rec.get("auto") or is_live):
+            continue
+        if since and str(rec.get("ts", "")) < since:
+            continue                           # epoch 之前的旧单：不计入当前胜率，但日志里仍保留
+        out.append(rec)
     return out
 
 def _bucket_conviction(c):
@@ -2189,8 +2201,12 @@ def _group_trades(rows: list[dict], keyfn) -> list[dict]:
                         total_pnl_usd=round(total_usd, 2)))
     return sorted(out, key=lambda x: -x["n"])
 
-def compute_auto_stats() -> dict:
-    rows = _load_auto_sells()
+def compute_auto_stats(live: bool | None = None) -> dict:
+    """live=False → лише паперові угоди; live=True → лише реальні; None → усі разом.
+    Змішувати їх не можна: паперовий результат систематично оптимістичніший
+    (стоп завжди спрацьовує, прослизання й комісій немає), тож спільна цифра
+    не описує ні те, ні інше."""
+    rows = _load_auto_sells(live)
     # 一笔仓位若先部分止盈（partial=true）再全部离场，会在日志里留下 2 条 SELL 记录——
     # 笔数/胜率必须只按"最终离场"那一条算（一笔仓位=一笔交易），否则每笔部分止盈过的
     # 仓位都会被重复计成 2 笔交易，且部分止盈几乎总是正 pnl，会把胜率虚高。
@@ -2930,7 +2946,8 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
     usd_notional = _sell_usd_notional(p, p["size_sol"])   # auto 部分止盈过的仓位，剩余部分只值原 $20 的一部分
     log("SELL", p["symbol"], f"{ST.mode} 平仓 PnL {pnl:+.1%}" + (f" · {exit_tag}" if exit_tag else ""),
         dict(address=p["address"], chain=pchain, size_sol=p["size_sol"], pnl=pnl, usd_notional=usd_notional,
-             auto=bool(p.get("auto")), exit_tag=exit_tag, entry_signal=p.get("entry_signal")))
+             auto=bool(p.get("auto")), live=bool(p.get("live")),   # без цього真钱 угода не потрапляє в реальну статистику
+             exit_tag=exit_tag, entry_signal=p.get("entry_signal")))
     ST.positions.pop(idx)
     save_positions()
     return dict(ok=True, symbol=p["symbol"])
@@ -2974,7 +2991,8 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
         ST.risk.consec_losses = 0
     log("SELL", p["symbol"], f"{ST.mode} 部分止盈 {frac:.0%} PnL {pnl:+.1%} · {exit_tag}",
         dict(address=p["address"], chain=p.get("chain", "sol"), size_sol=sell_size, pnl=pnl, usd_notional=usd_notional,
-             auto=bool(p.get("auto")), exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
+             auto=bool(p.get("auto")), live=bool(p.get("live")),
+             exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
     p["size_sol"] = round(p["size_sol"] - sell_size, 6)
     p["tp1_done"] = True
     if exit_tag == "AUTO_TP2_PARTIAL":
@@ -3178,11 +3196,25 @@ def api_auto_trade(a: AutoTradeIn):
     return dict(ok=True, auto_trade=ST.auto_trade, mode=ST.mode)
 
 @app.get("/api/stats/auto")
-def api_stats_auto():
-    """自动交易统计：按信号分组的胜率/PnL，供前端统计卡片用。持仓不对外（同 §7 约定），公开演示模式不可读。"""
+def api_stats_auto(scope: str = ""):
+    """统计：按信号分组的胜率/PnL，供前端统计卡片用。
+
+    scope: paper | real | all。留空则**跟随当前模式**——采集数据看纸面，
+    真钱模式看真钱。混在一起是最没用的那种口径（见 compute_auto_stats）。"""
     if PUBLIC_DEMO:
         raise HTTPException(403, "公开演示不展示本机自动交易统计")
-    return JSONResponse(compute_auto_stats())
+    s = (scope or "").strip().lower()
+    if s == "paper":
+        live = False
+    elif s == "real":
+        live = True
+    elif s == "all":
+        live = None
+    else:
+        live = (ST.mode == "LIVE")            # за замовчуванням — статистика поточного режиму
+    d = compute_auto_stats(live)
+    d["scope"] = "real" if live is True else ("paper" if live is False else "all")
+    return JSONResponse(d)
 
 @app.post("/api/stats/auto/reset")
 def api_stats_auto_reset():

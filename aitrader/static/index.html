@@ -731,6 +731,7 @@ const I18N={
     auto_row_tip:'点击在 GMGN 打开该币图表',
     partial_lbl:'部分',
     stats_h3:'自动交易统计', stats_none:'暂无已平仓的自动交易',
+    scope_paper:'纸面', scope_real:'真实资金', scope_all:'混合',
     stats_total:(n)=>`${n} 笔`, stats_winrate:'胜率', stats_pnl:'累计 PnL',
     period_day:'按日', period_week:'按周', period_month:'按月',
     stats_reset_btn:'↺ 重置', stats_reset_title:'重置胜率显示',
@@ -934,6 +935,7 @@ const I18N={
     auto_row_tip:'Click to open this token\'s chart on GMGN',
     partial_lbl:'partial',
     stats_h3:'Auto-trade stats', stats_none:'No closed auto-trades yet',
+    scope_paper:'paper', scope_real:'real money', scope_all:'mixed',
     stats_total:(n)=>`${n} trades`, stats_winrate:'win rate', stats_pnl:'total PnL',
     period_day:'By day', period_week:'By week', period_month:'By month',
     stats_reset_btn:'↺ Reset', stats_reset_title:'Reset win-rate display',
@@ -1137,6 +1139,7 @@ const I18N={
     auto_row_tip:'Клік — відкрити графік цього токена на GMGN',
     partial_lbl:'частково',
     stats_h3:'Статистика автотрейду', stats_none:'Ще немає закритих угод автотрейду',
+    scope_paper:'папір', scope_real:'реальні гроші', scope_all:'змішано',
     stats_total:(n)=>`${n} угод`, stats_winrate:'вінрейт', stats_pnl:'сумарний PnL',
     period_day:'По днях', period_week:'По тижнях', period_month:'По місяцях',
     stats_reset_btn:'↺ Скинути', stats_reset_title:'Скинути показ вінрейту',
@@ -1844,7 +1847,9 @@ function renderAutoStats(s){
     return;
   }
   lastAutoStats=s;
-  if(cnt)cnt.textContent=t('stats_total',s.total_trades);
+  // Підписати, ЧИЯ це статистика. Паперова й реальна рахуються окремо й виглядають однаково —
+  // без підпису неможливо зрозуміти, на що дивишся, а цифри означають зовсім різне.
+  if(cnt)cnt.textContent=t('stats_total',s.total_trades)+(s.scope?' · '+t('scope_'+s.scope):'');
   const pnlCls=s.total_pnl_usd>=0?'up':'dn';
   const periodArr=[...(s['by_'+autoStatsPeriod]||[])].reverse();   // 最近的时段排最上面
   const periodRows=periodArr.map(p=>{
