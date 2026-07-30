@@ -2893,6 +2893,9 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
                              entry_token_amount=entry_tokens,
                              entry_signal=_manual_entry_signal(chain, address),
                              auto_gates=gates,
+                             # Фіксована в позиції один раз при вході: pump.fun-родина не змінює supply,
+                             # тож капа на виході рахується тим самим числом без повторного token_info().
+                             circulating_supply=_f(info.get("circulating_supply")),
                              tp1_done=False, tp2_done=False, peak_price=entry_price))
     save_positions()
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
@@ -3191,10 +3194,21 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
     if p.get("live"):
         send_telegram(
             f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
-            f"{p['symbol']} · PnL {pnl:+.1%}" + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
+            f"{p['symbol']} · PnL {pnl:+.1%}{_mcap_line(p)}"
+            + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
     ST.positions.pop(idx)
     save_positions()
     return dict(ok=True, symbol=p["symbol"])
+
+def _mcap_line(p: dict) -> str:
+    """Капіталізація на момент виходу для Telegram — рахуємо з circulating_supply,
+    зафіксованим у позиції при вході (do_buy), і поточної ціни. Старі позиції
+    (створені до цього поля) просто не покажуть рядок замість помилки чи нуля."""
+    supply = p.get("circulating_supply")
+    price = p.get("cur_price")
+    if not supply or not price:
+        return ""
+    return f"\nКапіталізація виходу: ${price * supply:,.0f}"
 
 def _sell_usd_notional(p: dict, sell_size_sol: float) -> float:
     """卖出的这部分持仓，按«占当初建仓原始数量的比例»折算成 $ 名义（只对 auto 仓位有意义；
@@ -3239,7 +3253,8 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
              exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
     if p.get("live"):
         send_telegram(
-            f"🟡 ЧАСТКОВИЙ ТЕЙК (LIVE)\n{p['symbol']} · продано {frac:.0%} · PnL {pnl:+.1%} · {exit_tag}")
+            f"🟡 ЧАСТКОВИЙ ТЕЙК (LIVE)\n{p['symbol']} · продано {frac:.0%} · "
+            f"PnL {pnl:+.1%}{_mcap_line(p)} · {exit_tag}")
     p["size_sol"] = round(p["size_sol"] - sell_size, 6)
     p["tp1_done"] = True
     if exit_tag == "AUTO_TP2_PARTIAL":
