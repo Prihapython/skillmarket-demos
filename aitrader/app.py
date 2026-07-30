@@ -187,7 +187,7 @@ CFG = {
     # 2% 是用户在 GMGN 手动下单实测能成交的值，作为起点；不是拍脑袋的"大滑点更保险"。
     # ⚠️ 滑点是**上限不是手续费**：调高不等于多付钱，只是允许更差的成交价才不回滚。
     #    真正要用数据定的是"我们的入场条件下失败率多少"，见 WALLET_PLAN.md 阶段 3。
-    # 2.0 → 5.0（2026-07-27，实盘 3 单定的，不是拍脑袋）：
+    # 2.0 → 5.0（2026-07-30，实盘 3 单定的，不是拍脑袋）：
     #   Fartci  5分钟 +360%  实测滑点 0.62%  成交
     #   L'Eon   5分钟  +21%  实测滑点 1.93%  成交（已经贴着 2% 上限）
     #   CSC     5分钟  +58%  超过 2%        **失败回滚**
@@ -594,7 +594,7 @@ class LiveGMGN(GMGNAdapter):
         我们没参与，本地无从知晓。余额才是唯一的事实来源。
 
         ⚠️ 返回结构是 {"balances":[{"balance":"11.89",...}]}——**列表**，不是顶层 balance 字段。
-        2026-07-27 实盘第一单就栽在这里：按顶层取值拿到 None→0，entry_token_amount 记成 0，
+        2026-07-30 实盘第一单就栽在这里：按顶层取值拿到 None→0，entry_token_amount 记成 0，
         整个链上校准被静默跳过。所以这里直接返回数字，不把解析责任丢给调用方。"""
         r = self._cli("portfolio", "token-balance", "--wallet", wallet, "--token", token)
         rows = r.get("balances") or []
@@ -1641,7 +1641,7 @@ def native_usd_price(g: "GMGNAdapter", chain: str) -> float:
 
 def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int) -> None:
     """SHADOW-only 自动入场；调用方须已持有 ST.lock（从 screen_once 内调用，api_run 持锁跑它）。"""
-    # 2026-07-27：用户明确要求解锁 LIVE 自动开仓（此前这里是「绝不在 LIVE 下自动开仓」的硬阀）。
+    # 2026-07-30：用户明确要求解锁 LIVE 自动开仓（此前这里是「绝不在 LIVE 下自动开仓」的硬阀）。
     # 现在 LIVE + auto_trade 会**真实下单**，走 do_buy（条件单、成交价回填、链上校准都在那边）。
     if ST.mode == "LIVE" and LIVE_TRADING_DISABLED:
         return                               # 只剩顶层总闸还能拦（app.py 顶部的 LIVE_TRADING_DISABLED）
@@ -1763,7 +1763,7 @@ def _auto_decide_exit(p: dict):
             # SHADOW：扫描周期之间价格可能已经跌穿止损位很远；真实止损单会在触发价附近成交，
             # 所以纸面成绩按 -35% 记账，而不是"看到多少算多少"——这是**模拟**，不是观测。
             # LIVE：绝不套这个夹子。实盘有真实成交价，夹一下就等于往账本里写一个没发生过的数字，
-            # 而 LIVE 存在的全部意义就是拿真实数据校准 SHADOW。2026-07-27 MANTEN 实测：
+            # 而 LIVE 存在的全部意义就是拿真实数据校准 SHADOW。2026-07-30 MANTEN 实测：
             # 真实成交 -32.4%，夹完记成 -35.0% —— 这次偏向对我们有利，方向无所谓，记假就是错。
             if not p.get("live"):
                 p["pnl"] = max(pnl, -CFG["hard_stop_pct"])
@@ -2583,7 +2583,7 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
         # 不显式检查就会出现最危险的情况——**有仓位、没止损，而且界面显示一切正常**。
         if conds:
             # swap 的响应里**没有** strategy_order_id（文档提到该字段，实盘首单实测并未返回）。
-            # 只看响应会把"挂上了"误判成"没挂上"——2026-07-27 首单就是这样虚惊一场，
+            # 只看响应会把"挂上了"误判成"没挂上"——2026-07-30 首单就是这样虚惊一场，
             # 更糟的是仓位被标成"无保护"，本地逻辑会跟 GMGN 抢着卖，造成双重卖出。
             # 唯一可靠的确认方式是回查 strategy list（group_tag=STMix 即跟随买单的那组）。
             live_strategy = _find_live_strategy(g, wallet, address)
@@ -2612,7 +2612,7 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
         if not entry_tokens:
             log("LIVE_BALANCE_FAIL", symbol, "建仓后多次读取 token 余额均为 0，链上校准将不可用")
         # 用**实际成交价**覆盖建仓价。entry_price 原本取自下单前的行情快照，
-        # 而这几秒里价格照样在动：2026-07-27 实测 Couple 差了 7%。
+        # 而这几秒里价格照样在动：2026-07-30 实测 Couple 差了 7%。
         # 它是保本止损、移动止损和 PnL 的共同基准——差 7% 就意味着"保本价"其实在真实成本
         # 下方 7%，会在亏损处离场却记成保本。这次方向恰好有利（+8.1% 离场），纯属运气。
         try:
@@ -2671,7 +2671,7 @@ def _find_live_strategy(g: "GMGNAdapter", wallet: str, token: str, tries: int = 
                 if (o.get("base_token") or "").lower() != token.lower() \
                         or o.get("status") != "open" or not o.get("order_id"):
                     continue
-                # 组的 status=open **不代表**里面每一条都挂上了：2026-07-27 实测一个薄流动性
+                # 组的 status=open **不代表**里面每一条都挂上了：2026-07-30 实测一个薄流动性
                 # 新币，两条止盈 status=check（已武装），止损却是 status=failed —— 组仍然显示
                 # open。只看组状态就会把"有止盈、没止损"当成已保护，本地逻辑随之让路，
                 # 结果是最不能接受的那种：亏损方向完全裸奔。
@@ -2709,7 +2709,7 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     # 涨到 +20% 时两边各卖 30% = 卖掉 60%。所以每轮都尝试认领一次。
     if CFG["live_condition_orders"]:
         # **每轮都查**，不是只在缺失时查。止损不只会创建失败，还会**触发时失败**：
-        # 2026-07-27 实测 CSC —— 建仓时 status=check（已武装），价格跌穿 -35% 时变成 failed，
+        # 2026-07-30 实测 CSC —— 建仓时 status=check（已武装），价格跌穿 -35% 时变成 failed，
         # 币根本没卖出去，等我们发现已经 -40%。原来的写法只在 live_strategy_id 为空时回查，
         # 所以一旦认定"有保护"就永远不再复核，本地逻辑一直让路，等于两边都没人管。
         sid = _find_live_strategy(g, g.wallet_address(), p["address"], tries=1)
@@ -3108,7 +3108,7 @@ def api_config(cfg: ConfigIn):
         # 安全护栏：LIVE_TRADING_DISABLED 为真时，即使请求 LIVE 也强制 SHADOW（绝不上链）
         want_live = cfg.mode.upper() == "LIVE"
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
-        # 2026-07-27：不再因为离开 SHADOW 就强制关掉 AUTO——LIVE 自动交易已按用户要求解锁。
+        # 2026-07-30：不再因为离开 SHADOW 就强制关掉 AUTO——LIVE 自动交易已按用户要求解锁。
         try:
             ST.use_live()      # 配了 key 即走真实数据适配器（按链按需建，只读真实行情）
         except Exception:
@@ -3126,7 +3126,7 @@ def api_mode(m: ModeIn):
         raise HTTPException(400, f"切换到实盘需确认：请输入 {LIVE_CONFIRM_PHRASE}")
     with ST.lock:
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
-        # 2026-07-27：不再因为离开 SHADOW 就强制关掉 AUTO——LIVE 自动交易已按用户要求解锁。
+        # 2026-07-30：不再因为离开 SHADOW 就强制关掉 AUTO——LIVE 自动交易已按用户要求解锁。
     return dict(ok=True, mode=ST.mode, trading_locked=LIVE_TRADING_DISABLED, auto_trade=ST.auto_trade)
 
 @app.post("/api/trading_mode")
@@ -3169,10 +3169,10 @@ def api_trading_mode(m: TradingModeIn):
 def api_auto_trade(a: AutoTradeIn):
     """自动交易开关（右上角小拨钮）。**在 SHADOW 与 LIVE 下都生效**：
     SHADOW = 纸面自动交易（采集统计）；LIVE = **真实资金自动交易**。
-    2026-07-27 按用户明确要求解锁 LIVE 自动开仓，此前这里只允许 SHADOW。"""
+    2026-07-30 按用户明确要求解锁 LIVE 自动开仓，此前这里只允许 SHADOW。"""
     _block_if_public()
     with ST.lock:
-        ST.auto_trade = bool(a.enabled)      # 2026-07-27：AUTO 在 LIVE 下也生效（用户明确要求解锁）
+        ST.auto_trade = bool(a.enabled)      # 2026-07-30：AUTO 在 LIVE 下也生效（用户明确要求解锁）
         save_auto_trade_state()
         log("AUTO_TOGGLE", "-", f"auto_trade={ST.auto_trade}")
     return dict(ok=True, auto_trade=ST.auto_trade, mode=ST.mode)
