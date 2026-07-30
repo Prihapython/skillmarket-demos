@@ -2416,6 +2416,10 @@ def _public_broadcast_loop():
 # замість власного сканування; коли цикл вимкнений (режим OFF/РУЧНИЙ) — кеш порожній
 # і /api/run сканує сам, як раніше.
 _SCAN_CACHE: dict[str, tuple] = {}
+# chain -> кількість РЕАЛЬНИХ сканувань (не опитувань кешу вкладкою) відколи стартував бекенд.
+# Джерело правди для лічильника на фронтенді: переживає F5/новий таб (це серверний стан),
+# не переживає рестарт бекенда (лічильник сесії, не файл на диску — навмисно, не варте зберігання).
+_SCAN_ROUNDS: dict[str, int] = {}
 
 def _autonomous_trade_loop():
     """后台自治线程。两种模式跑的东西不同，**关键是 LIVE 也必须跑**：
@@ -2437,6 +2441,7 @@ def _autonomous_trade_loop():
                     # два повні проходи замість одного, вони чекали один одного (до ~8 с
                     # замість ~4) і вдвічі палили квоту GMGN на ті самі дані.
                     _SCAN_CACHE["sol"] = (time.time(), screen_once("sol"))
+                    _SCAN_ROUNDS["sol"] = _SCAN_ROUNDS.get("sol", 0) + 1
             elif ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
                 with ST.lock:
                     if any(p.get("live") for p in ST.positions):
@@ -3385,6 +3390,8 @@ def api_run(r: RunIn):
         out = dict(hit[1])
         out.update(trading_mode=current_trading_mode(), cached=True,
                    cache_age_s=round(time.time() - hit[0], 1),
+                   scan_ts=hit[0],   # мітка ФАКТИЧНОГО сканування — щоб фронтенд рахував реальні раунди, а не свої опитування кешу
+                   scan_round=_SCAN_ROUNDS.get(ch, 0),   # серверний лічильник — переживає рефреш сторінки
                    live_positions=sum(1 for p in ST.positions if p.get("live")),
                    auto_size_usd=CFG["auto_size_usd"], max_auto_positions=CFG["max_auto_positions"])
         return JSONResponse(out)
@@ -3400,6 +3407,9 @@ def api_run(r: RunIn):
             out["live_positions"] = sum(1 for p in ST.positions if p.get("live"))
             out["auto_size_usd"] = CFG["auto_size_usd"]
             out["max_auto_positions"] = CFG["max_auto_positions"]
+            out["scan_ts"] = time.time()   # цей виклик сам щойно відсканував — завжди новий раунд
+            _SCAN_ROUNDS[ch] = _SCAN_ROUNDS.get(ch, 0) + 1
+            out["scan_round"] = _SCAN_ROUNDS[ch]
             return JSONResponse(out)
         except Exception as e:
             raise HTTPException(502, f"扫描失败：{e}")

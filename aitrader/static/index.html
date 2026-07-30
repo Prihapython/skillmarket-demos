@@ -1433,7 +1433,8 @@ document.getElementById('chainPillWrap').onclick=e=>{e.stopPropagation();if(e.ta
 document.addEventListener('click',e=>{if(!e.target.closest('#chainPillWrap'))closeChainMenu();});
 
 /* ── KPI ── */
-let cycles=1;
+let cycles=1;         // фолбек-лічильник (коли бекенд не присилає scan_round, напр. PUBLIC_DEMO)
+let lastScanTs=null;  // мітка останнього ФАКТИЧНОГО сканування, яку ми вже врахували
 function passG(g){return T.filter(t=>t.died===null||t.died>g).length;}
 function killAt(g){return T.filter(t=>t.died===g).length;}
 function kpiData(){
@@ -1684,7 +1685,16 @@ async function scanCycle(){
       const {list,risk,positions}=normalize(data);
       loadingScreen=false;                 // 拿到后端响应，结束骨架
       T=list; RISK=risk; if(positions)POS=positions; if(sel>=T.length)sel=-1;
-      cycles++;renderAll(true);logScreen();
+      // Раунд рахуємо за scan_ts — міткою ФАКТИЧНОГО сканування бекенда, а не за кожним
+      // 2-секундним опитуванням вкладки (яке часто отримує той самий кеш повторно).
+      // scan_round — серверний лічильник: приходить готовим і переживає F5 (на відміну
+      // від локальної змінної cycles, яка скидалась би в 1 щоразу після рефрешу сторінки).
+      const isNewRound=data.scan_ts!=null&&data.scan_ts!==lastScanTs;
+      if(isNewRound)logScreen();
+      if(typeof data.scan_round==='number')cycles=data.scan_round;
+      else if(isNewRound)cycles++;
+      if(data.scan_ts!=null)lastScanTs=data.scan_ts;
+      renderAll(true);
       if(++autoStatsTick%5===0)fetchAutoStats();   // 统计面板轮询更稀疏，非每轮 /api/run 都拉
     }catch(e){
       // 之前这里会把 bePolling 永久置 false——一次瞬时失败（网络抖动/后端重启中）就会让页面
