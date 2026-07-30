@@ -1965,13 +1965,15 @@ async function fetchAutoStats(){
   try{
     const r=await fetch(API+'/api/stats/auto');
     if(!r.ok)return;
-    const s=await r.json();
-    // scans_24h рахується з журналу на бекенді (реальні SCREEN+FILTER рядки за 24г, не
-    // UI-опитування) незалежно від того, чи є вже закриті угоди — тому оновлюємо
-    // KPI-картку тут, а не всередині renderAutoStats (та виходить рано, коли угод 0).
-    if(s.scans_24h){scans24h=s.scans_24h;renderKpis();}
-    renderAutoStats(s);
+    renderAutoStats(await r.json());
   }catch(e){/* 静默：统计面板非关键路径 */}
+  // Окремий легкий запит: /api/stats/auto першим викликом після рестарту читає
+  // весь журнал заради SELL-рядків і може висіти довго (росте з журналом), тому
+  // scans_24h не чіпляємо до нього — інакше картка сканів чекала б на ту саму паузу.
+  try{
+    const r2=await fetch(API+'/api/stats/scans');
+    if(r2.ok){scans24h=await r2.json();renderKpis();}
+  }catch(e){/* 静默 */}
 }
 function resetAutoStats(){
   if(source!=='backend'){toast(t('toast_be_switched'),'err');return;}

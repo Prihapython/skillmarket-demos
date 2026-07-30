@@ -2156,20 +2156,59 @@ def _all_sell_rows() -> list[dict]:
 # якого дійшло сканування, незалежно від того, чи була відкрита вкладка браузера.
 # Рахуємо по годинних відрах (UTC) з окремим інкрементальним курсором у той самий
 # журнал, що й _all_sell_rows — новий хвіст, а не весь файл щоразу.
-_SCAN_STATS_CACHE: dict = {"pos": 0}
+_SCAN_STATS_CACHE: dict = {"pos": 0, "seeded": False}
 _SCAN_STATS_LOCK = threading.Lock()
 _SCAN_HOURLY: dict[str, dict] = {}   # "YYYY-MM-DDTHH" (UTC) -> {"n": рядків, "syms": set(symbol)}
+
+def _find_hour_offset(size: int, target_hour: str) -> int:
+    """Бінарний пошук байтового офсету першого рядка, чия ts-година >= target_hour.
+    Журнал append-only й майже строго хронологічний (усі записи йдуть через один
+    log() під ST.lock) — тож двійковий пошук по ньому коректний і не вимагає читати
+    файл із початку. Наближено (з точністю до рядка на межі), і це нормально:
+    нам треба зекономити на об'ємі, а не влучити в точний байт."""
+    if size <= 0:
+        return 0
+    lo, hi = 0, size
+    with LOG_PATH.open("rb") as f:
+        for _ in range(40):   # з великим запасом на log2(розмір/типовий рядок)
+            if lo >= hi:
+                break
+            mid = (lo + hi) // 2
+            f.seek(mid)
+            f.readline()          # дочитати обрізаний рядок під mid
+            line = f.readline()   # перший ПОВНИЙ рядок після mid
+            if not line:
+                hi = mid
+                continue
+            try:
+                hour = str(json.loads(line).get("ts", ""))[:13]
+            except Exception:
+                hour = ""
+            if hour and hour >= target_hour:
+                hi = mid
+            else:
+                lo = mid + 1
+    return lo
 
 def _update_scan_hourly():
     with _SCAN_STATS_LOCK:
         if not LOG_PATH.exists():
-            _SCAN_STATS_CACHE["pos"] = 0
+            _SCAN_STATS_CACHE.update(pos=0, seeded=False)
             _SCAN_HOURLY.clear()
             return
         size = LOG_PATH.stat().st_size
         if size < _SCAN_STATS_CACHE["pos"]:
-            _SCAN_STATS_CACHE["pos"] = 0
+            _SCAN_STATS_CACHE.update(pos=0, seeded=False)
             _SCAN_HOURLY.clear()
+        if not _SCAN_STATS_CACHE["seeded"]:
+            # Холодний старт (щойно після рестарту процесу): журнал росте необмежено
+            # (уже 500+ МБ, мультиденна історія), а нам треба лише останні ~30г.
+            # Стрибаємо туди бінарним пошуком замість лінійного проходу від байта 0 —
+            # інакше цей ендпоінт зависав би на довше й довше з кожним днем роботи бота.
+            cutoff0 = (datetime.datetime.now(datetime.timezone.utc)
+                       - datetime.timedelta(hours=30)).strftime("%Y-%m-%dT%H")
+            _SCAN_STATS_CACHE["pos"] = _find_hour_offset(size, cutoff0)
+            _SCAN_STATS_CACHE["seeded"] = True
         if size > _SCAN_STATS_CACHE["pos"]:
             with LOG_PATH.open("rb") as f:
                 f.seek(_SCAN_STATS_CACHE["pos"])
@@ -3383,8 +3422,17 @@ def api_stats_auto(scope: str = ""):
         live = (ST.mode == "LIVE")            # за замовчуванням — статистика поточного режиму
     d = compute_auto_stats(live)
     d["scope"] = "real" if live is True else ("paper" if live is False else "all")
-    d["scans_24h"] = scan_stats_24h()
     return JSONResponse(d)
+
+@app.get("/api/stats/scans")
+def api_stats_scans():
+    """Окремо від /api/stats/auto навмисно: той першим викликом після рестарту читає
+    ввесь журнал заради SELL-рядків і може займати десятки секунд (росте з журналом).
+    Ця цифра рахується бінарним пошуком (див. _find_hour_offset) і має лишатись
+    швидкою завжди, незалежно від того, чи прогрілась статистика угод."""
+    if PUBLIC_DEMO:
+        raise HTTPException(403, "公开演示不展示扫描统计")
+    return JSONResponse(scan_stats_24h())
 
 @app.post("/api/stats/auto/reset")
 def api_stats_auto_reset():
