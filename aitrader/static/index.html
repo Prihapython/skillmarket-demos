@@ -69,6 +69,11 @@ body.publicro #escCard{display:none !important}
 .seg2{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--ink2)}
 .seg2 button{background:transparent;border:0;color:var(--dim);font-family:var(--mono);font-size:10px;letter-spacing:.08em;padding:8px 11px;cursor:pointer}
 .seg2 button.on{background:var(--lime);color:var(--ink);font-weight:700}
+/* Режими з реальними грошима фарбуються інакше, ніж паперовий: активний стан має
+   читатись боковим зором, без вчитування в текст. */
+.tmseg button.on.real{background:var(--clay);color:#fff}
+.tmseg button.real{color:#c9705a}
+.tmseg button.real:hover{color:var(--clay)}
 .gear{width:36px;height:36px;border-radius:9px;border:1px solid var(--line);background:var(--ink2);color:var(--paper2);display:grid;place-items:center;cursor:pointer}
 .gear:hover{border-color:var(--lime);color:var(--lime)}.gear svg{width:16px;height:16px}
 .langbtn{height:36px;padding:0 12px;border-radius:9px;border:1px solid var(--line);background:var(--ink2);color:var(--paper2);display:grid;place-items:center;cursor:pointer;font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.04em;white-space:nowrap}
@@ -431,7 +436,11 @@ td{padding:5px 10px;vertical-align:middle}
           <div data-ch="robinhood" onclick="switchChain('robinhood')">Robinhood</div>
         </div>
       </div>
-      <div class="pill mode clk" id="tmWrap" onclick="cycleTradingMode()" data-i18n-title="tm_title"><span class="dot" id="tmDot" style="background:var(--dim2)"></span><div><span class="k" data-i18n="tm_k">РЕЖИМ</span><span class="v" id="tmPill">—</span></div></div>
+      <div class="seg2 tmseg" id="tmSeg" data-i18n-title="tm_title">
+        <button id="tmData"   onclick="setTradingMode('DATA')"   data-i18n="tm_data">ЗБІР ДАНИХ</button>
+        <button id="tmManual" onclick="setTradingMode('MANUAL')" data-i18n="tm_manual">РУЧНИЙ</button>
+        <button id="tmAuto"   onclick="setTradingMode('AUTO')"   data-i18n="tm_auto">АВТО</button>
+      </div>
       <div class="langbtn" id="langBtn" data-i18n-title="lang_title" onclick="switchLang()">中文</div>
       <div class="gear" id="gearBtn" data-i18n-title="gear_title"></div>
     </div>
@@ -1782,10 +1791,12 @@ let tradingMode='OFF', tmInFlight=false;
 
 function applyTradingMode(){
   const st=TM_STYLE[tradingMode]||TM_STYLE.OFF;
-  const v=document.getElementById('tmPill');
-  if(v){v.textContent=t('tm_'+tradingMode.toLowerCase());v.style.color=st.color;}
-  const dot=document.getElementById('tmDot'); if(dot)dot.style.background=st.color;
-  const wrap=document.getElementById('tmWrap'); if(wrap)wrap.classList.toggle('on',st.real);
+  TM_ORDER.forEach(m=>{
+    const b=document.getElementById('tm'+m.charAt(0)+m.slice(1).toLowerCase());
+    if(!b)return;
+    b.classList.toggle('on',m===tradingMode);
+    b.classList.toggle('real',!!TM_STYLE[m]?.real);
+  });
   const ll=document.getElementById('liveLbl');
   if(ll)ll.textContent=st.real?t('live_lbl_live'):t('live_lbl_shadow');
   // сумісність зі старим кодом, який ще читає ці прапорці
@@ -1806,6 +1817,7 @@ function applyAutoLabel(){applyTradingMode();}
 function syncBackendMode(){}      // замінено на syncTradingMode
 
 async function setTradingMode(target){
+  if(target===tradingMode)return;              // вже в цьому режимі — не питати підтвердження знову
   const st=TM_STYLE[target];
   if(st?.real&&tradingLocked){toast(t('toast_trade_locked'),'err');return;}
   let confirmStr='';
