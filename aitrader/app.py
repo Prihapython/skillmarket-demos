@@ -2114,6 +2114,43 @@ def reset_stats_epoch() -> str:
         pass
     return now
 
+_SELLS_CACHE: dict = {"pos": 0, "rows": []}
+_SELLS_LOCK = threading.Lock()
+
+def _all_sell_rows() -> list[dict]:
+    """Усі SELL-записи журналу, з **дочитуванням лише нового хвоста**.
+
+    Журнал append-only і вже виріс до 252 МБ / 1.67 млн рядків, з яких SELL — сотні.
+    Раніше кожен запит статистики перечитував і розбирав увесь файл: 51 секунда на
+    виклик, а фронтенд смикає його при кожному перемиканні режиму й кожні 5 циклів.
+    Тепер пам'ятаємо зміщення й розбираємо тільки те, що дописалось.
+
+    Читаємо байтами й зупиняємось на останньому переводі рядка: інакше можна
+    прихопити рядок, який пишеться просто зараз, і зіпсувати кеш незакінченим JSON.
+    Файл став меншим (обрізали/підмінили) → перечитуємо з нуля."""
+    with _SELLS_LOCK:
+        if not LOG_PATH.exists():
+            _SELLS_CACHE.update(pos=0, rows=[])
+            return []
+        size = LOG_PATH.stat().st_size
+        if size < _SELLS_CACHE["pos"]:
+            _SELLS_CACHE.update(pos=0, rows=[])
+        if size > _SELLS_CACHE["pos"]:
+            with LOG_PATH.open("rb") as f:
+                f.seek(_SELLS_CACHE["pos"])
+                blob = f.read(size - _SELLS_CACHE["pos"])
+            cut = blob.rfind(b"\n")
+            if cut >= 0:
+                for ln in blob[:cut + 1].decode("utf-8", "replace").splitlines():
+                    try:
+                        rec = json.loads(ln)
+                    except Exception:
+                        continue
+                    if rec.get("action") == "SELL":
+                        _SELLS_CACHE["rows"].append(rec)
+                _SELLS_CACHE["pos"] += cut + 1
+        return list(_SELLS_CACHE["rows"])
+
 def _load_auto_sells(live: bool | None = None) -> list[dict]:
     """全量读日志算胜率——不能像之前那样只看尾部 N 行：自主循环每轮给 top_n_prefilter(100) 个
     候选都写 SCREEN/FILTER，几分钟就能把任意固定行数窗口挤爆（真实事故：不到 1 小时日志涨到
@@ -2121,19 +2158,13 @@ def _load_auto_sells(live: bool | None = None) -> list[dict]:
     统计出来变成 0 胜）。SELL 记录在全部日志里占比很小，全量扫一遍的成本可以接受
     （同 _load_auto_traded_addresses 的取舍，见其注释）。
     只返回 stats_epoch 之后成交的 SELL——"重置胜率"靠推进 epoch 实现，不再 truncate 日志
-    （日志里的 entry_signal 是数据分析的唯一来源，绝不能因为清胜率就被删掉）。"""
-    if not LOG_PATH.exists():
-        return []
+    （日志里的 entry_signal 是数据分析的唯一来源，绝不能因为清胜率就被删掉）。
+
+    Розбір рядків живе в `_all_sell_rows()` з інкрементальним кешем; тут лишилась
+    тільки фільтрація вже розібраних записів."""
     since = stats_epoch()
-    lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
     out = []
-    for ln in lines:
-        try:
-            rec = json.loads(ln)
-        except Exception:
-            continue
-        if rec.get("action") != "SELL":
-            continue
+    for rec in _all_sell_rows():
         # 纸面与真钱**必须分开统计**。以前这里只看 `auto`，于是：
         #   · LIVE 自动交易也带 auto=True → 真实成交被混进纸面胜率，事后无从拆开；
         #   · 手动 LIVE 交易 auto=False   → 真实成交干脆不进任何统计。
