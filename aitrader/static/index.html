@@ -1861,12 +1861,11 @@ async function setTradingMode(target){
           autoSizeUsd=s.auto_size_usd;maxAutoPos=s.max_auto_positions;}catch(e){}
       return;
     }
+    // Одне вікно підтвердження, без набору «LIVE» руками (користувач прибрав).
+    // Текст усе одно називає точні суми — саме він тут і є запобіжником.
     const warn=(target==='AUTO')?t('tm_warn_auto',autoSizeUsd,maxAutoPos):t('tm_warn_manual');
     const ok=await new Promise(res=>confirmDialog(t('confirm_live_title'),warn,()=>res(true),()=>res(false)));
     if(!ok)return;
-    const s=window.prompt(t('confirm_live_type'));
-    if(s===null)return;
-    if(s.trim().toUpperCase()!=='LIVE'){toast(t('confirm_live_bad'),'err');return;}
     confirmStr='LIVE';
   }
   tmInFlight=true;

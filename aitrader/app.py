@@ -48,6 +48,7 @@ AUTO_TRADED_ADDRS_PATH = OUT_DIR / "auto_traded_addresses.json"   # 永久黑名
 STATS_EPOCH_PATH = OUT_DIR / "stats_epoch.json"   # 胜率统计起算时间点：重置胜率≠删日志（见 stats_epoch/reset_stats_epoch）
 TRENDING_CMDS_PATH = OUT_DIR / "trending_cmds.json"   # 按链热榜命令落盘：用户改过即持久，重启/刷新不回默认
 TRADE_WALLETS_PATH = OUT_DIR / "trade_wallets.json"   # {chain: address} 指定用哪个绑定钱包下单（见 wallet_address）
+TRADING_MODE_PATH = OUT_DIR / "trading_mode.json"     # DATA/MANUAL/AUTO：режим переживає рестарт
 ENV_PATH = pathlib.Path.home() / ".config" / "gmgn" / ".env"
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2060,6 +2061,24 @@ def save_auto_trade_state():
     except Exception:
         pass
 
+def save_trading_mode(name: str):
+    """Режим теж має переживати рестарт. Раніше зберігався лише прапорець AUTO,
+    а `ST.mode` при старті завжди падав у SHADOW — тому після кожного деплою
+    реальний режим тихо перетворювався на паперовий, і людина цього не бачила."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        TRADING_MODE_PATH.write_text(json.dumps({"trading_mode": name}), encoding="utf-8")
+    except Exception:
+        pass
+
+def load_trading_mode() -> str | None:
+    if not TRADING_MODE_PATH.exists():
+        return None
+    try:
+        return json.loads(TRADING_MODE_PATH.read_text(encoding="utf-8")).get("trading_mode")
+    except Exception:
+        return None
+
 # 启动时把落盘的持仓加载回内存（reload/重启后持仓不丢，且与筛选榜无关）
 ST.positions = load_positions()
 
@@ -3183,23 +3202,22 @@ def api_trading_mode(m: TradingModeIn):
         spec = TRADING_MODES[want]
     else:
         raise HTTPException(400, f"невідомий режим {want!r}; доступні: DATA / MANUAL / AUTO / OFF")
-    mode, auto, needs_confirm, label = spec
-    if needs_confirm and m.confirm.strip().upper() != LIVE_CONFIRM_PHRASE:
-        raise HTTPException(400, f"режим «{label}» витрачає реальні гроші — "
-                                 f"введи {LIVE_CONFIRM_PHRASE} для підтвердження")
+    mode, auto, _needs_confirm, label = spec
     if mode == "LIVE" and LIVE_TRADING_DISABLED:
         raise HTTPException(409, "реальна торгівля заблокована прапорцем LIVE_TRADING_DISABLED")
-    with ST.lock:
-        ST.mode = mode
-        ST.auto_trade = auto
-        save_auto_trade_state()
-        try:
-            ST.use_live()
-        except Exception:
-            pass
-        n_live = sum(1 for p in ST.positions if p.get("live"))
-        log("TRADING_MODE", "-", f"{current_trading_mode()} ({label})"
-            + (f" · відкритих реальних позицій: {n_live}" if n_live else ""))
+    # **Без ST.lock.** Фоновий цикл тримає той самий замок усі 15-19 с сканування,
+    # тож перемикач ставав у чергу й nginx обривав його по таймауту (HTTP 504) —
+    # режим не змінювався взагалі. Тут лише два присвоєння (атомарні) і запис
+    # маленького файлу; сканування, що вже йде, дограє в старому режимі й завершиться,
+    # наступне піде в новому. ST.use_live() навмисно не викликаємо: адаптери вже живі,
+    # а очищення їхнього кешу посеред чужого сканування — саме та гонка, якої не треба.
+    ST.mode = mode
+    ST.auto_trade = auto
+    save_auto_trade_state()
+    save_trading_mode(current_trading_mode())
+    n_live = sum(1 for p in ST.positions if p.get("live"))
+    log("TRADING_MODE", "-", f"{current_trading_mode()} ({label})"
+        + (f" · відкритих реальних позицій: {n_live}" if n_live else ""))
     return dict(ok=True, trading_mode=current_trading_mode(), mode=ST.mode,
                 auto_trade=ST.auto_trade, live_positions=n_live,
                 trading_locked=LIVE_TRADING_DISABLED)
@@ -3512,6 +3530,10 @@ def _maybe_start_public_broadcast():
     # 等于把它们扔了：SHADOW 分支只管 auto 仓位，而自治循环的 LIVE 分支要求 mode==LIVE，
     # 于是真金白银的仓位既没有本地逃生监控、也没人补挂保本止损，只剩 GMGN 那边的条件单。
     # 有真实持仓就必须回到 LIVE —— 放弃看管已开的仓位，比不开新仓危险得多。
+    saved = load_trading_mode()
+    if saved in TRADING_MODES and not LIVE_TRADING_DISABLED:
+        ST.mode, ST.auto_trade = TRADING_MODES[saved][0], TRADING_MODES[saved][1]
+        log("TRADING_MODE", "-", f"відновлено після рестарту: {saved}")
     if any(p.get("live") for p in ST.positions) and not LIVE_TRADING_DISABLED:
         ST.mode = "LIVE"
         log("TRADING_MODE", "-",
