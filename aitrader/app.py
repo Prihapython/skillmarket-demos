@@ -1874,11 +1874,20 @@ def auto_manage_exits(chain: str) -> None:
         # 这一步不能省——GMGN 替我们平的仓，本地既没记账也没销仓，
         # 统计里就会缺掉整笔交易，而列表里留着一个永远为 0 的幽灵仓位。
         for p in [x for x in pool if x.get("_chain_closed")]:
+            # Остання нога коштує **лише те, що ще лишалось**, а не весь початковий розмір:
+            # частки, продані тейками, уже записані окремими SELL (див. _log_chain_partial),
+            # і якщо тут знову взяти orig_size_sol, та сама позиція порахується двічі.
+            rest = max(0.0, 1.0 - _f(p.get("chain_sold_frac")))
+            orig_sol = _f(p.get("orig_size_sol"))
             log("SELL", p.get("symbol", ""), f"LIVE 链上条件单已全部平仓 PnL {p.get('pnl', 0):+.1%}",
-                dict(address=p["address"], chain=chain, size_sol=p.get("orig_size_sol", 0),
-                     pnl=p.get("pnl", 0), usd_notional=_sell_usd_notional(p, p.get("orig_size_sol", 0)),
+                dict(address=p["address"], chain=chain, size_sol=round(orig_sol * rest, 6),
+                     pnl=p.get("pnl", 0), usd_notional=round(CFG["auto_size_usd"] * rest, 4),
                      auto=bool(p.get("auto")), live=True, exit_tag="LIVE_CHAIN_CLOSED",
                      entry_signal=p.get("entry_signal")))
+            if p.get("live"):
+                send_telegram(
+                    f"{'🟢' if p.get('pnl', 0) >= 0 else '🔴'} ВИХІД (LIVE)\n"
+                    f"{p.get('symbol', '')} · PnL {p.get('pnl', 0):+.1%}{_mcap_line(p)} · закрито на боці GMGN")
             ST.positions[:] = [x for x in ST.positions if x is not p]
         save_positions()
     for p in pool:
@@ -3076,9 +3085,11 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
         p["peak_price"] = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0))
         log("LIVE_TP1_DETECTED", p.get("symbol", ""),
             f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到保本")
+        _log_chain_partial(g, p, CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
     if not p.get("tp2_done") and left <= (1 - CFG["auto_tp1_sell_frac"] - CFG["auto_tp2_sell_frac"] + 0.05):
         p["tp2_done"] = True
         log("LIVE_TP2_DETECTED", p.get("symbol", ""), f"链上余额剩 {left:.0%} → 第二次止盈已成交")
+        _log_chain_partial(g, p, CFG["auto_tp2_sell_frac"], "AUTO_TP2_PARTIAL")
     # 账面持仓量跟着链上走，否则后续按比例卖出的基数是错的
     if orig > 0 and p.get("orig_size_sol"):
         p["size_sol"] = round(p["orig_size_sol"] * left, 6)
@@ -3087,6 +3098,46 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     # 每轮白白去查余额和策略单，而且这笔交易的结果永远不会进统计。
     if left <= 0.02 and orig > 0:
         p["_chain_closed"] = True
+
+def _log_chain_partial(g: "GMGNAdapter", p: dict, frac: float, tag: str) -> None:
+    """Записати як SELL той частковий тейк, який виконав сам GMGN.
+
+    Навіщо: до 2026-07-30 ці угоди не записувались узагалі — лише позначка в журналі.
+    Підсумок угоди рахувався тільки за останньою ногою, тож прибуток від тейку зникав.
+    Реальний випадок LEMO: тейк дав +$0.73, залишок вийшов на -2.1%, і вся угода
+    (+5.4% насправді) потрапила в статистику як **збиток** -2.1%.
+
+    Ціну беремо з блокчейну, а не з p["cur_price"]: продаж зробив GMGN, ми його не бачили,
+    а наш цикл міг помітити це на 12-17 с пізніше — за цей час ціна вже інша."""
+    entry = _f(p.get("entry_price"))
+    if entry <= 0:
+        return
+    fill = 0.0
+    try:
+        acts = g.wallet_activity(g.wallet_address(), limit=20).get("activities") or []
+        for a in acts:
+            if (a.get("event_type") == "sell"
+                    and ((a.get("token") or {}).get("address") or "").lower() == p["address"].lower()):
+                fill = _f(a.get("price_usd"))
+                break
+    except Exception as e:
+        log("LIVE_FILL_PRICE_FAIL", p.get("symbol", ""), f"ціна тейку з блокчейну не зчиталась: {e}")
+    if fill <= 0:
+        fill = _f(p.get("cur_price"))      # запасний варіант: краще приблизно, ніж не записати зовсім
+    if fill <= 0:
+        return
+    pnl = round((fill - entry) / entry, 4)
+    orig_sol = _f(p.get("orig_size_sol")) or _f(p.get("size_sol"))
+    log("SELL", p.get("symbol", ""), f"LIVE 链上条件单部分止盈 {frac:.0%} PnL {pnl:+.1%} · {tag}",
+        dict(address=p["address"], chain=p.get("chain", "sol"), size_sol=round(orig_sol * frac, 6),
+             pnl=pnl, usd_notional=round(CFG["auto_size_usd"] * frac, 4),
+             auto=bool(p.get("auto")), live=True, exit_tag=tag,
+             entry_signal=p.get("entry_signal"), partial=True))
+    p["chain_sold_frac"] = round(_f(p.get("chain_sold_frac")) + frac, 4)
+    if p.get("live"):
+        send_telegram(
+            f"🟡 ЧАСТКОВИЙ ТЕЙК (LIVE)\n{p.get('symbol', '')} · продано {frac:.0%} · "
+            f"PnL {pnl:+.1%}{_mcap_line(p)} · {tag}")
 
 def _live_rearm_hard_stop(g: "GMGNAdapter", p: dict) -> None:
     """Заново поставити початковий стоп -35%, коли той, що йшов у комплекті з купівлею, помер.
