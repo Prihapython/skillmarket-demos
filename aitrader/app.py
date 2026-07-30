@@ -2899,9 +2899,12 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
     log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})",
         dict(size_sol=size_sol, chain=chain, auto_gates=gates, **exit_plan()))
     if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+        # token_info не віддає готове поле капіталізації — тільки price + supply окремо
+        # (сама trending-стрічка рахує market_cap так само, з тих самих двох чисел).
+        entry_mcap = entry_price * _f(info.get("circulating_supply"))
         send_telegram(
             f"🟢 КУПІВЛЯ (LIVE)\n{symbol} · {size_sol:.4f} SOL\n"
-            f"Ціна входу: {entry_price:.8g}\n"
+            f"Капіталізація входу: ${entry_mcap:,.0f}\n"
             f"Стоп -{int(CFG['hard_stop_pct']*100)}% · "
             f"Тейк1 +{int(CFG['auto_tp1_pct']*100)}% · Тейк2 +{int(CFG['auto_tp2_pct']*100)}%\n"
             f"https://gmgn.ai/{chain}/token/{address}")
