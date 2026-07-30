@@ -25,6 +25,7 @@ app.py — GMGN AI Trader 本地后端 (FastAPI)
 
 from __future__ import annotations
 import json, os, re, subprocess, random, datetime, pathlib, threading, math, shlex, time, shutil
+import urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -50,6 +51,9 @@ TRENDING_CMDS_PATH = OUT_DIR / "trending_cmds.json"   # 按链热榜命令落盘
 TRADE_WALLETS_PATH = OUT_DIR / "trade_wallets.json"   # {chain: address} 指定用哪个绑定钱包下单（见 wallet_address）
 TRADING_MODE_PATH = OUT_DIR / "trading_mode.json"     # DATA/MANUAL/AUTO：режим переживає рестарт
 ENV_PATH = pathlib.Path.home() / ".config" / "gmgn" / ".env"
+# Окремий файл, НЕ поруч у ENV_PATH: write_env() перезаписує весь .env цілком щоразу,
+# коли зберігаються GMGN-ключі з UI — токен Telegram у тому ж файлі стирався б мовчки.
+TELEGRAM_CFG_PATH = pathlib.Path.home() / ".config" / "gmgn" / "telegram.env"
 
 # ──────────────────────────────────────────────────────────────────────────
 # 0. 硬参数（LLM 无权修改）
@@ -329,6 +333,17 @@ def load_env() -> dict:
                 v = v[1:-1]                    # 去包裹引号
             v = v.replace("\\n", "\n")         # 字面 \n → 真实换行（还原多行 PEM）
             out[k.strip()] = v
+    return out
+
+def load_telegram_cfg() -> dict:
+    """TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID — так само, як GMGN-ключі: файл 0600, ніколи не логується."""
+    if not TELEGRAM_CFG_PATH.exists():
+        return {}
+    out = {}
+    for line in TELEGRAM_CFG_PATH.read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.strip().startswith("#"):
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
     return out
 
 def load_trending_cmds() -> dict:
@@ -2103,6 +2118,25 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+def send_telegram(text: str):
+    """Сповіщення про вхід/вихід із реальних (LIVE) угод. Best-effort і навмисно неблокуюче:
+    мережевий виклик іде у фоновому потоці, щоб повільний/недоступний Telegram ніколи
+    не затримав і не зламав саму угоду. Мовчить (лише пише в журнал), якщо токен/chat_id
+    не налаштовані — TELEGRAM_CFG_PATH відсутній до першого ручного налаштування."""
+    cfg = load_telegram_cfg()
+    token, chat_id = cfg.get("TELEGRAM_BOT_TOKEN"), cfg.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    def _send():
+        try:
+            data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+            urllib.request.urlopen(
+                urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data),
+                timeout=10)
+        except Exception as e:
+            log("TELEGRAM_FAIL", "-", str(e))
+    threading.Thread(target=_send, daemon=True).start()
+
 # ──────────────────────────────────────────────────────────────────────────
 # 10b. 自动交易统计（反馈飞轮第一个真正的"读"：trade_decisions.jsonl 过去只写不读，见 SPEC §5.4）
 #      直接复用 do_sell 写进 SELL 记录里的 entry_signal + exit_tag，一行即一笔完整的已平仓交易，
@@ -2864,6 +2898,13 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
     log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})",
         dict(size_sol=size_sol, chain=chain, auto_gates=gates, **exit_plan()))
+    if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+        send_telegram(
+            f"🟢 КУПІВЛЯ (LIVE)\n{symbol} · {size_sol:.4f} SOL\n"
+            f"Ціна входу: {entry_price:.8g}\n"
+            f"Стоп -{int(CFG['hard_stop_pct']*100)}% · "
+            f"Тейк1 +{int(CFG['auto_tp1_pct']*100)}% · Тейк2 +{int(CFG['auto_tp2_pct']*100)}%\n"
+            f"https://gmgn.ai/{chain}/token/{address}")
     off = (gates or {}).get("failed") or []
     if off:
         status_msg += " · ⚠ поза стратегією: " + "; ".join(off)
@@ -3144,6 +3185,10 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
         dict(address=p["address"], chain=pchain, size_sol=p["size_sol"], pnl=pnl, usd_notional=usd_notional,
              auto=bool(p.get("auto")), live=bool(p.get("live")),   # без цього真钱 угода не потрапляє в реальну статистику
              exit_tag=exit_tag, entry_signal=p.get("entry_signal")))
+    if p.get("live"):
+        send_telegram(
+            f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
+            f"{p['symbol']} · PnL {pnl:+.1%}" + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
     ST.positions.pop(idx)
     save_positions()
     return dict(ok=True, symbol=p["symbol"])
@@ -3189,6 +3234,9 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
         dict(address=p["address"], chain=p.get("chain", "sol"), size_sol=sell_size, pnl=pnl, usd_notional=usd_notional,
              auto=bool(p.get("auto")), live=bool(p.get("live")),
              exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
+    if p.get("live"):
+        send_telegram(
+            f"🟡 ЧАСТКОВИЙ ТЕЙК (LIVE)\n{p['symbol']} · продано {frac:.0%} · PnL {pnl:+.1%} · {exit_tag}")
     p["size_sol"] = round(p["size_sol"] - sell_size, 6)
     p["tp1_done"] = True
     if exit_tag == "AUTO_TP2_PARTIAL":
