@@ -2151,6 +2151,77 @@ def _all_sell_rows() -> list[dict]:
                 _SELLS_CACHE["pos"] += cut + 1
         return list(_SELLS_CACHE["rows"])
 
+# Реальна швидкість сканування (не плутати з UI-лічильником у kpiData, який рахує
+# лише сесію з останнього рестарту): SCREEN+FILTER — це буквально кожен токен,
+# якого дійшло сканування, незалежно від того, чи була відкрита вкладка браузера.
+# Рахуємо по годинних відрах (UTC) з окремим інкрементальним курсором у той самий
+# журнал, що й _all_sell_rows — новий хвіст, а не весь файл щоразу.
+_SCAN_STATS_CACHE: dict = {"pos": 0}
+_SCAN_STATS_LOCK = threading.Lock()
+_SCAN_HOURLY: dict[str, dict] = {}   # "YYYY-MM-DDTHH" (UTC) -> {"n": рядків, "syms": set(symbol)}
+
+def _update_scan_hourly():
+    with _SCAN_STATS_LOCK:
+        if not LOG_PATH.exists():
+            _SCAN_STATS_CACHE["pos"] = 0
+            _SCAN_HOURLY.clear()
+            return
+        size = LOG_PATH.stat().st_size
+        if size < _SCAN_STATS_CACHE["pos"]:
+            _SCAN_STATS_CACHE["pos"] = 0
+            _SCAN_HOURLY.clear()
+        if size > _SCAN_STATS_CACHE["pos"]:
+            with LOG_PATH.open("rb") as f:
+                f.seek(_SCAN_STATS_CACHE["pos"])
+                blob = f.read(size - _SCAN_STATS_CACHE["pos"])
+            cut = blob.rfind(b"\n")
+            if cut >= 0:
+                for ln in blob[:cut + 1].decode("utf-8", "replace").splitlines():
+                    try:
+                        rec = json.loads(ln)
+                    except Exception:
+                        continue
+                    if rec.get("action") not in ("SCREEN", "FILTER"):
+                        continue
+                    hour = str(rec.get("ts", ""))[:13]   # "YYYY-MM-DDTHH"
+                    if not hour:
+                        continue
+                    b = _SCAN_HOURLY.setdefault(hour, {"n": 0, "syms": set()})
+                    b["n"] += 1
+                    sym = rec.get("symbol")
+                    if sym:
+                        b["syms"].add(sym)
+                _SCAN_STATS_CACHE["pos"] += cut + 1
+        # відра старші за 30г нам уже не знадобляться (вікно звіту — 24г) — не тримати їх вічно
+        cutoff_h = (datetime.datetime.now(datetime.timezone.utc)
+                    - datetime.timedelta(hours=30)).strftime("%Y-%m-%dT%H")
+        for k in [k for k in _SCAN_HOURLY if k < cutoff_h]:
+            del _SCAN_HOURLY[k]
+
+def scan_stats_24h() -> dict:
+    """Скільки токенів чекер РЕАЛЬНО оцінив за останні 24 години — незалежно від того,
+    чи була відкрита вкладка браузера і скільки разів вона питала /api/run.
+    total_decisions — кожна оцінка (той самий токен, що трендить годину, рахується
+    в кожному раунді, де він потрапив у топ-N — це не 24000 різних монет).
+    unique_symbols — за тікером, тому кілька різних токенів з однаковим тікером
+    (не рідкість на pump.fun) зіллються в один — оцінка знизу, не точна лічба адрес."""
+    _update_scan_hourly()
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
+    total = 0
+    syms: set = set()
+    with _SCAN_STATS_LOCK:
+        for hour, b in _SCAN_HOURLY.items():
+            try:
+                h_start = datetime.datetime.strptime(hour, "%Y-%m-%dT%H").replace(tzinfo=datetime.timezone.utc)
+            except Exception:
+                continue
+            if h_start + datetime.timedelta(hours=1) <= cutoff:
+                continue
+            total += b["n"]
+            syms |= b["syms"]
+    return dict(window_hours=24, total_decisions=total, unique_symbols=len(syms),
+                approx_rounds=round(total / max(CFG["top_n_prefilter"], 1)))
+
 def _load_auto_sells(live: bool | None = None) -> list[dict]:
     """全量读日志算胜率——不能像之前那样只看尾部 N 行：自主循环每轮给 top_n_prefilter(100) 个
     候选都写 SCREEN/FILTER，几分钟就能把任意固定行数窗口挤爆（真实事故：不到 1 小时日志涨到
@@ -3312,6 +3383,7 @@ def api_stats_auto(scope: str = ""):
         live = (ST.mode == "LIVE")            # за замовчуванням — статистика поточного режиму
     d = compute_auto_stats(live)
     d["scope"] = "real" if live is True else ("paper" if live is False else "all")
+    d["scans_24h"] = scan_stats_24h()
     return JSONResponse(d)
 
 @app.post("/api/stats/auto/reset")

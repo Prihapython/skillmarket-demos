@@ -684,7 +684,7 @@ const I18N={
     risk_open:'并发持仓', risk_expo:'总敞口', risk_loss:'当日亏损', risk_streak:'连亏 / kill',
     log_screen_reason:(size,pri)=>`通过闸门 · 待决策 · 建议 ${size} SOL · 优先级${pri}`,
     kpi_scan:'累计扫描', kpi_safety:'过避雷门', kpi_consensus:'过共识门', kpi_pending:'待你决策', kpi_pos:'持仓 / 上限', kpi_escape:'逃生预警', kpi_catch:'避雷命中率',
-    kpi_sub_scan:(c)=>`${c} 轮 · top-N 粗筛`, kpi_sub_block:(n)=>`拦截 ${n}`, kpi_sub_pending:'点击一键买入', kpi_sub_expo:(e)=>`敞口 ${e} SOL`,
+    kpi_sub_scan:(c)=>`${c} 轮 · top-N 粗筛`, kpi_scan_24h:(n,u)=>`24小时内 ${n} 次评估 · ${u} 个不同代号`, kpi_sub_block:(n)=>`拦截 ${n}`, kpi_sub_pending:'点击一键买入', kpi_sub_expo:(e)=>`敞口 ${e} SOL`,
     kpi_sub_escape_act:'⚠ 需立即处理', kpi_sub_escape_ok:'持仓平稳', kpi_catch_sub:'0 rug 放过',
     sig_normal:'持仓正常监控中',
     sig_top31:'top10 集中度升至 31%', sig_top45:'top10 集中度升至 45%', sig_top58:'top10 集中度升至 58%',
@@ -890,7 +890,7 @@ const I18N={
     risk_open:'Open positions', risk_expo:'Total exposure', risk_loss:'Daily loss', risk_streak:'Streak / kill',
     log_screen_reason:(size,pri)=>`passed gates · pending · suggest ${size} SOL · priority ${pri}`,
     kpi_scan:'Total scanned', kpi_safety:'Past safety', kpi_consensus:'Past consensus', kpi_pending:'Awaiting you', kpi_pos:'Positions / cap', kpi_escape:'Escape alerts', kpi_catch:'Trap catch rate',
-    kpi_sub_scan:(c)=>`${c} rounds · top-N prefilter`, kpi_sub_block:(n)=>`blocked ${n}`, kpi_sub_pending:'click to buy', kpi_sub_expo:(e)=>`exposure ${e} SOL`,
+    kpi_sub_scan:(c)=>`${c} rounds · top-N prefilter`, kpi_scan_24h:(n,u)=>`${n} evals/24h · ${u} distinct tickers`, kpi_sub_block:(n)=>`blocked ${n}`, kpi_sub_pending:'click to buy', kpi_sub_expo:(e)=>`exposure ${e} SOL`,
     kpi_sub_escape_act:'⚠ act now', kpi_sub_escape_ok:'all stable', kpi_catch_sub:'0 rugs missed',
     sig_normal:'position monitored, normal',
     sig_top31:'top10 concentration up to 31%', sig_top45:'top10 concentration up to 45%', sig_top58:'top10 concentration up to 58%',
@@ -1096,7 +1096,7 @@ const I18N={
     risk_open:'Відкриті позиції', risk_expo:'Загальна експозиція', risk_loss:'Денний збиток', risk_streak:'Серія збитків / kill',
     log_screen_reason:(size,pri)=>`пройшов ворота · очікує · пропоновано ${size} SOL · пріоритет ${pri}`,
     kpi_scan:'Всього просканов.', kpi_safety:'Пройшли безпеку', kpi_consensus:'Пройшли консенсус', kpi_pending:'Чекають вас', kpi_pos:'Позиції / ліміт', kpi_escape:'Тривоги втечі', kpi_catch:'Відсів пасток',
-    kpi_sub_scan:(c)=>`${c} раундів · top-N відсів`, kpi_sub_block:(n)=>`заблоковано ${n}`, kpi_sub_pending:'клік — купити', kpi_sub_expo:(e)=>`експозиція ${e} SOL`,
+    kpi_sub_scan:(c)=>`${c} раундів · top-N відсів`, kpi_scan_24h:(n,u)=>`${n} оцінок за 24г · ${u} різних тікерів`, kpi_sub_block:(n)=>`заблоковано ${n}`, kpi_sub_pending:'клік — купити', kpi_sub_expo:(e)=>`експозиція ${e} SOL`,
     kpi_sub_escape_act:'⚠ дійте зараз', kpi_sub_escape_ok:'все стабільно', kpi_catch_sub:'0 пасток пропущено',
     sig_normal:'позиція під моніторингом, норма',
     sig_top31:'концентрація топ10 зросла до 31%', sig_top45:'концентрація топ10 зросла до 45%', sig_top58:'концентрація топ10 зросла до 58%',
@@ -1435,6 +1435,7 @@ document.addEventListener('click',e=>{if(!e.target.closest('#chainPillWrap'))clo
 /* ── KPI ── */
 let cycles=1;         // фолбек-лічильник (коли бекенд не присилає scan_round, напр. PUBLIC_DEMO)
 let lastScanTs=null;  // мітка останнього ФАКТИЧНОГО сканування, яку ми вже врахували
+let scans24h=null;    // {window_hours,total_decisions,unique_symbols,approx_rounds} з /api/stats/auto — реальний рахунок за журналом, переживає рестарт бекенда й F5
 function passG(g){return T.filter(t=>t.died===null||t.died>g).length;}
 function killAt(g){return T.filter(t=>t.died===g).length;}
 function kpiData(){
@@ -1445,7 +1446,8 @@ function kpiData(){
   const esc=loadingScreen?0:POS.filter(p=>p.escaping).length;
   const expo=loadingScreen?0:+RISK.expo;
   return [
-    [t('kpi_scan'),'scan','var(--teal)',cycles*T.length,t('kpi_sub_scan',cycles)],
+    [t('kpi_scan'),'scan','var(--teal)',cycles*T.length,
+      t('kpi_sub_scan',cycles)+(scans24h?' · '+t('kpi_scan_24h',scans24h.total_decisions,scans24h.unique_symbols):'')],
     [t('kpi_safety'),'shield','var(--lime)',passG(1),t('kpi_sub_block',killAt(1))],
     [t('kpi_consensus'),'users','var(--lime)',passG(2),t('kpi_sub_block',killAt(2))],
     [t('kpi_pending'),'target','var(--lime)',act,t('kpi_sub_pending')],
@@ -1963,7 +1965,12 @@ async function fetchAutoStats(){
   try{
     const r=await fetch(API+'/api/stats/auto');
     if(!r.ok)return;
-    renderAutoStats(await r.json());
+    const s=await r.json();
+    // scans_24h рахується з журналу на бекенді (реальні SCREEN+FILTER рядки за 24г, не
+    // UI-опитування) незалежно від того, чи є вже закриті угоди — тому оновлюємо
+    // KPI-картку тут, а не всередині renderAutoStats (та виходить рано, коли угод 0).
+    if(s.scans_24h){scans24h=s.scans_24h;renderKpis();}
+    renderAutoStats(s);
   }catch(e){/* 静默：统计面板非关键路径 */}
 }
 function resetAutoStats(){
