@@ -1215,7 +1215,10 @@ const fill=n=>`<svg viewBox="0 0 24 24" fill="currentColor" stroke="none">${I[n]
    仅 file:// 直接打开时回退到本地端口。连不上(纯静态/GitHub Pages)→ 自动 DEMO。 */
 const API=location.protocol==='file:'?"http://127.0.0.1:8000":"";
 let source="demo", bePolling=false, liveMode=false, tradingLocked=false, autoTrade=false, autoStatsTick=0;
-let pollMs=5600, pollTimer=null, defaultTrendCmd="", curChain="sol", beReady=false, buyAmount=0.01;
+// 2 с замість 5.6 с: браузер більше не запускає власне сканування, а читає результат
+// фонового циклу (див. _SCAN_CACHE у app.py). Тобто частіше опитування не додає жодного
+// виклику до GMGN — воно лише швидше показує те, що бекенд уже порахував.
+let pollMs=2000, pollTimer=null, defaultTrendCmd="", curChain="sol", beReady=false, buyAmount=0.01;
 let onlyHeld=false;            // TOKEN 旁警告图标：只看当前持仓的币
 function toggleOnlyHeld(){
   onlyHeld=!onlyHeld;
@@ -1671,6 +1674,12 @@ async function scanCycle(){
         if(mcp){mcp.textContent=t('be_ok');mcp.style.color='var(--lime)';}
       }
       syncTradingMode(data.trading_mode);    // бекенд — джерело правди щодо режиму
+      // Темп опитування підлаштовується сам. Якщо відповідь прийшла з кешу фонового
+      // циклу — питати часто безкоштовно, це не додає викликів до GMGN. Якщо бекенд
+      // сканував сам (цикл вимкнений, режим РУЧНИЙ) — кожен запит коштує квоти,
+      // тож повертаємось до рідкісного опитування.
+      const wantMs=data.cached?2000:5600;
+      if(wantMs!==pollMs)applyPollInterval(wantMs/1000);
       const {list,risk,positions}=normalize(data);
       loadingScreen=false;                 // 拿到后端响应，结束骨架
       T=list; RISK=risk; if(positions)POS=positions; if(sel>=T.length)sel=-1;

@@ -2362,6 +2362,11 @@ def _public_broadcast_loop():
 #     跑 screen_once（复用同一套硬门槛/评分/LLM/自动开平仓逻辑，和浏览器触发的完全一样，
 #     ST.lock 保证不会跟浏览器发起的请求并发踩踏）。AUTO 关着时只空转睡眠，不烧 CLI 配额。
 # ──────────────────────────────────────────────────────────────────────────
+# chain -> (коли, результат screen_once) від фонового циклу. Браузер читає його
+# замість власного сканування; коли цикл вимкнений (режим OFF/РУЧНИЙ) — кеш порожній
+# і /api/run сканує сам, як раніше.
+_SCAN_CACHE: dict[str, tuple] = {}
+
 def _autonomous_trade_loop():
     """后台自治线程。两种模式跑的东西不同，**关键是 LIVE 也必须跑**：
 
@@ -2377,7 +2382,11 @@ def _autonomous_trade_loop():
             if ST.auto_trade and (ST.mode == "SHADOW"
                                   or (ST.mode == "LIVE" and not LIVE_TRADING_DISABLED)):
                 with ST.lock:
-                    screen_once("sol")   # 只扫 TRADEABLE_CHAINS 里唯一可交易的链
+                    # Результат кладемо в кеш, щоб браузер його **читав, а не повторював**.
+                    # Раніше вкладка запускала власне screen_once під тим самим замком:
+                    # два повні проходи замість одного, вони чекали один одного (до ~8 с
+                    # замість ~4) і вдвічі палили квоту GMGN на ті самі дані.
+                    _SCAN_CACHE["sol"] = (time.time(), screen_once("sol"))
             elif ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
                 with ST.lock:
                     if any(p.get("live") for p in ST.positions):
@@ -3290,6 +3299,16 @@ def api_run(r: RunIn):
             return JSONResponse(dict(decisions=[], portfolio=None, positions=[]))
         return JSONResponse(data)
     ch = valid_chain(r.chain)
+    # Фоновий цикл щойно сканував цей ланцюг → віддати його результат.
+    # Свіжість беремо трохи більшою за період циклу, щоб не проскочити повз
+    # черговий прохід і не влаштувати зайве сканування на межі.
+    hit = _SCAN_CACHE.get(ch)
+    if hit and (time.time() - hit[0]) < DEFAULT_POLL_S * 1.5:
+        out = dict(hit[1])
+        out.update(trading_mode=current_trading_mode(), cached=True,
+                   live_positions=sum(1 for p in ST.positions if p.get("live")),
+                   auto_size_usd=CFG["auto_size_usd"], max_auto_positions=CFG["max_auto_positions"])
+        return JSONResponse(out)
     with ST.lock:
         try:
             out = screen_once(ch)
