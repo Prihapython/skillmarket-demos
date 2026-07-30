@@ -209,8 +209,16 @@ CFG = {
     # ⚠️ 代价不是白拿的：上限放宽不会多付固定费用，但确实允许更差的成交价。
     #    5% 是覆盖已观测到的 1.93% 再留出余量，不是"越大越保险"；
     #    继续记录每单实际滑点，若长期远低于 5% 就调回来（见 WALLET_PLAN 阶段 3）。
-    "live_slippage_buy": 5.0,
-    "live_slippage_sell": 5.0,
+    # 2026-07-30，把 5% 提到 20%：10 笔真实交易的完整复盘显示，**止损触发后成交失败 4/5**，
+    # 而同一批交易里止盈成交成功 5/6。同一个钱包、同一组参数、同一笔单，差别只在方向——
+    # 止盈卖在上涨里（有人接），止损卖在崩盘里（没人接，价格一个区块就穿过触发价）。
+    # 5% 的容忍度在崩盘瞬间必然被击穿，于是整笔卖单直接回滚：不是"卖差了"，是**根本没卖出去**，
+    # 仓位继续往 -70% 掉。放宽不是多付费用，只是允许更差的成交价——没成交的止损比 -42% 成交贵得多。
+    # ⚠️ swap 只有**一个** --slippage，同时管买入和它挂上去的条件单卖出，无法只放宽止损那一侧
+    #    （swap 没有 --sell-param）。买入实测滑点 0.62%/1.28%/1.93%，20% 的上限对买入几乎不触发。
+    # 待验证（见 NEXT.md 步骤 4）：成交率是否回升、实际成交价比 -35% 差多少、买入价是否变差。
+    "live_slippage_buy": 20.0,
+    "live_slippage_sell": 20.0,
     # SOL 上挂条件单（--condition-orders）时，priority-fee 与 tip-fee 是**必填**，不是可选优化。
     "live_priority_fee_sol": 0.0001,
     "live_tip_fee_sol": 0.0001,
@@ -226,6 +234,10 @@ CFG = {
     # 移动止损重挂的滞后阈值：止损价变化不到这个比例就不重挂，省掉无谓的撤单+建单两次 API。
     # 峰值只升不降 → 止损价只升不降，所以这里不会出现来回抖动，只是"攒够一步再走"。
     "live_stop_resync_pct": 0.02,
+    # Як часто окремий потік перевіряє ціну відкритих LIVE-позицій (див. _live_price_watch_loop).
+    # 3 с — компроміс: головний цикл дає ~20 с і пропускає різкі обвали, а частіше палити
+    # квоту GMGN немає сенсу, бо це один виклик на позицію щоразу (максимум 5 позицій).
+    "live_price_poll_s": 3.0,
     # ── LIVE 容量上限 ───────────────────────────────────────────────────────
     # ⚠️ 只作用于 LIVE。SHADOW 侧的数量类上限是**用户明确要求移除**的（为了不拖慢统计积累），
     #    这里绝不能顺手加回去——那会直接改变正在收集的样本。
@@ -2614,6 +2626,61 @@ def _autonomous_trade_loop():
             log("AUTOLOOP_ERR", "-", str(e))
         time.sleep(DEFAULT_POLL_S)
 
+def _live_price_watch_loop():
+    """Швидка перевірка ціни для відкритих LIVE-позицій — окремо від головного циклу.
+
+    Навіщо окремо: головний цикл тримає ST.lock увесь screen_once (12-17 с на сервері),
+    тож ціна позиції перевірялась раз на ~20 с. Обвал Hardy 2026-07-30 стався й відкотився
+    **між** двома перевірками: локальний стоп не побачив його взагалі, а ордер на боці GMGN
+    у цей момент провалився — позиція лишилась без жодного захисту.
+
+    Тут лише ціна (один дешевий виклик на позицію) і лише **повний** вихід: стоп, трейлінг,
+    escape. Часткові тейки навмисно не чіпаємо — ними займаються умовні ордери GMGN
+    і головний цикл, а дублювати їх звідси означало б продати 30% двічі.
+
+    Мережеві виклики — поза замком; замок береться лише на застосування результату,
+    інакше цей цикл просто стояв би в черзі за screen_once і не був би швидким."""
+    while True:
+        try:
+            if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+                with ST.lock:
+                    watch = [(p["address"], p.get("chain", "sol"))
+                             for p in ST.positions if p.get("live")]
+                prices = {}
+                for addr, ch in watch:          # поза замком: тут мережа, вона повільна
+                    try:
+                        prices[addr] = ST.adapter_for(ch).token_price(addr)
+                    except Exception:
+                        pass                    # не дістали ціну → цю позицію просто пропускаємо
+                if prices:
+                    with ST.lock:
+                        for p in list(ST.positions):
+                            if not p.get("live"):
+                                continue
+                            np_ = _f(prices.get(p["address"]))
+                            ep = _f(p.get("entry_price"))
+                            if np_ <= 0 or ep <= 0:
+                                continue
+                            p["cur_price"] = np_
+                            p["pnl"] = round((np_ - ep) / ep, 4)
+                            d = _auto_decide_exit(p)
+                            if not d or d[0] != "full":
+                                continue
+                            # Той самий поділ обов'язків, що в auto_manage_exits: поки на боці
+                            # GMGN живий ордер, цінові виходи — його справа, наша тут лише втеча.
+                            if d[-1] != "AUTO_ESCAPE":
+                                protected = (p.get("live_stop_id") if p.get("tp1_done")
+                                             else p.get("live_strategy_id"))
+                                if protected:
+                                    continue
+                            try:
+                                do_sell(p["address"], exit_tag=d[1])
+                            except Exception as e:
+                                log("AUTO_SELL_FAIL", p.get("symbol", ""), str(e))
+        except Exception as e:
+            log("PRICEWATCH_ERR", "-", str(e))
+        time.sleep(CFG["live_price_poll_s"])
+
 def _dev_reject_reason(f) -> str:
     """dev 评分过滤的拒绝理由（demo 风格：点明工厂号/换皮/喷币/已清仓）。"""
     dp = f.dev or {}
@@ -2985,6 +3052,11 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
             p["live_strategy_id"] = None
             log("LIVE_STOPLOSS_LOST", p.get("symbol", ""),
                 "⚠ 链上止损已失效（触发失败或被撤），本地逻辑接管")
+            # 立刻补挂一张新的：2026-07-30 复盘发现，止损失效**几乎总是发生在第一次止盈之前**，
+            # 而 _live_arm_stop 只在 tp1_done 之后才动作——也就是说这段时间仓位实际上**完全裸奔**，
+            # 只剩每 12-17 秒一次的本地轮询，而它连 Hardy 那种插针式暴跌都看不见（跌穿又弹回，
+            # 两次轮询之间就结束了）。补挂用的是同一个 -35% 触发价，只是这次带 20% 滑点容忍度。
+            _live_rearm_hard_stop(g, p)
 
     # ── 自愈 2：补回建仓数量 ─────────────────────────────────────────────
     # 建仓后立刻读余额常常拿到 0（成交与索引之间有延迟）。只要还没发生过部分止盈，
@@ -3015,6 +3087,54 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     # 每轮白白去查余额和策略单，而且这笔交易的结果永远不会进统计。
     if left <= 0.02 and orig > 0:
         p["_chain_closed"] = True
+
+def _live_rearm_hard_stop(g: "GMGNAdapter", p: dict) -> None:
+    """Заново поставити початковий стоп -35%, коли той, що йшов у комплекті з купівлею, помер.
+
+    Потрібно саме до першого тейку: після нього трейлінг веде `_live_arm_stop`, а **до** нього
+    єдиним захистом був умовний ордер від GMGN — і якщо він провалився, не лишалось нічого.
+
+    Якщо ціна вже нижча за стоп (обвал уже стався, а ордер не спрацював) — ставити новий
+    ордер немає сенсу, він одразу спрацює й може провалитись так само. Тоді продаємо ринком
+    просто зараз: краще вийти із запізненням, ніж лишитись у падінні без виходу."""
+    if not p.get("live") or p.get("tp1_done") or p.get("live_stop_id"):
+        return
+    entry = _f(p.get("entry_price"))
+    if entry <= 0:
+        return
+    want = entry * (1 - CFG["hard_stop_pct"])
+    cur = _f(p.get("cur_price"))
+    if cur > 0 and cur <= want:
+        log("LIVE_STOP_LATE_EXIT", p.get("symbol", ""),
+            f"⚠ ціна вже {cur / entry - 1:+.1%} — нижче стопа, виходимо ринком негайно")
+        try:
+            do_sell(p["address"], exit_tag="AUTO_SL_LATE")
+        except Exception as e:
+            log("SELL_FAIL", p.get("symbol", ""), f"аварійний вихід після провалу стопа: {e}")
+        return
+    try:
+        wallet = g.wallet_address()
+        bal = g.token_balance(wallet, p["address"])
+        if bal <= 0:
+            return
+        dec = g.token_decimals(p["address"])
+        r = g.strategy_create_stop(
+            wallet=wallet, base_token=p["address"],
+            quote_token=native_token(p.get("chain", "sol")),
+            check_price=want,
+            amount_in=int(bal * (10 ** dec)),
+            slippage=CFG["live_slippage_sell"],
+            priority_fee=CFG["live_priority_fee_sol"], tip_fee=CFG["live_tip_fee_sol"])
+        sid = r.get("order_id")
+        if not sid:
+            raise RuntimeError(f"немає order_id: {r}")
+        p["live_stop_id"] = sid
+        p["live_stop_price"] = want
+        log("LIVE_STOP_REARMED", p.get("symbol", ""),
+            f"стоп перевстановлено @ {want:.10g} (-{int(CFG['hard_stop_pct'] * 100)}%)")
+    except Exception as e:
+        log("LIVE_NO_STOPLOSS", p.get("symbol", ""),
+            f"⚠ не вдалось перевстановити стоп, лишається лише локальний цикл: {e}")
 
 def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
     """把 GMGN 侧的止损单对齐到 trailing_stop_price() 算出的价格（只在第一次止盈后需要）。
@@ -3810,6 +3930,9 @@ def _maybe_start_public_broadcast():
     # 自主交易循环：无论 PUBLIC_DEMO 与否、无论有没有浏览器连着，都启动——
     # AUTO 开关本身已经是"是否真的跑"的开关（见 _autonomous_trade_loop 内的判断）。
     threading.Thread(target=_autonomous_trade_loop, daemon=True).start()
+    # Швидкий нагляд за ціною відкритих LIVE-позицій. Окремий потік навмисно: головний
+    # цикл зайнятий скануванням ринку по 12-17 с і на цей час просто не бачить позицію.
+    threading.Thread(target=_live_price_watch_loop, daemon=True).start()
 
 if __name__ == "__main__":
     import uvicorn
