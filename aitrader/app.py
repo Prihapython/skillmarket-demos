@@ -3134,6 +3134,28 @@ def _block_if_public():
     if PUBLIC_DEMO:
         raise HTTPException(403, "公开演示为只读模式，已禁用写操作")
 
+_BUILD_ID: str | None = None
+def _build_id() -> str:
+    """Коротка мітка збірки для кутка інтерфейсу.
+
+    Потрібна суто діагностично: браузер може тримати стару сторінку, і тоді
+    «не працює» означає «у мене інший код», а не «на сервері зламано». Без мітки
+    це з'ясовується довгим листуванням; з міткою — одним поглядом."""
+    global _BUILD_ID
+    if _BUILD_ID is None:
+        try:
+            out = subprocess.run(["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=5)
+            _BUILD_ID = (out.stdout or "").strip() or "?"
+        except Exception:
+            _BUILD_ID = "?"
+        try:    # мітка часу файлу фронтенду: ловить випадок «код новий, сторінка стара»
+            _BUILD_ID += "/" + datetime.datetime.fromtimestamp(
+                (STATIC_DIR / "index.html").stat().st_mtime).strftime("%H:%M")
+        except Exception:
+            pass
+    return _BUILD_ID
+
 @app.get("/api/status")
 def api_status():
     """前端加载时探测：后端是否已就绪（环境有 key + 已切真实适配器），免去重填。
@@ -3145,6 +3167,7 @@ def api_status():
                 # реального режиму називало **справжні** числа. Зашите в текст «$20»
                 # розійшлося з конфігом тієї ж миті, як розмір змінили на $2.
                 auto_size_usd=CFG["auto_size_usd"], max_auto_positions=CFG["max_auto_positions"],
+                build=_build_id(),
                 has_key=bool(load_env().get("GMGN_API_KEY")),
                 trading_locked=LIVE_TRADING_DISABLED, public_demo=PUBLIC_DEMO,
                 trending_cmd=ST.get_trending_cmd(ST.chain), auto_trade=ST.auto_trade)

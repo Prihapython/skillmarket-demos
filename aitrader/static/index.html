@@ -441,6 +441,7 @@ td{padding:5px 10px;vertical-align:middle}
         <button id="tmManual" onclick="setTradingMode('MANUAL')" data-i18n="tm_manual">РУЧНИЙ</button>
         <button id="tmAuto"   onclick="setTradingMode('AUTO')"   data-i18n="tm_auto">АВТО</button>
       </div>
+      <span id="buildLbl" title="версія збірки" style="font-family:var(--mono);font-size:9px;color:var(--dim2);align-self:center;padding:0 2px"></span>
       <div class="langbtn" id="langBtn" data-i18n-title="lang_title" onclick="switchLang()">中文</div>
       <div class="gear" id="gearBtn" data-i18n-title="gear_title"></div>
     </div>
@@ -2535,6 +2536,9 @@ async function autoConnect(){
     const r=await fetch(API+'/api/status'); if(!r.ok)throw 0;
     const d=await r.json(); beReady=!!d.has_key; tradingLocked=!!d.trading_locked;
     autoSizeUsd=d.auto_size_usd; maxAutoPos=d.max_auto_positions;
+    // Мітка збірки в кутку: одразу видно, чи браузер тримає стару сторінку.
+    const bl=document.getElementById('buildLbl');
+    if(bl)bl.textContent=d.build||'';
     syncTradingMode(d.trading_mode);       // показати справжній режим одразу, а не після першого циклу
     if(d.public_demo){
       // 公开只读演示：后端定时广播真实筛选缓存。锁定 UI 为只读，链跟随后端。
