@@ -408,7 +408,6 @@ td{padding:5px 10px;vertical-align:middle}
 <div class="grain"></div>
 <div class="app">
 
-  <div class="demobar" id="demoBar" data-i18n="demobar"></div>
   <div class="demobar publicbar" id="publicBar" data-i18n="publicbar"></div>
 
   <div class="bar">
@@ -434,7 +433,6 @@ td{padding:5px 10px;vertical-align:middle}
       </div>
       <div class="pill mode clk" id="modePillWrap" onclick="toggleMode()" data-i18n-title="mode_toggle_title"><span class="dot" id="modeDot" style="background:var(--amber)"></span><div><span class="k">MODE</span><span class="v" id="modePill">模拟盘</span></div></div>
       <div class="pill auto" id="autoPillWrap" onclick="toggleAuto()" data-i18n-title="auto_toggle_title"><span class="dot" id="autoDot" style="background:var(--dim2)"></span><div><span class="k">AUTO</span><span class="v" id="autoPill" data-i18n="auto_off">关闭</span></div></div>
-      <div class="seg2"><button id="srcDemo" class="on" onclick="setSource('demo')">DEMO</button><button id="srcBe" onclick="setSource('backend')" data-i18n="src_backend">本地后端</button></div>
       <div class="langbtn" id="langBtn" data-i18n-title="lang_title" onclick="switchLang()">中文</div>
       <div class="gear" id="gearBtn" data-i18n-title="gear_title"></div>
     </div>
@@ -583,6 +581,9 @@ const I18N={
     mw_unreal:'未实现',
     confirm_live_type:'切换到实盘将动用真实资金。请输入 LIVE 确认：',
     confirm_live_bad:'确认串不匹配，仍停留在模拟盘',
+    be_ok:'已连接',
+    be_down:'未连接',
+    be_down_hint:'连不上后端 —— 页面不会显示任何数据（DEMO 假数据模式已移除）',
     funnel_h3:'闸门漏斗 · ',
     cfg_h2:'配置 · GMGN 凭据',
     cfg_apikey_ph:'留空 = 沿用 ~/.config/gmgn/.env 已有 key',
@@ -778,6 +779,9 @@ const I18N={
     mw_unreal:'unrealized',
     confirm_live_type:'Switching to LIVE will spend real funds. Type LIVE to confirm:',
     confirm_live_bad:'Confirmation did not match — staying in SHADOW',
+    be_ok:'connected',
+    be_down:'no backend',
+    be_down_hint:'Cannot reach the backend — nothing will be shown (the DEMO fake-data mode was removed)',
     funnel_h3:'Gate Funnel · ',
     cfg_h2:'Configure · GMGN Credentials',
     cfg_apikey_ph:'Leave empty = reuse existing key in ~/.config/gmgn/.env',
@@ -963,6 +967,19 @@ const I18N={
     log_h3:'Журнал рішень наживо · trade_decisions.jsonl',
     funneltog_title:'Розгорнути / згорнути',
     esc_h3:'Моніторинг втечі з позицій',
+    mw_h3:'Мій гаманець · реальний баланс',
+    mw_empty:'Гаманець не прив\'язаний (перевір Trading Wallets у GMGN API-ключі)',
+    mw_err:'Не вдалось прочитати гаманець',
+    mw_stale:'дані застаріли',
+    mw_trade:'торговий',
+    mw_ambiguous:'Прив\'язано кілька гаманців, не вказано який торговий — задай у outputs/trade_wallets.json',
+    mw_holdings:'позиції',
+    mw_unreal:'нереалізовано',
+    confirm_live_type:'Перехід у реальну торгівлю витрачатиме справжні гроші. Введи LIVE для підтвердження:',
+    confirm_live_bad:'Підтвердження не збіглось — лишаємось у SHADOW',
+    be_ok:'з\'єднано',
+    be_down:'немає зв\'язку',
+    be_down_hint:'Бекенд недоступний — дані не показуються (режим DEMO з фальшивими даними прибрано)',
     funnel_h3:'Вирва воріт · ',
     cfg_h2:'Налаштування · Ключі GMGN',
     cfg_apikey_ph:'Залиште порожнім = використати наявний ключ з ~/.config/gmgn/.env',
@@ -1319,7 +1336,9 @@ function seedPositions(){return [
  {sym:'LATEMOON',address:'2MfTqVrJkHx9pQ3mKvR7tWn4bYj6cLwZ8sFgUaXpBn5dz',size:0.01,pnl:-0.21,severity:62,escaping:false,_frozen:true,entryPrice:0.05,price:0.0395,sigs:[{k:'sig_top45',hot:false},{k:'sig_5mweak',hot:false}]},
  {sym:'RUGRUN',address:'RUGRUNzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz',size:0.01,pnl:-0.61,severity:88,escaping:true,entryPrice:0.003,price:0.00117,sigs:[{k:'sig_mintback',hot:true},{k:'sig_top58',hot:true}]},
 ];}
-let POS=seedPositions();
+// 起始为空，不再用 seedPositions() 的示例持仓打底：页面刚打开、真实数据还没到的
+// 那几秒里，屏幕上出现的必须是"还没有数据"，而不是一屏看起来像真的假仓位。
+let POS=[];
 
 let RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};
 const P=x=>Math.round(x*100)+'%';
@@ -1529,7 +1548,7 @@ function renderFunnel(){
    后端 /api/mywallets 自带 45s 缓存，这里按 30s 轮询即可（不跟随扫描节奏，免得白烧配额）。*/
 let MW=null, mwTimer=null;
 async function loadMyWallet(force){
-  if(source==='demo') return;            // 纯静态 Demo 没有后端，别发请求
+  if(!beReady) return;                   // бекенд не готовий — не смикаємо його дарма
   try{
     const r=await fetch(API+'/api/mywallets?chain='+encodeURIComponent(curChain)+(force?'&refresh=true':''));
     if(!r.ok) throw new Error('HTTP '+r.status);
@@ -1617,7 +1636,7 @@ async function scanCycle(){
       if(beFailStreak>0){                    // 之前连续失败过 → 这轮成功了，把提示状态清掉
         beFailStreak=0;
         const mcp=document.getElementById('mcpPill');
-        if(mcp){mcp.textContent='LIVE';mcp.style.color='var(--lime)';}
+        if(mcp){mcp.textContent=t('be_ok');mcp.style.color='var(--lime)';}
       }
       syncBackendMode(data.mode);            // 后端真实 mode 同步到开关（重启后端会回 SHADOW，避免开关停留 LIVE 误导）
       syncAutoTrade(data.auto_trade);        // 同上，同步自动交易开关
@@ -1639,34 +1658,22 @@ async function scanCycle(){
     finally{scanInFlight=false;sc.classList.remove('on');}
     return;
   }
-  // demo
-  sc.classList.add('on');
-  const rows=[...document.querySelectorAll('#rows tr')];
-  rows.forEach((r,i)=>setTimeout(()=>{r.classList.add('ping');setTimeout(()=>r.classList.remove('ping'),700);},i*90));
-  setTimeout(()=>{cycles++;driftPositions();renderAll(true);telemetry();sc.classList.remove('on');},rows.length*90+250);
+  // 没有后端就什么都不做。这里以前跑的是 DEMO 动画：让假持仓随机漂移，看着像在实时更新。
 }
 
-/* ── source toggle ── */
+/* ── 连接后端 ──
+   DEMO 模式（合成行情 + 假持仓）已整体移除：这一屏显示的是真金白银的仓位，
+   「看起来像真的」比「明确没有」危险得多。连不上后端就摆明连不上，不再编数据。 */
 function setSource(s){
-  source=s;bePolling=false;
-  document.getElementById('srcDemo').classList.toggle('on',s==='demo');
-  document.getElementById('srcBe').classList.toggle('on',s==='backend');
-  document.getElementById('demoBar').classList.toggle('on',s==='demo');  // 演示横幅仅 DEMO 显示
+  source='backend';bePolling=false;
   const mcp=document.getElementById('mcpPill');
-  if(s==='backend'){mcp.textContent='LIVE';mcp.style.color='var(--lime)';
-    if(beReady){bePolling=true;scanCycle();}              // 环境已有 key，直接轮询，不弹框
-    else{toast(t('toast_be_switched'),'ok');openCfg();}
-    resetWalletView();   // 切回真实后端：清掉 DEMO 假数据，避免误认成真实查询结果
-    fetchAutoStats();
-    loadMyWallet(true);                                   // 真实余额：切过来立刻拉一次
-    if(!mwTimer) mwTimer=setInterval(loadMyWallet,30000);  // 之后 30s 一次（后端另有 45s 缓存兜底）
-  }
-  else{
-    if(mwTimer){clearInterval(mwTimer);mwTimer=null;}
-    MW=null;renderMyWallet();          // DEMO 不展示真实余额：宁可空着，也不能拿假数字冒充链上钱mcp.textContent='DEMO';mcp.style.color='var(--amber)';loadingScreen=false;T=freshSeed();POS=seedPositions();RISK={open:1,openMax:20,expo:0.2857,expoMax:1.0,loss:0,lossMax:0.5,consec:0,consecMax:3,killed:false};sel=-1;cycles=1;renderAll(false);if(feed)feed.innerHTML='';logScreen();
-    showWalletDemo();   // 切到 DEMO：钱包评估也给一份假地址+假结果，只演示布局
-    autoTrade=false;applyAutoLabel();renderAutoStats(null);   // DEMO 无后端自动交易，拨钮回默认关闭
-  }
+  if(mcp){mcp.textContent=t('be_ok');mcp.style.color='var(--lime)';}
+  if(beReady){bePolling=true;scanCycle();}                // 环境已有 key，直接轮询，不弹框
+  else{toast(t('toast_be_switched'),'ok');openCfg();}
+  resetWalletView();
+  fetchAutoStats();
+  loadMyWallet(true);                                     // 真实余额：立刻拉一次
+  if(!mwTimer) mwTimer=setInterval(loadMyWallet,30000);   // 之后 30s 一次（后端另有 45s 缓存兜底）
 }
 
 /* ── config modal ── */
@@ -2043,7 +2050,6 @@ function applyI18n(){
   applyLiveLabel();
   renderAll(false);
   if(typeof wltData!=='undefined'&&wltData&&typeof renderWallet==='function')renderWallet();  // 已评估的钱包随语言重渲染
-  if(source==='demo'){if(feed)feed.innerHTML='';logScreen();}   // 重置日志为当前语言
 }
 function switchLang(){lang=(lang==='uk'?'zh':lang==='zh'?'en':'uk');localStorage.setItem('aitrader_lang',lang);applyI18n();}
 
@@ -2477,10 +2483,16 @@ async function autoConnect(){
       toast(t('toast_connected',CHAIN_LABEL[curChain]),'ok');
       return;
     }
-    throw 0;                                 // 有后端但没 key → 也退回演示
+    throw 0;                                 // 有后端但没 key
   }catch(e){
-    // 连不上后端（如 GitHub Pages 静态托管）/无 key → 自动进 DEMO 演示，显示示例数据
-    setSource('demo');
+    // 连不上后端或没配 key。以前这里自动退到 DEMO，页面照样显示一屏合成的持仓和榜单——
+    // 看上去一切正常，实际全是假的。这一屏真金白银的仓位数字必须**要么真、要么没有**，
+    // 绝不能是"像真的"。现在直接摆明连不上，什么都不编。
+    setSource('backend');
+    beReady=false;bePolling=false;
+    const mcp=document.getElementById('mcpPill');
+    if(mcp){mcp.textContent=t('be_down');mcp.style.color='var(--amber)';}
+    toast(t('be_down_hint'),'err');
   }
 }
 function initResize(){
