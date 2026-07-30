@@ -593,7 +593,7 @@ const I18N={
     tm_data:'采集数据', tm_manual:'手动', tm_auto:'自动', tm_off:'已停止',
     tm_switched:(m)=>`模式：${m}`,
     tm_warn_manual:'手动 —— 真实资金。你决定何时买入，卖出由机器人管（止损/止盈/移动止损）。',
-    tm_warn_auto:'自动 —— 真实资金。机器人自己选币、自己按 $20 建仓、自己平仓，最多 5 笔并发，无人值守且重启后继续。',
+    tm_warn_auto:(sz,mx)=>`自动 —— 真实资金。机器人自己选币、自己按 $${sz} 建仓、自己平仓，最多 ${mx} 笔并发（在场上限 $${(sz*mx).toFixed(0)}），无人值守且重启后继续。`,
     be_ok:'已连接',
     be_down:'未连接',
     be_down_hint:'连不上后端 —— 页面不会显示任何数据（DEMO 假数据模式已移除）',
@@ -741,6 +741,7 @@ const I18N={
     partial_lbl:'部分',
     stats_h3:'自动交易统计', stats_none:'暂无已平仓的自动交易',
     scope_paper:'纸面', scope_real:'真实资金', scope_all:'混合',
+    tm_no_cfg:'尚未拿到后端参数，稍后再试',
     stats_total:(n)=>`${n} 笔`, stats_winrate:'胜率', stats_pnl:'累计 PnL',
     period_day:'按日', period_week:'按周', period_month:'按月',
     stats_reset_btn:'↺ 重置', stats_reset_title:'重置胜率显示',
@@ -797,7 +798,7 @@ const I18N={
     tm_data:'DATA', tm_manual:'MANUAL', tm_auto:'AUTO', tm_off:'OFF',
     tm_switched:(m)=>`Mode: ${m}`,
     tm_warn_manual:'MANUAL — real money. You choose entries; the bot still runs the exits (stop, takes, trailing).',
-    tm_warn_auto:'AUTO — real money. The bot picks tokens, buys \$20 positions and exits them on its own, up to 5 at once, unattended and across restarts.',
+    tm_warn_auto:(sz,mx)=>`AUTO — real money. The bot picks tokens, buys $${sz} positions and exits them on its own, up to ${mx} at once, so $${(sz*mx).toFixed(0)} deployed at most. Unattended, and it survives restarts.`,
     be_ok:'connected',
     be_down:'no backend',
     be_down_hint:'Cannot reach the backend — nothing will be shown (the DEMO fake-data mode was removed)',
@@ -945,6 +946,7 @@ const I18N={
     partial_lbl:'partial',
     stats_h3:'Auto-trade stats', stats_none:'No closed auto-trades yet',
     scope_paper:'paper', scope_real:'real money', scope_all:'mixed',
+    tm_no_cfg:'Backend parameters not loaded yet - try again in a second',
     stats_total:(n)=>`${n} trades`, stats_winrate:'win rate', stats_pnl:'total PnL',
     period_day:'By day', period_week:'By week', period_month:'By month',
     stats_reset_btn:'↺ Reset', stats_reset_title:'Reset win-rate display',
@@ -1001,7 +1003,7 @@ const I18N={
     tm_data:'ЗБІР ДАНИХ', tm_manual:'РУЧНИЙ', tm_auto:'АВТО', tm_off:'ВИМКНЕНО',
     tm_switched:(m)=>`Режим: ${m}`,
     tm_warn_manual:'РУЧНИЙ — реальні гроші. Входиш ти, виходами керує бот (стоп, тейки, трейлінг).',
-    tm_warn_auto:'АВТО — реальні гроші. Бот сам обирає токени, сам купує на $20 і сам продає. До 5 позицій одночасно. Працює без тебе, переживає перезапуск.',
+    tm_warn_auto:(sz,mx)=>`АВТО — реальні гроші. Бот сам обирає токени, сам купує на $${sz} і сам продає. До ${mx} позицій одночасно, тобто максимум $${(sz*mx).toFixed(0)} у ринку. Працює без тебе, переживає перезапуск.`,
     be_ok:'з\'єднано',
     be_down:'немає зв\'язку',
     be_down_hint:'Бекенд недоступний — дані не показуються (режим DEMO з фальшивими даними прибрано)',
@@ -1149,6 +1151,7 @@ const I18N={
     partial_lbl:'частково',
     stats_h3:'Статистика автотрейду', stats_none:'Ще немає закритих угод автотрейду',
     scope_paper:'папір', scope_real:'реальні гроші', scope_all:'змішано',
+    tm_no_cfg:'Ще не отримано параметри від бекенда — спробуй за секунду',
     stats_total:(n)=>`${n} угод`, stats_winrate:'вінрейт', stats_pnl:'сумарний PnL',
     period_day:'По днях', period_week:'По тижнях', period_month:'По місяцях',
     stats_reset_btn:'↺ Скинути', stats_reset_title:'Скинути показ вінрейту',
@@ -1788,6 +1791,9 @@ const TM_STYLE={
   OFF:   {color:'var(--dim2)',  real:false},
 };
 let tradingMode='OFF', tmInFlight=false;
+// Числа приходять з бекенда (/api/status). Тримати їх копію в тексті попередження
+// не можна — саме так у вікні лишилось «$20» після того, як розмір змінили на $2.
+let autoSizeUsd=null, maxAutoPos=null;
 
 function applyTradingMode(){
   const st=TM_STYLE[tradingMode]||TM_STYLE.OFF;
@@ -1822,7 +1828,16 @@ async function setTradingMode(target){
   if(st?.real&&tradingLocked){toast(t('toast_trade_locked'),'err');return;}
   let confirmStr='';
   if(st?.real){
-    const ok=await new Promise(res=>confirmDialog(t('confirm_live_title'),t('tm_warn_'+target.toLowerCase()),()=>res(true),()=>res(false)));
+    // Не питати підтвердження, поки не знаємо справжніх цифр — інакше попередження
+    // назве неправильну суму, а це саме той текст, на підставі якого людина вирішує.
+    if(target==='AUTO'&&(autoSizeUsd==null||maxAutoPos==null)){
+      toast(t('tm_no_cfg'),'err');
+      try{const s=await(await fetch(API+'/api/status')).json();
+          autoSizeUsd=s.auto_size_usd;maxAutoPos=s.max_auto_positions;}catch(e){}
+      return;
+    }
+    const warn=(target==='AUTO')?t('tm_warn_auto',autoSizeUsd,maxAutoPos):t('tm_warn_manual');
+    const ok=await new Promise(res=>confirmDialog(t('confirm_live_title'),warn,()=>res(true),()=>res(false)));
     if(!ok)return;
     const s=window.prompt(t('confirm_live_type'));
     if(s===null)return;
@@ -2483,6 +2498,7 @@ async function autoConnect(){
   try{
     const r=await fetch(API+'/api/status'); if(!r.ok)throw 0;
     const d=await r.json(); beReady=!!d.has_key; tradingLocked=!!d.trading_locked;
+    autoSizeUsd=d.auto_size_usd; maxAutoPos=d.max_auto_positions;
     syncTradingMode(d.trading_mode);       // показати справжній режим одразу, а не після першого циклу
     if(d.public_demo){
       // 公开只读演示：后端定时广播真实筛选缓存。锁定 UI 为只读，链跟随后端。

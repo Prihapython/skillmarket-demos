@@ -3113,6 +3113,10 @@ def api_status():
     return dict(live_adapter=ST.is_live_adapter, chain=ST.chain, mode=ST.mode,
                 trading_mode=current_trading_mode(),
                 live_positions=sum(1 for p in ST.positions if p.get("live")),
+                # Розмір і ліміт віддаємо назовні, щоб попередження перед вмиканням
+                # реального режиму називало **справжні** числа. Зашите в текст «$20»
+                # розійшлося з конфігом тієї ж миті, як розмір змінили на $2.
+                auto_size_usd=CFG["auto_size_usd"], max_auto_positions=CFG["max_auto_positions"],
                 has_key=bool(load_env().get("GMGN_API_KEY")),
                 trading_locked=LIVE_TRADING_DISABLED, public_demo=PUBLIC_DEMO,
                 trending_cmd=ST.get_trending_cmd(ST.chain), auto_trade=ST.auto_trade)
