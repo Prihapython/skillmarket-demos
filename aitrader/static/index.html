@@ -431,8 +431,7 @@ td{padding:5px 10px;vertical-align:middle}
           <div data-ch="robinhood" onclick="switchChain('robinhood')">Robinhood</div>
         </div>
       </div>
-      <div class="pill mode clk" id="modePillWrap" onclick="toggleMode()" data-i18n-title="mode_toggle_title"><span class="dot" id="modeDot" style="background:var(--amber)"></span><div><span class="k">MODE</span><span class="v" id="modePill">模拟盘</span></div></div>
-      <div class="pill auto" id="autoPillWrap" onclick="toggleAuto()" data-i18n-title="auto_toggle_title"><span class="dot" id="autoDot" style="background:var(--dim2)"></span><div><span class="k">AUTO</span><span class="v" id="autoPill" data-i18n="auto_off">关闭</span></div></div>
+      <div class="pill mode clk" id="tmWrap" onclick="cycleTradingMode()" data-i18n-title="tm_title"><span class="dot" id="tmDot" style="background:var(--dim2)"></span><div><span class="k" data-i18n="tm_k">РЕЖИМ</span><span class="v" id="tmPill">—</span></div></div>
       <div class="langbtn" id="langBtn" data-i18n-title="lang_title" onclick="switchLang()">中文</div>
       <div class="gear" id="gearBtn" data-i18n-title="gear_title"></div>
     </div>
@@ -581,6 +580,11 @@ const I18N={
     mw_unreal:'未实现',
     confirm_live_type:'切换到实盘将动用真实资金。请输入 LIVE 确认：',
     confirm_live_bad:'确认串不匹配，仍停留在模拟盘',
+    tm_k:'模式', tm_title:'点击切换：采集数据 → 手动 → 自动',
+    tm_data:'采集数据', tm_manual:'手动', tm_auto:'自动', tm_off:'已停止',
+    tm_switched:(m)=>`模式：${m}`,
+    tm_warn_manual:'手动 —— 真实资金。你决定何时买入，卖出由机器人管（止损/止盈/移动止损）。',
+    tm_warn_auto:'自动 —— 真实资金。机器人自己选币、自己按 $20 建仓、自己平仓，最多 5 笔并发，无人值守且重启后继续。',
     be_ok:'已连接',
     be_down:'未连接',
     be_down_hint:'连不上后端 —— 页面不会显示任何数据（DEMO 假数据模式已移除）',
@@ -779,6 +783,11 @@ const I18N={
     mw_unreal:'unrealized',
     confirm_live_type:'Switching to LIVE will spend real funds. Type LIVE to confirm:',
     confirm_live_bad:'Confirmation did not match — staying in SHADOW',
+    tm_k:'MODE', tm_title:'Click to cycle: data → manual → auto',
+    tm_data:'DATA', tm_manual:'MANUAL', tm_auto:'AUTO', tm_off:'OFF',
+    tm_switched:(m)=>`Mode: ${m}`,
+    tm_warn_manual:'MANUAL — real money. You choose entries; the bot still runs the exits (stop, takes, trailing).',
+    tm_warn_auto:'AUTO — real money. The bot picks tokens, buys \$20 positions and exits them on its own, up to 5 at once, unattended and across restarts.',
     be_ok:'connected',
     be_down:'no backend',
     be_down_hint:'Cannot reach the backend — nothing will be shown (the DEMO fake-data mode was removed)',
@@ -977,6 +986,11 @@ const I18N={
     mw_unreal:'нереалізовано',
     confirm_live_type:'Перехід у реальну торгівлю витрачатиме справжні гроші. Введи LIVE для підтвердження:',
     confirm_live_bad:'Підтвердження не збіглось — лишаємось у SHADOW',
+    tm_k:'РЕЖИМ', tm_title:'Клік — наступний режим: збір даних → ручний → авто',
+    tm_data:'ЗБІР ДАНИХ', tm_manual:'РУЧНИЙ', tm_auto:'АВТО', tm_off:'ВИМКНЕНО',
+    tm_switched:(m)=>`Режим: ${m}`,
+    tm_warn_manual:'РУЧНИЙ — реальні гроші. Входиш ти, виходами керує бот (стоп, тейки, трейлінг).',
+    tm_warn_auto:'АВТО — реальні гроші. Бот сам обирає токени, сам купує на $20 і сам продає. До 5 позицій одночасно. Працює без тебе, переживає перезапуск.',
     be_ok:'з\'єднано',
     be_down:'немає зв\'язку',
     be_down_hint:'Бекенд недоступний — дані не показуються (режим DEMO з фальшивими даними прибрано)',
@@ -1638,8 +1652,7 @@ async function scanCycle(){
         const mcp=document.getElementById('mcpPill');
         if(mcp){mcp.textContent=t('be_ok');mcp.style.color='var(--lime)';}
       }
-      syncBackendMode(data.mode);            // 后端真实 mode 同步到开关（重启后端会回 SHADOW，避免开关停留 LIVE 误导）
-      syncAutoTrade(data.auto_trade);        // 同上，同步自动交易开关
+      syncTradingMode(data.trading_mode);    // бекенд — джерело правди щодо режиму
       const {list,risk,positions}=normalize(data);
       loadingScreen=false;                 // 拿到后端响应，结束骨架
       T=list; RISK=risk; if(positions)POS=positions; if(sel>=T.length)sel=-1;
@@ -1750,63 +1763,75 @@ async function savePipe(){
 }
 // 后端真实 mode → 同步前端 LIVE/SHADOW 开关。后端重启会回 SHADOW；若开关停在 LIVE，
 // 此处翻回 SHADOW 并弹一次警示，杜绝「以为 LIVE、实际 SHADOW 只记录」的误买。
-function syncBackendMode(m){
-  if(typeof m!=='string')return;
-  const beLive=(m==='LIVE');
-  if(beLive===liveMode)return;
-  const wasLive=liveMode;
-  liveMode=beLive;
-  applyLiveLabel();
-  if(wasLive&&!beLive)toast(t('toast_mode_reverted'),'err');   // LIVE→SHADOW 自动回落，提醒用户
+/* ── Режим торгівлі: один перемикач замість MODE × AUTO ──────────────────
+   Внутрішньо бекенд і далі тримає (mode, auto_trade), але назовні це одна назва.
+   Два незалежні тумблери давали чотири комбінації, з яких одна безглузда,
+   а найнебезпечніша (реальні гроші + бот сам) збиралась двома непов'язаними
+   кліками без жодного попередження між ними. */
+const TM_ORDER=['DATA','MANUAL','AUTO'];
+const TM_STYLE={
+  DATA:  {color:'var(--amber)', real:false},
+  MANUAL:{color:'var(--clay)',  real:true},
+  AUTO:  {color:'var(--clay)',  real:true},
+  OFF:   {color:'var(--dim2)',  real:false},
+};
+let tradingMode='OFF', tmInFlight=false;
+
+function applyTradingMode(){
+  const st=TM_STYLE[tradingMode]||TM_STYLE.OFF;
+  const v=document.getElementById('tmPill');
+  if(v){v.textContent=t('tm_'+tradingMode.toLowerCase());v.style.color=st.color;}
+  const dot=document.getElementById('tmDot'); if(dot)dot.style.background=st.color;
+  const wrap=document.getElementById('tmWrap'); if(wrap)wrap.classList.toggle('on',st.real);
+  const ll=document.getElementById('liveLbl');
+  if(ll)ll.textContent=st.real?t('live_lbl_live'):t('live_lbl_shadow');
+  // сумісність зі старим кодом, який ще читає ці прапорці
+  liveMode=st.real; autoTrade=(tradingMode==='DATA'||tradingMode==='AUTO');
 }
-function applyLiveLabel(){
-  const ll=document.getElementById('liveLbl'); if(ll)ll.textContent=liveMode?t('live_lbl_live'):t('live_lbl_shadow');
-  const v=document.getElementById('modePill');v.textContent=liveMode?t('mode_live'):t('mode_shadow');v.style.color=liveMode?'var(--clay)':'var(--amber)';
-  const dot=document.getElementById('modeDot'); if(dot)dot.style.background=liveMode?'var(--clay)':'var(--amber)';
-  if(liveMode&&autoTrade){autoTrade=false;}   // 前端本地也同步关掉（后端在 LIVE 下已强制 false）
-  applyAutoLabel();
+// Бекенд — джерело правди. Щоразу вирівнюємось по ньому, а не «якщо змінилось»:
+// при розсинхроні DOM і змінної старий підхід залишався б у хибному стані назавжди.
+function syncTradingMode(tm){
+  if(typeof tm!=='string'||tmInFlight)return;
+  const was=tradingMode;
+  tradingMode=tm; applyTradingMode();
+  if(was!=='OFF'&&was!==tm&&TM_STYLE[was]?.real&&!TM_STYLE[tm]?.real)
+    toast(t('toast_mode_reverted'),'err');
 }
-// AUTO 拨钮：仅 SHADOW 生效，切到 LIVE 时视觉禁用（灰化）
-function applyAutoLabel(){
-  const v=document.getElementById('autoPill'); if(v){v.textContent=autoTrade?t('auto_on'):t('auto_off');v.style.color=autoTrade?'var(--lime)':'';}
-  const dot=document.getElementById('autoDot'); if(dot)dot.style.background=autoTrade?'var(--lime)':'var(--dim2)';
-  const wrap=document.getElementById('autoPillWrap');
-  if(wrap){wrap.classList.toggle('on',autoTrade);wrap.classList.toggle('disabled',liveMode);}
-}
-// 后端真实 auto_trade → 同步前端拨钮（如后端因切 LIVE / 重启而自动关闭）
-// 每轮都无条件按后端值重绘（不再"值没变就跳过"）——万一某次因为竞态/异常导致 DOM 和
-// autoTrade 变量不一致，之前的写法会一直卡在错误状态，永远不会自我修复；现在每轮强制对齐。
-let autoToggleInFlight=false;   // toggleAuto() 的 POST 还没返回时，忽略本轮 /api/run 带回的旧值，
-                                 // 避免它把 toggleAuto 乐观设置的新状态又刷回旧状态（转瞬即逝的错误闪烁）。
-function syncAutoTrade(v){
-  if(typeof v!=='boolean'||autoToggleInFlight)return;
-  const was=autoTrade;
-  autoTrade=v;
-  applyAutoLabel();
-  if(was&&!autoTrade)toast(t('toast_auto_reverted'),'err');
-}
-function toggleAuto(){
-  if(liveMode){toast(t('toast_auto_live_only'),'err');return;}
-  const goOn=!autoTrade;
-  if(source!=='backend'){                       // DEMO 无后端：仅本地翻转，不会真的开仓
-    if(goOn){confirmDialog(t('confirm_auto_title'),t('confirm_auto_msg'),()=>{autoTrade=true;applyAutoLabel();});}
-    else{autoTrade=false;applyAutoLabel();}
-    return;
+// Сумісність: ці дві функції ще викликаються з кількох місць
+function applyLiveLabel(){applyTradingMode();}
+function applyAutoLabel(){applyTradingMode();}
+function syncBackendMode(){}      // замінено на syncTradingMode
+
+async function setTradingMode(target){
+  const st=TM_STYLE[target];
+  if(st?.real&&tradingLocked){toast(t('toast_trade_locked'),'err');return;}
+  let confirmStr='';
+  if(st?.real){
+    const ok=await new Promise(res=>confirmDialog(t('confirm_live_title'),t('tm_warn_'+target.toLowerCase()),()=>res(true),()=>res(false)));
+    if(!ok)return;
+    const s=window.prompt(t('confirm_live_type'));
+    if(s===null)return;
+    if(s.trim().toUpperCase()!=='LIVE'){toast(t('confirm_live_bad'),'err');return;}
+    confirmStr='LIVE';
   }
-  const apply=async(target)=>{
-    autoToggleInFlight=true;
-    try{
-      const r=await fetch(API+'/api/auto_trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:target})});
-      if(!r.ok)throw new Error(await errDetail(r));
-      const d=await r.json();
-      autoTrade=!!d.auto_trade;applyAutoLabel();
-      toast(autoTrade?t('toast_auto_on'):t('toast_auto_off'),autoTrade?'err':'ok');
-    }catch(e){toast(t('toast_auto_fail',e.message),'err');}
-    finally{autoToggleInFlight=false;}
-  };
-  if(goOn)confirmDialog(t('confirm_auto_title'),t('confirm_auto_msg'),()=>apply(true));
-  else apply(false);
+  tmInFlight=true;
+  try{
+    const r=await fetch(API+'/api/trading_mode',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode:target,confirm:confirmStr})});
+    if(!r.ok)throw new Error(await errDetail(r));
+    const d=await r.json();
+    tradingMode=d.trading_mode; applyTradingMode();
+    toast(t('tm_switched',t('tm_'+tradingMode.toLowerCase())),TM_STYLE[tradingMode]?.real?'err':'ok');
+  }catch(e){toast(t('toast_mode_fail',e.message),'err');}
+  finally{tmInFlight=false;}
 }
+function cycleTradingMode(){
+  const i=TM_ORDER.indexOf(tradingMode);
+  setTradingMode(TM_ORDER[(i+1)%TM_ORDER.length]);
+}
+let autoToggleInFlight=false;      // лишається для сумісності зі старими викликами
+function syncAutoTrade(){}         // режим тепер синхронізує syncTradingMode
+function toggleAuto(){cycleTradingMode();}   // старий тумблер AUTO злився з перемикачем режиму
 let autoStatsPeriod='day', lastAutoStats=null;
 function setStatsPeriod(p){autoStatsPeriod=p;if(lastAutoStats)renderAutoStats(lastAutoStats);}
 function renderAutoStats(s){
@@ -1874,35 +1899,7 @@ function resetAutoStats(){
   });
 }
 // 右上角 MODE 图标点击切换：→LIVE 需二次确认(动真钱)，→SHADOW 直接切。均通知后端 /api/mode。
-function toggleMode(){
-  const goLive=!liveMode;
-  if(goLive&&tradingLocked){toast(t('toast_trade_locked'),'err');return;}   // 硬锁时不让切 LIVE
-  if(source!=='backend'){                       // DEMO 无后端：仅本地翻转
-    if(goLive){confirmDialog(t('confirm_live_title'),t('confirm_live_msg'),()=>{liveMode=true;applyLiveLabel();});}
-    else{liveMode=false;applyLiveLabel();}
-    return;
-  }
-  const apply=async(target,confirmStr)=>{
-    try{
-      const r=await fetch(API+'/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:target?'LIVE':'SHADOW',confirm:confirmStr||''})});
-      if(!r.ok)throw new Error(await errDetail(r));
-      const d=await r.json();
-      liveMode=(d.mode==='LIVE');applyLiveLabel();
-      toast(liveMode?t('toast_mode_live'):t('toast_mode_shadow'),liveMode?'err':'ok');
-    }catch(e){toast(t('toast_mode_fail',e.message),'err');}
-  };
-  // 进 LIVE：弹窗之外还要**手打 LIVE**。单纯点确认太容易误触，而误触意味着真实资金开始动。
-  // 出 LIVE 不加任何摩擦——收紧安全方向的操作永远该是最省事的那个。
-  if(goLive){
-    confirmDialog(t('confirm_live_title'),t('confirm_live_msg'),()=>{
-      const s=window.prompt(t('confirm_live_type'));
-      if(s===null)return;                                   // 取消 = 留在 SHADOW
-      if(s.trim().toUpperCase()!=='LIVE'){toast(t('confirm_live_bad'),'err');return;}
-      apply(true,s.trim().toUpperCase());
-    });
-  }
-  else apply(false);
-}
+function toggleMode(){cycleTradingMode();}   // старий тумблер MODE злився з перемикачем режиму
 const val=id=>document.getElementById(id).value.trim();
 // 从后端错误响应取 FastAPI 的 detail（如「链上买入失败：缺签名密钥」），取不到才回 HTTP 码
 async function errDetail(resp){const j=await resp.json().catch(()=>({}));return j.detail||('HTTP '+resp.status);}
@@ -2469,6 +2466,7 @@ async function autoConnect(){
   try{
     const r=await fetch(API+'/api/status'); if(!r.ok)throw 0;
     const d=await r.json(); beReady=!!d.has_key; tradingLocked=!!d.trading_locked;
+    syncTradingMode(d.trading_mode);       // показати справжній режим одразу, а не після першого циклу
     if(d.public_demo){
       // 公开只读演示：后端定时广播真实筛选缓存。锁定 UI 为只读，链跟随后端。
       document.body.classList.add('publicro');

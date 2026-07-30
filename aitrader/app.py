@@ -3043,7 +3043,29 @@ class ModeIn(BaseModel):
 LIVE_CONFIRM_PHRASE = "LIVE"
 
 class AutoTradeIn(BaseModel):
-    enabled: bool             # SHADOW-only 自动交易开关
+    enabled: bool             # 自动交易开关（SHADOW=纸面，LIVE=真实资金）
+
+# ── 三档交易模式 ────────────────────────────────────────────────────────────
+# 内部仍然是 (ST.mode, ST.auto_trade) 两个状态——大量代码依赖它们——但**对外只暴露一档**。
+# 两个独立开关能拼出四种组合，其中一种（SHADOW 手动）没有用途，而最危险的一种
+# （LIVE + AUTO = 真钱自动交易）只需要两次互不相关的点击就能凑出来，且中间没有任何提示。
+TRADING_MODES = {
+    #  名称        mode      auto    需要确认   说明
+    "DATA":   ("SHADOW", True,  False, "збір даних — паперова авто-торгівля"),
+    "MANUAL": ("LIVE",   False, True,  "ручний — реальні гроші, входиш ти"),
+    "AUTO":   ("LIVE",   True,  True,  "авто — реальні гроші, бот входить сам"),
+}
+
+def current_trading_mode() -> str:
+    """Звести внутрішні (mode, auto_trade) до однієї з трьох назв."""
+    for name, (m, a, _, _) in TRADING_MODES.items():
+        if ST.mode == m and ST.auto_trade == a:
+            return name
+    return "OFF"        # SHADOW без AUTO — нічого не відбувається
+
+class TradingModeIn(BaseModel):
+    mode: str                 # DATA | MANUAL | AUTO | OFF
+    confirm: str = ""         # для режимів з реальними грошима треба ввести LIVE
 
 class WalletIn(BaseModel):
     chain: str = "sol"
@@ -3063,6 +3085,8 @@ def api_status():
     """前端加载时探测：后端是否已就绪（环境有 key + 已切真实适配器），免去重填。
     chain 仅为启动默认链（前端各 tab 用自己的链，不依赖这个）。"""
     return dict(live_adapter=ST.is_live_adapter, chain=ST.chain, mode=ST.mode,
+                trading_mode=current_trading_mode(),
+                live_positions=sum(1 for p in ST.positions if p.get("live")),
                 has_key=bool(load_env().get("GMGN_API_KEY")),
                 trading_locked=LIVE_TRADING_DISABLED, public_demo=PUBLIC_DEMO,
                 trending_cmd=ST.get_trending_cmd(ST.chain), auto_trade=ST.auto_trade)
@@ -3104,6 +3128,42 @@ def api_mode(m: ModeIn):
         ST.mode = "LIVE" if (want_live and not LIVE_TRADING_DISABLED) else "SHADOW"
         # 2026-07-27：不再因为离开 SHADOW 就强制关掉 AUTO——LIVE 自动交易已按用户要求解锁。
     return dict(ok=True, mode=ST.mode, trading_locked=LIVE_TRADING_DISABLED, auto_trade=ST.auto_trade)
+
+@app.post("/api/trading_mode")
+def api_trading_mode(m: TradingModeIn):
+    """Єдиний перемикач режиму: DATA / MANUAL / AUTO (+ OFF).
+
+    Відкриті позиції при перемиканні **не чіпаються** — примусовий продаж був би
+    збитком на рівному місці, а заборона перемикатись — незручністю. Бот і далі
+    веде їх виходи; реальні позиції лишаються реальними незалежно від режиму."""
+    _block_if_public()
+    want = (m.mode or "").strip().upper()
+    if want == "OFF":
+        spec = ("SHADOW", False, False, "вимкнено")
+    elif want in TRADING_MODES:
+        spec = TRADING_MODES[want]
+    else:
+        raise HTTPException(400, f"невідомий режим {want!r}; доступні: DATA / MANUAL / AUTO / OFF")
+    mode, auto, needs_confirm, label = spec
+    if needs_confirm and m.confirm.strip().upper() != LIVE_CONFIRM_PHRASE:
+        raise HTTPException(400, f"режим «{label}» витрачає реальні гроші — "
+                                 f"введи {LIVE_CONFIRM_PHRASE} для підтвердження")
+    if mode == "LIVE" and LIVE_TRADING_DISABLED:
+        raise HTTPException(409, "реальна торгівля заблокована прапорцем LIVE_TRADING_DISABLED")
+    with ST.lock:
+        ST.mode = mode
+        ST.auto_trade = auto
+        save_auto_trade_state()
+        try:
+            ST.use_live()
+        except Exception:
+            pass
+        n_live = sum(1 for p in ST.positions if p.get("live"))
+        log("TRADING_MODE", "-", f"{current_trading_mode()} ({label})"
+            + (f" · відкритих реальних позицій: {n_live}" if n_live else ""))
+    return dict(ok=True, trading_mode=current_trading_mode(), mode=ST.mode,
+                auto_trade=ST.auto_trade, live_positions=n_live,
+                trading_locked=LIVE_TRADING_DISABLED)
 
 @app.post("/api/auto_trade")
 def api_auto_trade(a: AutoTradeIn):
@@ -3368,6 +3428,14 @@ def _maybe_start_public_broadcast():
     # 公开演示模式：启动后台守护线程定时刷新真实筛选缓存（仅此线程触发 CLI）。
     if PUBLIC_DEMO:
         threading.Thread(target=_public_broadcast_loop, daemon=True).start()
+    # 重启后 ST.mode 默认回 SHADOW（安全默认）。但如果盘上还有**真实持仓**，回 SHADOW
+    # 等于把它们扔了：SHADOW 分支只管 auto 仓位，而自治循环的 LIVE 分支要求 mode==LIVE，
+    # 于是真金白银的仓位既没有本地逃生监控、也没人补挂保本止损，只剩 GMGN 那边的条件单。
+    # 有真实持仓就必须回到 LIVE —— 放弃看管已开的仓位，比不开新仓危险得多。
+    if any(p.get("live") for p in ST.positions) and not LIVE_TRADING_DISABLED:
+        ST.mode = "LIVE"
+        log("TRADING_MODE", "-",
+            f"重启后检测到 {sum(1 for p in ST.positions if p.get('live'))} 笔真实持仓 → 恢复 LIVE 以继续看管")
     # 自主交易循环：无论 PUBLIC_DEMO 与否、无论有没有浏览器连着，都启动——
     # AUTO 开关本身已经是"是否真的跑"的开关（见 _autonomous_trade_loop 内的判断）。
     threading.Thread(target=_autonomous_trade_loop, daemon=True).start()
