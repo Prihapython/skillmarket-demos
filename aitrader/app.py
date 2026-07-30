@@ -2384,18 +2384,23 @@ def _attach_trade_totals(rows: list[dict]) -> list[dict]:
     其中 SECRETBULL 整笔赚了 $24.50 却计入亏损——胜率被系统性低估（49.6% → 实为 56.3%）。
     按时间顺序累计部分止盈、遇到最终离场就结算并清零，这样同一地址若真发生二次交易也不会串账。
     """
-    pend: dict[str, float] = {}
+    pend_usd: dict[str, float] = {}
+    pend_notional: dict[str, float] = {}
     finals: list[dict] = []
     for r in rows:
         addr = r.get("address") or ""
-        usd = r.get("pnl", 0) * _row_usd(r)
+        notional = _row_usd(r)
+        usd = r.get("pnl", 0) * notional
         if r.get("partial"):
-            pend[addr] = pend.get(addr, 0.0) + usd
+            pend_usd[addr] = pend_usd.get(addr, 0.0) + usd
+            pend_notional[addr] = pend_notional.get(addr, 0.0) + notional
             continue
-        total = usd + pend.pop(addr, 0.0)
+        total = usd + pend_usd.pop(addr, 0.0)
+        total_notional = notional + pend_notional.pop(addr, 0.0)
         r["trade_pnl_usd"] = round(total, 4)
-        # 等效百分比：整笔交易盈亏 ÷ 建仓名义（$20），便于与单腿 pnl 同量纲比较
-        r["trade_pnl_pct"] = round(total / CFG["auto_size_usd"], 4) if CFG["auto_size_usd"] else 0.0
+        # 等效百分比：整笔交易盈亏 ÷ 这笔仓位自己的建仓名义（不是当前 CFG 值——仓位大小
+        # 改过之后，老交易的名义早就不是 CFG["auto_size_usd"] 了，见 bug 记录）。
+        r["trade_pnl_pct"] = round(total / total_notional, 4) if total_notional else 0.0
         finals.append(r)
     return finals
 
