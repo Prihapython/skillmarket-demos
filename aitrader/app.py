@@ -390,6 +390,14 @@ class LiveGMGN(GMGNAdapter):
         # --use-system-ca 让 Node 改走系统信任链，规避这个误判。
         if "--use-system-ca" not in self.env.get("NODE_OPTIONS", ""):
             self.env["NODE_OPTIONS"] = (self.env.get("NODE_OPTIONS", "") + " --use-system-ca").strip()
+        # gmgn-cli сам відмовляється виконувати фінансову операцію без інтерактивного
+        # термінала ("No interactive terminal available to confirm this swap"). Під systemd
+        # на VPS терміналу немає ніколи, тож 2026-07-30 усі авто-купівлі мовчки падали
+        # в BUY_FAIL, хоча токени ворота проходили. Знімаємо цей запобіжник **разом** із
+        # --yes на конкретних командах (swap / order strategy create) — сама змінна без
+        # прапорця нічого не вмикає. Наші власні гарантії лишаються: LIVE_TRADING_DISABLED,
+        # ST.mode, ліміти розміру/кількості позицій і фраза підтвердження при вході в LIVE.
+        self.env["GMGN_ALLOW_AUTOMATED_TRADES"] = "1"
         self._wallet_cache: dict[str, str] = {}   # chain -> bound wallet address
 
     @staticmethod
@@ -581,6 +589,11 @@ class LiveGMGN(GMGNAdapter):
             args += ["--condition-orders", json.dumps(condition_orders, separators=(",", ":"))]
             if sell_ratio_type:
                 args += ["--sell-ratio-type", sell_ratio_type]
+        # Без --yes gmgn-cli під systemd відмовляє **і купівлі, і продажу** (див. коментар
+        # про GMGN_ALLOW_AUTOMATED_TRADES у __init__). Прапорець тут, а не лише на купівлі,
+        # саме тому: полагодити вхід і не полагодити вихід — це позиція з реальними
+        # грошима, у якої escape-вихід і трейлінг мовчки не спрацюють.
+        args += ["--yes"]
         return self._cli(*args)
 
     def order_get(self, order_id):  return self._cli("order", "get", "--order-id", order_id)
@@ -634,6 +647,7 @@ class LiveGMGN(GMGNAdapter):
             args += ["--priority-fee", str(priority_fee)]
         if tip_fee is not None:
             args += ["--tip-fee", str(tip_fee)]
+        args += ["--yes"]     # той самий блок підтвердження, що й у swap() — це беззбитковий стоп і трейлінг
         return self._cli(*args)
 
     def token_decimals(self, token: str) -> int:
