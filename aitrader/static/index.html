@@ -742,6 +742,7 @@ const I18N={
     stats_h3:'自动交易统计', stats_none:'暂无已平仓的自动交易',
     scope_paper:'纸面', scope_real:'真实资金', scope_all:'混合',
     tm_no_cfg:'尚未拿到后端参数，稍后再试',
+    stats_none_scope:(sc)=>`「${sc}」还没有已平仓的交易`,
     stats_total:(n)=>`${n} 笔`, stats_winrate:'胜率', stats_pnl:'累计 PnL',
     period_day:'按日', period_week:'按周', period_month:'按月',
     stats_reset_btn:'↺ 重置', stats_reset_title:'重置胜率显示',
@@ -947,6 +948,7 @@ const I18N={
     stats_h3:'Auto-trade stats', stats_none:'No closed auto-trades yet',
     scope_paper:'paper', scope_real:'real money', scope_all:'mixed',
     tm_no_cfg:'Backend parameters not loaded yet - try again in a second',
+    stats_none_scope:(sc)=>`No closed trades yet in "${sc}"`,
     stats_total:(n)=>`${n} trades`, stats_winrate:'win rate', stats_pnl:'total PnL',
     period_day:'By day', period_week:'By week', period_month:'By month',
     stats_reset_btn:'↺ Reset', stats_reset_title:'Reset win-rate display',
@@ -1152,6 +1154,7 @@ const I18N={
     stats_h3:'Статистика автотрейду', stats_none:'Ще немає закритих угод автотрейду',
     scope_paper:'папір', scope_real:'реальні гроші', scope_all:'змішано',
     tm_no_cfg:'Ще не отримано параметри від бекенда — спробуй за секунду',
+    stats_none_scope:(sc)=>`Ще немає закритих угод у категорії «${sc}»`,
     stats_total:(n)=>`${n} угод`, stats_winrate:'вінрейт', stats_pnl:'сумарний PnL',
     period_day:'По днях', period_week:'По тижнях', period_month:'По місяцях',
     stats_reset_btn:'↺ Скинути', stats_reset_title:'Скинути показ вінрейту',
@@ -1824,8 +1827,10 @@ function applyTradingMode(){
 function syncTradingMode(tm){
   if(typeof tm!=='string'||tmInFlight)return;
   const was=tradingMode;
+  if(was===tm)return;
   tradingMode=tm; applyTradingMode();
-  if(was!=='OFF'&&was!==tm&&TM_STYLE[was]?.real&&!TM_STYLE[tm]?.real)
+  fetchAutoStats();               // режим змінився ззовні (рестарт сервера, інша вкладка) → цифри теж
+  if(was!=='OFF'&&TM_STYLE[was]?.real&&!TM_STYLE[tm]?.real)
     toast(t('toast_mode_reverted'),'err');
 }
 // Сумісність: ці дві функції ще викликаються з кількох місць
@@ -1862,6 +1867,9 @@ async function setTradingMode(target){
     if(!r.ok)throw new Error(await errDetail(r));
     const d=await r.json();
     tradingMode=d.trading_mode; applyTradingMode();
+    // Статистика прив'язана до режиму (папір / реальні гроші) — перетягнути одразу,
+    // інакше до наступного циклу на екрані висять цифри з іншого режиму.
+    fetchAutoStats();
     toast(t('tm_switched',t('tm_'+tradingMode.toLowerCase())),TM_STYLE[tradingMode]?.real?'err':'ok');
   }catch(e){
     toast(t('toast_mode_fail',e.message),'err');
@@ -1887,8 +1895,10 @@ function renderAutoStats(s){
   const box=document.getElementById('autostats'); if(!box)return;
   const cnt=document.getElementById('autoStatsCnt');
   if(!s||!s.total_trades){
-    if(cnt)cnt.textContent='';
-    box.innerHTML=`<div class="posempty">${t('stats_none')}</div>`;
+    // Сказати, ЯКИХ саме угод немає. Просто «немає угод» після переходу в реальний
+    // режим читається як поломка, хоча насправді там просто ще нічого не торгували.
+    if(cnt)cnt.textContent=s&&s.scope?t('scope_'+s.scope):'';
+    box.innerHTML=`<div class="posempty">${s&&s.scope?t('stats_none_scope',t('scope_'+s.scope)):t('stats_none')}</div>`;
     return;
   }
   lastAutoStats=s;
