@@ -1746,15 +1746,26 @@ async function resetSettings(){
 dismissOnBackdrop('pipeScrim',closePipe);
 
 /* ── 通用二次确认弹窗（替代浏览器 confirm）── */
-let _confirmCb=null;
-function confirmDialog(title,msg,cb){
+let _confirmCb=null, _confirmCancelCb=null;
+function confirmDialog(title,msg,cb,onCancel){
   document.getElementById('confirmTitle').textContent=title;
   document.getElementById('confirmMsg').innerHTML=msg;
-  _confirmCb=cb;
+  _confirmCb=cb; _confirmCancelCb=onCancel||null;
   document.getElementById('confirmScrim').classList.add('on');
 }
-function closeConfirm(){document.getElementById('confirmScrim').classList.remove('on');_confirmCb=null;}
-document.getElementById('confirmOk').onclick=()=>{const cb=_confirmCb;closeConfirm();if(cb)cb();};
+// Скасування теж має покликати колбек. Без цього обгортка в Promise зависала назавжди:
+// натиснув «Скасувати» — і setTradingMode лишався в await до кінця життя сторінки.
+function closeConfirm(){
+  document.getElementById('confirmScrim').classList.remove('on');
+  const cc=_confirmCancelCb; _confirmCb=null; _confirmCancelCb=null;
+  if(cc)cc();
+}
+document.getElementById('confirmOk').onclick=()=>{
+  const cb=_confirmCb;
+  _confirmCancelCb=null;          // підтвердження — не скасування; інакше спрацювали б обидва
+  closeConfirm();
+  if(cb)cb();
+};
 dismissOnBackdrop('confirmScrim',closeConfirm);
 function applyPollInterval(sec){
   pollMs=Math.max(1000,Math.round(sec*1000));
@@ -1852,7 +1863,14 @@ async function setTradingMode(target){
     const d=await r.json();
     tradingMode=d.trading_mode; applyTradingMode();
     toast(t('tm_switched',t('tm_'+tradingMode.toLowerCase())),TM_STYLE[tradingMode]?.real?'err':'ok');
-  }catch(e){toast(t('toast_mode_fail',e.message),'err');}
+  }catch(e){
+    toast(t('toast_mode_fail',e.message),'err');
+    // Перемикання не вдалось — підтягнути справжній стан із сервера.
+    // Показувати старий режим після невдачі гірше, ніж показувати помилку:
+    // людина вважатиме, що система в тому режимі, у якому вона не опинилась.
+    try{const s=await(await fetch(API+'/api/status')).json();
+        tradingMode=s.trading_mode;applyTradingMode();}catch(_){}
+  }
   finally{tmInFlight=false;}
 }
 function cycleTradingMode(){

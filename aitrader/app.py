@@ -3292,7 +3292,17 @@ def api_run(r: RunIn):
     ch = valid_chain(r.chain)
     with ST.lock:
         try:
-            return JSONResponse(screen_once(ch))
+            out = screen_once(ch)
+            # Режим має їхати з КОЖНОЮ відповіддю, а не лише при завантаженні сторінки.
+            # Без цього фронтенд отримував undefined і мовчки лишався зі старим станом:
+            # після рестарту сервера (деплой, збій) екран годинами показував режим,
+            # якого вже немає. А це саме той індикатор, за яким людина вирішує,
+            # чи витрачаються зараз реальні гроші.
+            out["trading_mode"] = current_trading_mode()
+            out["live_positions"] = sum(1 for p in ST.positions if p.get("live"))
+            out["auto_size_usd"] = CFG["auto_size_usd"]
+            out["max_auto_positions"] = CFG["max_auto_positions"]
+            return JSONResponse(out)
         except Exception as e:
             raise HTTPException(502, f"扫描失败：{e}")
 
