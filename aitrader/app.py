@@ -1897,15 +1897,16 @@ def auto_manage_exits(chain: str) -> None:
                 proceeds_sol = round(remainder_sol * (1 + pnl), 6)
                 if p.get("tp1_done"):
                     # після тейку1 захищає трейлінг/беззбитковий стоп (trailing_stop_price)
+                    # завжди червоний — це вихід-стоп, а не свідома фіксація прибутку
                     send_telegram(
-                        f"{'🟢' if pnl >= 0 else '🔴'} Закрито по трейлінговому стопу (LIVE)\n"
+                        f"🔴 Закрито по трейлінговому стопу\n"
                         f"{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
                         f"Сума: {proceeds_sol:.4f} SOL")
                 else:
                     # до тейку1 захищає лише початковий жорсткий стоп -35%
                     loss_sol = round(remainder_sol - proceeds_sol, 6)
                     send_telegram(
-                        f"🔴 Закрито по стоп-лосу (LIVE)\n"
+                        f"🔴 Закрито по стоп-лосу\n"
                         f"{p.get('symbol', '')} · {pnl:+.1%} від депозиту\n"
                         f"Втрачено: {loss_sol:.4f} SOL")
             ST.positions[:] = [x for x in ST.positions if x is not p]
@@ -3007,7 +3008,7 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
         # (сама trending-стрічка рахує market_cap так само, з тих самих двох чисел).
         entry_mcap = entry_price * _f(info.get("circulating_supply"))
         send_telegram(
-            f"🟡 КУПІВЛЯ (LIVE)\n{symbol} · {size_sol:.4f} SOL\n"
+            f"🟡 КУПІВЛЯ\n{symbol} · {size_sol:.4f} SOL\n"
             f"Капіталізація входу: ${entry_mcap:,.0f}\n"
             f"https://gmgn.ai/{chain}/token/{address}")
     off = (gates or {}).get("failed") or []
@@ -3174,7 +3175,7 @@ def _log_chain_partial(g: "GMGNAdapter", p: dict, frac: float, tag: str) -> None
         tp_label = "ТЕЙК 1" if tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
         tp_pct = int(CFG["auto_tp1_pct"] * 100) if tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
         send_telegram(
-            f"🟢 {tp_label} (+{tp_pct}%) спрацював (LIVE)\n{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
+            f"🟢 {tp_label} (+{tp_pct}%) спрацював\n{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
             f"Отримано: {proceeds_sol:.4f} SOL")
 
 def _live_rearm_hard_stop(g: "GMGNAdapter", p: dict) -> None:
@@ -3414,17 +3415,18 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
     if p.get("live"):
         proceeds_sol = round(p["size_sol"] * (1 + pnl), 6)
         if exit_tag == "AUTO_TRAIL_BE":
+            # завжди червоний — це вихід-стоп, а не свідома фіксація прибутку
             send_telegram(
-                f"{'🟢' if pnl >= 0 else '🔴'} Закрито по трейлінговому стопу (LIVE)\n"
+                f"🔴 Закрито по трейлінговому стопу\n"
                 f"{p['symbol']} · PnL {pnl:+.1%}\nСума: {proceeds_sol:.4f} SOL")
         elif exit_tag == "AUTO_SL":
             loss_sol = round(p["size_sol"] - proceeds_sol, 6)
             send_telegram(
-                f"🔴 Закрито по стоп-лосу (LIVE)\n"
+                f"🔴 Закрито по стоп-лосу\n"
                 f"{p['symbol']} · {pnl:+.1%} від депозиту\nВтрачено: {loss_sol:.4f} SOL")
         else:
             send_telegram(
-                f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
+                f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД\n"
                 f"{p['symbol']} · PnL {pnl:+.1%}{_mcap_line(p)}"
                 + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
     ST.positions.pop(idx)
@@ -3515,7 +3517,7 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
         tp_label = "ТЕЙК 1" if exit_tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
         tp_pct = int(CFG["auto_tp1_pct"] * 100) if exit_tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
         send_telegram(
-            f"🟢 {tp_label} (+{tp_pct}%) спрацював (LIVE)\n{p['symbol']} · PnL {pnl:+.1%}\n"
+            f"🟢 {tp_label} (+{tp_pct}%) спрацював\n{p['symbol']} · PnL {pnl:+.1%}\n"
             f"Отримано: {proceeds_sol:.4f} SOL")
     p["size_sol"] = round(p["size_sol"] - sell_size, 6)
     p["tp1_done"] = True
