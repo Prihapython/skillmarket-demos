@@ -1879,17 +1879,23 @@ def auto_manage_exits(chain: str) -> None:
             # і якщо тут знову взяти orig_size_sol, та сама позиція порахується двічі.
             rest = max(0.0, 1.0 - _f(p.get("chain_sold_frac")))
             orig_sol = _f(p.get("orig_size_sol"))
+            # Реальна ціна продажу з гаманця, не p["pnl"] (той — з нашого відстаючого
+            # опитування ціни). 2026-07-30 (Fate): різниця була відчутна — p["pnl"] показував
+            # -47.6%, а фактичний своп на блокчейні виконався за -34.0%.
+            entry = _f(p.get("entry_price"))
+            fill = _last_sell_fill_price(g, p)
+            pnl = round((fill - entry) / entry, 4) if fill > 0 and entry > 0 else p.get("pnl", 0)
             exit_ctx = _capture_exit_context(g, p)   # той самий знімок, що й у do_sell — це теж «зловив падіння»
-            log("SELL", p.get("symbol", ""), f"LIVE 链上条件单已全部平仓 PnL {p.get('pnl', 0):+.1%}",
+            log("SELL", p.get("symbol", ""), f"LIVE 链上条件单已全部平仓 PnL {pnl:+.1%}",
                 dict(address=p["address"], chain=chain, size_sol=round(orig_sol * rest, 6),
-                     pnl=p.get("pnl", 0), usd_notional=round(CFG["auto_size_usd"] * rest, 4),
+                     pnl=pnl, usd_notional=round(CFG["auto_size_usd"] * rest, 4),
                      auto=bool(p.get("auto")), live=True, exit_tag="LIVE_CHAIN_CLOSED",
                      entry_signal=p.get("entry_signal"),
                      **({"exit_context": exit_ctx} if exit_ctx else {})))
             if p.get("live"):
                 send_telegram(
-                    f"{'🟢' if p.get('pnl', 0) >= 0 else '🔴'} ВИХІД (LIVE)\n"
-                    f"{p.get('symbol', '')} · PnL {p.get('pnl', 0):+.1%}{_mcap_line(p)} · закрито на боці GMGN")
+                    f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
+                    f"{p.get('symbol', '')} · PnL {pnl:+.1%}{_mcap_line(p)} · закрито на боці GMGN")
             ST.positions[:] = [x for x in ST.positions if x is not p]
         save_positions()
     for p in pool:
@@ -3081,25 +3087,44 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
         return
     left = amt / orig
     p["chain_left_ratio"] = round(left, 4)
-    # 剩余 ≤ 75% → 第一刀（卖 30%）已成交；≤ 45% → 第二刀也成交了
-    if not p.get("tp1_done") and left <= (1 - CFG["auto_tp1_sell_frac"] + 0.05):
+    # ⚠️ Якщо залишок за ОДИН прохід впав одразу до ~0 — це одна транзакція (найчастіше
+    # початковий стоп -35%, продає 100% одним свопом), не послідовні тейк1+тейк2.
+    # 2026-07-30 (Fate): без цієї гілки код бачив «залишок ≤70%» і «залишок ≤40%» одночасно
+    # і записував ОДИН стоп-лос як два фейкові «часткові тейки» з тим самим (неправильним,
+    # бо ціна одна на всіх) PnL — назва «тейк» на збитковій угоді, подвійний рахунок суми.
+    if left <= 0.02:
         p["tp1_done"] = True
-        p["peak_price"] = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0))
-        log("LIVE_TP1_DETECTED", p.get("symbol", ""),
-            f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到保本")
-        _log_chain_partial(g, p, CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
-    if not p.get("tp2_done") and left <= (1 - CFG["auto_tp1_sell_frac"] - CFG["auto_tp2_sell_frac"] + 0.05):
         p["tp2_done"] = True
-        log("LIVE_TP2_DETECTED", p.get("symbol", ""), f"链上余额剩 {left:.0%} → 第二次止盈已成交")
-        _log_chain_partial(g, p, CFG["auto_tp2_sell_frac"], "AUTO_TP2_PARTIAL")
+        p["_chain_closed"] = True
+    else:
+        # Залишок ≤ 75% → перший тейк (продано 30%) справді стався окремо; ≤ 45% → другий теж.
+        if not p.get("tp1_done") and left <= (1 - CFG["auto_tp1_sell_frac"] + 0.05):
+            p["tp1_done"] = True
+            p["peak_price"] = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0))
+            log("LIVE_TP1_DETECTED", p.get("symbol", ""),
+                f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到保本")
+            _log_chain_partial(g, p, CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
+        if not p.get("tp2_done") and left <= (1 - CFG["auto_tp1_sell_frac"] - CFG["auto_tp2_sell_frac"] + 0.05):
+            p["tp2_done"] = True
+            log("LIVE_TP2_DETECTED", p.get("symbol", ""), f"链上余额剩 {left:.0%} → 第二次止盈已成交")
+            _log_chain_partial(g, p, CFG["auto_tp2_sell_frac"], "AUTO_TP2_PARTIAL")
     # 账面持仓量跟着链上走，否则后续按比例卖出的基数是错的
     if orig > 0 and p.get("orig_size_sol"):
         p["size_sol"] = round(p["orig_size_sol"] * left, 6)
-    # 链上已经清零 = GMGN 的条件单把仓位全部卖完了，我们没参与。
-    # 不标记的话仓位会以 size_sol=0 的状态永远挂在列表里：占着并发额度、
-    # 每轮白白去查余额和策略单，而且这笔交易的结果永远不会进统计。
-    if left <= 0.02 and orig > 0:
-        p["_chain_closed"] = True
+
+def _last_sell_fill_price(g: "GMGNAdapter", p: dict) -> float:
+    """Остання реальна ціна продажу цього токена з гаманця — не p["cur_price"]: той продаж
+    зробив GMGN, ми його не бачили, а наш цикл міг помітити це на 12-17 с пізніше,
+    коли ціна вже інша. 0.0, якщо нічого не знайшли (виклик мовчить, не кидає)."""
+    try:
+        acts = g.wallet_activity(g.wallet_address(), limit=20).get("activities") or []
+        for a in acts:
+            if (a.get("event_type") == "sell"
+                    and ((a.get("token") or {}).get("address") or "").lower() == p["address"].lower()):
+                return _f(a.get("price_usd"))
+    except Exception as e:
+        log("LIVE_FILL_PRICE_FAIL", p.get("symbol", ""), f"ціна продажу з блокчейну не зчиталась: {e}")
+    return 0.0
 
 def _log_chain_partial(g: "GMGNAdapter", p: dict, frac: float, tag: str) -> None:
     """Записати як SELL той частковий тейк, який виконав сам GMGN.
@@ -3109,23 +3134,13 @@ def _log_chain_partial(g: "GMGNAdapter", p: dict, frac: float, tag: str) -> None
     Реальний випадок LEMO: тейк дав +$0.73, залишок вийшов на -2.1%, і вся угода
     (+5.4% насправді) потрапила в статистику як **збиток** -2.1%.
 
-    Ціну беремо з блокчейну, а не з p["cur_price"]: продаж зробив GMGN, ми його не бачили,
-    а наш цикл міг помітити це на 12-17 с пізніше — за цей час ціна вже інша."""
+    Викликається лише коли залишок падає ПОСТУПОВО (не одним стрибком до нуля —
+    те відловлює окрема гілка в _live_sync_from_chain), тож "останній продаж у гаманці"
+    тут дійсно відповідає саме цій нозі, а не якійсь іншій."""
     entry = _f(p.get("entry_price"))
     if entry <= 0:
         return
-    fill = 0.0
-    try:
-        acts = g.wallet_activity(g.wallet_address(), limit=20).get("activities") or []
-        for a in acts:
-            if (a.get("event_type") == "sell"
-                    and ((a.get("token") or {}).get("address") or "").lower() == p["address"].lower()):
-                fill = _f(a.get("price_usd"))
-                break
-    except Exception as e:
-        log("LIVE_FILL_PRICE_FAIL", p.get("symbol", ""), f"ціна тейку з блокчейну не зчиталась: {e}")
-    if fill <= 0:
-        fill = _f(p.get("cur_price"))      # запасний варіант: краще приблизно, ніж не записати зовсім
+    fill = _last_sell_fill_price(g, p) or _f(p.get("cur_price"))   # запасний варіант: краще приблизно, ніж не записати
     if fill <= 0:
         return
     pnl = round((fill - entry) / entry, 4)
