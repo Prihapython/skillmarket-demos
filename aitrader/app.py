@@ -1886,16 +1886,28 @@ def auto_manage_exits(chain: str) -> None:
             fill = _last_sell_fill_price(g, p)
             pnl = round((fill - entry) / entry, 4) if fill > 0 and entry > 0 else p.get("pnl", 0)
             exit_ctx = _capture_exit_context(g, p)   # той самий знімок, що й у do_sell — це теж «зловив падіння»
+            remainder_sol = round(orig_sol * rest, 6)
             log("SELL", p.get("symbol", ""), f"LIVE 链上条件单已全部平仓 PnL {pnl:+.1%}",
-                dict(address=p["address"], chain=chain, size_sol=round(orig_sol * rest, 6),
+                dict(address=p["address"], chain=chain, size_sol=remainder_sol,
                      pnl=pnl, usd_notional=round(CFG["auto_size_usd"] * rest, 4),
                      auto=bool(p.get("auto")), live=True, exit_tag="LIVE_CHAIN_CLOSED",
                      entry_signal=p.get("entry_signal"),
                      **({"exit_context": exit_ctx} if exit_ctx else {})))
             if p.get("live"):
-                send_telegram(
-                    f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
-                    f"{p.get('symbol', '')} · PnL {pnl:+.1%}{_mcap_line(p)} · закрито на боці GMGN")
+                proceeds_sol = round(remainder_sol * (1 + pnl), 6)
+                if p.get("tp1_done"):
+                    # після тейку1 захищає трейлінг/беззбитковий стоп (trailing_stop_price)
+                    send_telegram(
+                        f"{'🟢' if pnl >= 0 else '🔴'} Закрито по трейлінговому стопу (LIVE)\n"
+                        f"{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
+                        f"Сума: {proceeds_sol:.4f} SOL")
+                else:
+                    # до тейку1 захищає лише початковий жорсткий стоп -35%
+                    loss_sol = round(remainder_sol - proceeds_sol, 6)
+                    send_telegram(
+                        f"🔴 Закрито по стоп-лосу (LIVE)\n"
+                        f"{p.get('symbol', '')} · {pnl:+.1%} від депозиту\n"
+                        f"Втрачено: {loss_sol:.4f} SOL")
             ST.positions[:] = [x for x in ST.positions if x is not p]
         save_positions()
     for p in pool:
@@ -2995,10 +3007,8 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
         # (сама trending-стрічка рахує market_cap так само, з тих самих двох чисел).
         entry_mcap = entry_price * _f(info.get("circulating_supply"))
         send_telegram(
-            f"🟢 КУПІВЛЯ (LIVE)\n{symbol} · {size_sol:.4f} SOL\n"
+            f"🟡 КУПІВЛЯ (LIVE)\n{symbol} · {size_sol:.4f} SOL\n"
             f"Капіталізація входу: ${entry_mcap:,.0f}\n"
-            f"Стоп -{int(CFG['hard_stop_pct']*100)}% · "
-            f"Тейк1 +{int(CFG['auto_tp1_pct']*100)}% · Тейк2 +{int(CFG['auto_tp2_pct']*100)}%\n"
             f"https://gmgn.ai/{chain}/token/{address}")
     off = (gates or {}).get("failed") or []
     if off:
@@ -3152,16 +3162,20 @@ def _log_chain_partial(g: "GMGNAdapter", p: dict, frac: float, tag: str) -> None
         return
     pnl = round((fill - entry) / entry, 4)
     orig_sol = _f(p.get("orig_size_sol")) or _f(p.get("size_sol"))
+    sold_sol = round(orig_sol * frac, 6)
     log("SELL", p.get("symbol", ""), f"LIVE 链上条件单部分止盈 {frac:.0%} PnL {pnl:+.1%} · {tag}",
-        dict(address=p["address"], chain=p.get("chain", "sol"), size_sol=round(orig_sol * frac, 6),
+        dict(address=p["address"], chain=p.get("chain", "sol"), size_sol=sold_sol,
              pnl=pnl, usd_notional=round(CFG["auto_size_usd"] * frac, 4),
              auto=bool(p.get("auto")), live=True, exit_tag=tag,
              entry_signal=p.get("entry_signal"), partial=True))
     p["chain_sold_frac"] = round(_f(p.get("chain_sold_frac")) + frac, 4)
     if p.get("live"):
+        proceeds_sol = round(sold_sol * (1 + pnl), 6)
+        tp_label = "ТЕЙК 1" if tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
+        tp_pct = int(CFG["auto_tp1_pct"] * 100) if tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
         send_telegram(
-            f"🟡 ЧАСТКОВИЙ ТЕЙК (LIVE)\n{p.get('symbol', '')} · продано {frac:.0%} · "
-            f"PnL {pnl:+.1%}{_mcap_line(p)} · {tag}")
+            f"🟢 {tp_label} (+{tp_pct}%) спрацював (LIVE)\n{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
+            f"Отримано: {proceeds_sol:.4f} SOL")
 
 def _live_rearm_hard_stop(g: "GMGNAdapter", p: dict) -> None:
     """Заново поставити початковий стоп -35%, коли той, що йшов у комплекті з купівлею, помер.
@@ -3398,10 +3412,21 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
              exit_tag=exit_tag, entry_signal=p.get("entry_signal"),
              **({"exit_context": exit_ctx} if exit_ctx else {})))
     if p.get("live"):
-        send_telegram(
-            f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
-            f"{p['symbol']} · PnL {pnl:+.1%}{_mcap_line(p)}"
-            + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
+        proceeds_sol = round(p["size_sol"] * (1 + pnl), 6)
+        if exit_tag == "AUTO_TRAIL_BE":
+            send_telegram(
+                f"{'🟢' if pnl >= 0 else '🔴'} Закрито по трейлінговому стопу (LIVE)\n"
+                f"{p['symbol']} · PnL {pnl:+.1%}\nСума: {proceeds_sol:.4f} SOL")
+        elif exit_tag == "AUTO_SL":
+            loss_sol = round(p["size_sol"] - proceeds_sol, 6)
+            send_telegram(
+                f"🔴 Закрито по стоп-лосу (LIVE)\n"
+                f"{p['symbol']} · {pnl:+.1%} від депозиту\nВтрачено: {loss_sol:.4f} SOL")
+        else:
+            send_telegram(
+                f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД (LIVE)\n"
+                f"{p['symbol']} · PnL {pnl:+.1%}{_mcap_line(p)}"
+                + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
     ST.positions.pop(idx)
     save_positions()
     return dict(ok=True, symbol=p["symbol"])
@@ -3486,9 +3511,12 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
              auto=bool(p.get("auto")), live=bool(p.get("live")),
              exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
     if p.get("live"):
+        proceeds_sol = round(sell_size * (1 + pnl), 6)
+        tp_label = "ТЕЙК 1" if exit_tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
+        tp_pct = int(CFG["auto_tp1_pct"] * 100) if exit_tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
         send_telegram(
-            f"🟡 ЧАСТКОВИЙ ТЕЙК (LIVE)\n{p['symbol']} · продано {frac:.0%} · "
-            f"PnL {pnl:+.1%}{_mcap_line(p)} · {exit_tag}")
+            f"🟢 {tp_label} (+{tp_pct}%) спрацював (LIVE)\n{p['symbol']} · PnL {pnl:+.1%}\n"
+            f"Отримано: {proceeds_sol:.4f} SOL")
     p["size_sol"] = round(p["size_sol"] - sell_size, 6)
     p["tp1_done"] = True
     if exit_tag == "AUTO_TP2_PARTIAL":
