@@ -121,7 +121,7 @@ CFG = {
     #      $2  清租金 +$5.61   不清 -$41.65      ← 不清理就是稳定亏损
     #      $20 清租金 +$131.19 不清 +$83.93
     #    也就是说 $2 这档，**定期清理空账户不是可选项，是前提**。
-    "auto_size_usd": 2.0,
+    "auto_size_usd": 5.0,
     # max_auto_positions/max_concurrent_positions/max_total_exposure_sol 三个数量类容量上限
     # 均已按用户要求移除（不再在 RiskManager.gate()/auto_open_position() 里拦截）——
     # 用户明确要求 SOL 上不受仓位数/敞口限制持续交易；CFG 里留着仅供前端展示参考数字。
