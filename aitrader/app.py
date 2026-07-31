@@ -3087,27 +3087,34 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
         return
     left = amt / orig
     p["chain_left_ratio"] = round(left, 4)
-    # ⚠️ Якщо залишок за ОДИН прохід впав одразу до ~0 — це одна транзакція (найчастіше
-    # початковий стоп -35%, продає 100% одним свопом), не послідовні тейк1+тейк2.
-    # 2026-07-30 (Fate): без цієї гілки код бачив «залишок ≤70%» і «залишок ≤40%» одночасно
-    # і записував ОДИН стоп-лос як два фейкові «часткові тейки» з тим самим (неправильним,
-    # бо ціна одна на всіх) PnL — назва «тейк» на збитковій угоді, подвійний рахунок суми.
-    if left <= 0.02:
-        p["tp1_done"] = True
-        p["tp2_done"] = True
-        p["_chain_closed"] = True
-    else:
-        # Залишок ≤ 75% → перший тейк (продано 30%) справді стався окремо; ≤ 45% → другий теж.
-        if not p.get("tp1_done") and left <= (1 - CFG["auto_tp1_sell_frac"] + 0.05):
+    # Рахуємо РЕАЛЬНУ продану частку відносно вже зарахованого (chain_sold_frac),
+    # а не завжди припускаємо рівно 30%/30%/40%. 2026-07-30 (Fate, burst): GMGN інколи
+    # продає одним свопом більше за один запланований крок — увесь залишок одразу
+    # (Fate, стоп на 100%) або тейк2 і рештку разом (burst, наш беззбитковий стоп на 70%).
+    # Фіксовані частки тоді розходяться з реальністю: одна справжня транзакція
+    # фабрикувалась у дві-три "ноги" з вигаданим PnL на кожній.
+    sold_total = round(1.0 - left, 4)
+    newly_sold = round(sold_total - _f(p.get("chain_sold_frac")), 4)
+    is_final = left <= 0.02
+    if newly_sold >= 0.02 and not is_final:      # < 0.02 — шум округлення на decimals токена
+        if not p.get("tp1_done"):
             p["tp1_done"] = True
             p["peak_price"] = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0))
             log("LIVE_TP1_DETECTED", p.get("symbol", ""),
                 f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到保本")
-            _log_chain_partial(g, p, CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
-        if not p.get("tp2_done") and left <= (1 - CFG["auto_tp1_sell_frac"] - CFG["auto_tp2_sell_frac"] + 0.05):
+            _log_chain_partial(g, p, newly_sold, "AUTO_TP1_PARTIAL")
+        else:
             p["tp2_done"] = True
             log("LIVE_TP2_DETECTED", p.get("symbol", ""), f"链上余额剩 {left:.0%} → 第二次止盈已成交")
-            _log_chain_partial(g, p, CFG["auto_tp2_sell_frac"], "AUTO_TP2_PARTIAL")
+            _log_chain_partial(g, p, newly_sold, "AUTO_TP2_PARTIAL")
+        p["chain_sold_frac"] = sold_total
+    if is_final:
+        # Остання нога, скільки б кроків до цього не було — весь ще не зарахований залишок
+        # продано одним свопом. Записує це "_chain_closed" блок в auto_manage_exits:
+        # реальна ціна через _last_sell_fill_price, частка = 1 - те, що вже зараховано вище.
+        p["tp1_done"] = True
+        p["tp2_done"] = True
+        p["_chain_closed"] = True
     # 账面持仓量跟着链上走，否则后续按比例卖出的基数是错的
     if orig > 0 and p.get("orig_size_sol"):
         p["size_sol"] = round(p["orig_size_sol"] * left, 6)
