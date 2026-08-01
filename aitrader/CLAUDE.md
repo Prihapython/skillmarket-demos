@@ -51,6 +51,36 @@ production changes to financial logic, not just code edits.
   `.env` only holds an Ed25519 key that signs GMGN API requests; the actual
   wallet key stays in Phantom. Don't conflate the two when discussing "the
   key."
+- Do not log or print sensitive fields anywhere, including ad-hoc debug
+  prints during a session — same rule as above, no exceptions for "just
+  checking."
+
+### Never hardcode secrets
+
+- Credentials (GMGN key, Telegram token) belong only in the `.env` files
+  above — never inline in `app.py` or committed alongside code, even
+  temporarily "to test something."
+- Don't change `.gitignore` to make either `.env` file trackable.
+
+### Never modify without explicit instruction
+
+- `requirements.txt` pins — version bumps must be deliberate and reviewed,
+  not a side effect of "fixing" an unrelated bug.
+- The `.env` files themselves (content, not just presence checks).
+
+### Never run destructive operations without confirmation
+
+- `git reset --hard`, `git push --force` to `fork`/`main`, or any command
+  that rewrites shared history.
+- Deleting or truncating anything under `outputs/` (`positions.json`,
+  `trade_decisions.jsonl`, state files) — see the "reset ≠ delete" note
+  under Workflow below.
+
+### Other restrictions
+
+- Do not disable or weaken the bind-to-`127.0.0.1`-only default, or any
+  check that gates LIVE mode, without it being the explicit point of the
+  task.
 
 ## Commands
 
@@ -108,6 +138,10 @@ start; tail a bounded window or grep on it.
 - **Never hand-mutate `outputs/positions.json` or call `save_positions()`** in
   an ad-hoc test script against the real file without restoring it afterward —
   this has broken real position tracking before.
+- **"Reset win-rate stats" ≠ delete the log.** The reset button only moves the
+  stats-epoch pointer forward; `trade_decisions.jsonl` itself keeps every row.
+  Don't reach for an "archive + truncate" flow to "clean up" the log — that
+  destroys data needed for the threshold-tuning analysis above.
 - **Thresholds and gates come from data, not intuition.** See
   `TESTING_PLAN.md`. Don't tune a filter by eyeballing trades that already
   happened and calling it fixed — that's look-ahead bias on the same sample
@@ -165,3 +199,42 @@ color on the trailing-stop message; both were deliberately removed/fixed.
   strategy list --type history`) over trusting our own logged `pnl` when the
   two could disagree — the log has had real accounting bugs before that
   on-chain data would have caught immediately.
+
+### Exceptions & error handling
+
+- Never use bare `except:` or catch `BaseException` — catch `Exception` or a
+  specific type, and either handle it or re-raise. A silently swallowed
+  exception inside the position-monitoring loop can hide a failed sell or a
+  stop-loss that never got re-armed, which is a real-money problem, not just
+  a bug.
+- Where a `try/except` already narrows to "log and continue" (e.g. a failed
+  `gmgn-cli` call for one candidate shouldn't kill the whole scan), keep that
+  pattern — the intent is isolating one bad token, not hiding real failures.
+
+### Logging
+
+- All trade/decision logging already goes through `log(action, symbol,
+  reason, extra_dict)`, which writes one JSON line per event with whatever
+  structured fields you pass in `extra_dict` — follow this existing
+  convention for new fields rather than inventing a second logging path or
+  free-form string concatenation.
+- No bare `print()` in code that ends up committed — on the server, only
+  what goes through `log()` (or an explicit `send_telegram`) is visible
+  after the fact; a `print()` just vanishes into the systemd journal noise.
+
+### General style
+
+- Prefer guard clauses and early returns over deeply nested `if` — most of
+  the gate/scoring functions in `app.py` already read this way.
+- Absolute imports only; keep imports at the top of the module.
+- State that needs to survive a restart lives in the global `ST` object
+  (`AppState`) and gets persisted via the matching `load_*`/`save_*`
+  functions in `outputs/*.json` — that's the existing pattern, not
+  incidental global state to "clean up." A new piece of persistent state
+  belongs on `ST` plus a save/load pair, not a fresh ad-hoc module-level
+  variable that won't survive a deploy.
+- Modern type hints (`X | Y`, built-in generics) where you're already
+  touching a function — not a mandate to retrofit the whole file in one pass.
+- Prefer keyword arguments once a function has more than ~2 positional
+  params — this file has several gate/scoring functions where positional
+  args have caused mixed-up-argument bugs before.
