@@ -189,9 +189,11 @@ CFG = {
     # ⚠️ exit_plan() 展示给人工看的退出计划直接读这几个数字（见其函数注释）——保证人工界面
     # 显示的"计划退出价位"与 auto 机器人实际执行的完全一致，不再各自维护一套不同的数字。
     "auto_tp1_pct": 0.20,
-    "auto_tp1_sell_frac": 0.3,
+    "auto_tp1_sell_frac": 0.5,      # 2026-08-01: 30%→50%（дані за 24г: TP1→беззбіковий трейлінг
+                                    # часто відкочується назад за 1-4 хв, тож фіксувати треба більше)
     "auto_tp2_pct": 0.50,
-    "auto_tp2_sell_frac": 0.3,      # 按"原始仓位"的比例算，与 auto_tp1_sell_frac 口径一致
+    "auto_tp2_sell_frac": 0.25,     # 30%→25% (компенсує зростання частки на тейку1: 50+25+25=100%)
+                                    #按"原始仓位"的比例算，与 auto_tp1_sell_frac 口径一致
     "auto_trailing_pct": 0.25,
 
     # ── LIVE 下单参数（SHADOW 完全用不到）──────────────────────────────────
@@ -3175,7 +3177,8 @@ def _log_chain_partial(g: "GMGNAdapter", p: dict, frac: float, tag: str) -> None
         tp_label = "ТЕЙК 1" if tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
         tp_pct = int(CFG["auto_tp1_pct"] * 100) if tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
         send_telegram(
-            f"🟢 {tp_label} (+{tp_pct}%) спрацював\n{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
+            f"🟢 {tp_label} (+{tp_pct}%) спрацював — продано {frac:.0%}\n"
+            f"{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
             f"Отримано: {proceeds_sol:.4f} SOL")
 
 def _live_rearm_hard_stop(g: "GMGNAdapter", p: dict) -> None:
@@ -3517,7 +3520,8 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
         tp_label = "ТЕЙК 1" if exit_tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
         tp_pct = int(CFG["auto_tp1_pct"] * 100) if exit_tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
         send_telegram(
-            f"🟢 {tp_label} (+{tp_pct}%) спрацював\n{p['symbol']} · PnL {pnl:+.1%}\n"
+            f"🟢 {tp_label} (+{tp_pct}%) спрацював — продано {frac:.0%}\n"
+            f"{p['symbol']} · PnL {pnl:+.1%}\n"
             f"Отримано: {proceeds_sol:.4f} SOL")
     p["size_sol"] = round(p["size_sol"] - sell_size, 6)
     p["tp1_done"] = True
