@@ -1868,7 +1868,13 @@ def auto_manage_exits(chain: str) -> None:
             return
         pool = [p for p in ST.positions if p.get("chain", "sol") == chain and p.get("auto")]
     else:
-        pool = [p for p in ST.positions if p.get("chain", "sol") == chain and p.get("live")]
+        # "_exiting" пропускаємо тут же: якщо позицію вже продає _live_price_watch_loop
+        # (do_sell без ST.lock на час свопу, див. його докстрінг), не варто цього ж проходу
+        # ще й переставляти для неї стоп чи повторно вирішувати вихід — do_sell все одно
+        # відхилить дубль 409-ю, але навіщо витрачати зайвий виклик gmgn-cli на позицію,
+        # що вже в польоті на продаж.
+        pool = [p for p in ST.positions
+                if p.get("chain", "sol") == chain and p.get("live") and not p.get("_exiting")]
         g = ST.adapter_for(chain)
         for p in pool:
             _live_sync_from_chain(g, p)   # 先用链上余额确认 GMGN 那两刀成交了没有
@@ -2019,7 +2025,12 @@ class AppState:
     """链改为「请求维度」：不再有全局当前链，按链缓存 adapter + trending 结果。
     mode/risk/positions 仍全局（钱包级、跨链合一）。self.chain 仅作启动默认 + status 展示。"""
     def __init__(self):
-        self.lock = threading.Lock()
+        # RLock, не Lock: do_sell/do_sell_partial самі беруть лок навколо своїх мутацій
+        # ST.positions (а не покладаються на те, що виклик уже під локом викликача) —
+        # реентерабельність потрібна, бо деякі виклики (auto_manage_exits) все ще тримають
+        # зовнішній лок навколо всього виклику. Для звичайних одноразових захоплень
+        # поведінка ідентична Lock.
+        self.lock = threading.RLock()
         self.mode = "SHADOW"          # SHADOW | LIVE（钱包级安全设置，全局）
         self.auto_trade = load_auto_trade_state()  # SHADOW-only 自动交易开关；落盘持久化，重启自动恢复上次状态
                                        # （mode 本身仍不落盘、重启回默认 SHADOW——即使 auto_trade 恢复为 True，
@@ -2124,7 +2135,17 @@ def load_positions() -> list:
         return []
     try:
         data = json.loads(POSITIONS_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        # "_exiting" — лише внутрішньопроцесна застава на час мережевого swap (do_sell/
+        # do_sell_partial). Якщо вона потрапила на диск (save_positions зберіг знімок саме
+        # в цю мить) і процес після цього перезапустився, застава напевно застаріла —
+        # нового продажу "в польоті" щойно стартований процес мати не може. Без цього
+        # чищення позиція назавжди отримувала б 409 на будь-яку спробу її продати.
+        for p in data:
+            if isinstance(p, dict):
+                p.pop("_exiting", None)
+        return data
     except Exception:
         return []
 
@@ -2687,6 +2708,7 @@ def _live_price_watch_loop():
                         prices[addr] = ST.adapter_for(ch).token_price(addr)
                     except Exception:
                         pass                    # не дістали ціну → цю позицію просто пропускаємо
+                to_sell = []
                 if prices:
                     with ST.lock:
                         for p in list(ST.positions):
@@ -2708,10 +2730,17 @@ def _live_price_watch_loop():
                                              else p.get("live_strategy_id"))
                                 if protected:
                                     continue
-                            try:
-                                do_sell(p["address"], exit_tag=d[1])
-                            except Exception as e:
-                                log("AUTO_SELL_FAIL", p.get("symbol", ""), str(e))
+                            to_sell.append((p["address"], d[1]))
+                # do_sell сам бере ST.lock лише навколо мутацій стану — мережевий swap тут
+                # навмисно виконується БЕЗ локу зовні. Якби ми тримали лок і тут, саме на
+                # час свопу (кілька секунд, до 25с timeout) знову блокувався б головний
+                # скан-цикл — той самий розрив, заради усунення якого цей швидкий цикл і
+                # існує (див. докстрінг вище про обвал Hardy).
+                for addr, tag in to_sell:
+                    try:
+                        do_sell(addr, exit_tag=tag)
+                    except Exception as e:
+                        log("AUTO_SELL_FAIL", addr[:8], str(e))
         except Exception as e:
             log("PRICEWATCH_ERR", "-", str(e))
         time.sleep(CFG["live_price_poll_s"])
@@ -3113,16 +3142,24 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     newly_sold = round(sold_total - _f(p.get("chain_sold_frac")), 4)
     is_final = left <= 0.02
     if newly_sold >= 0.02 and not is_final:      # < 0.02 — шум округлення на decimals токена
+        remaining = newly_sold
         if not p.get("tp1_done"):
+            # Швидкий ринок може виконати TP1 і TP2 одним стрибком між двома опитуваннями
+            # (залишок падає одразу до ~25%, а не спершу до ~50%). Раніше весь newly_sold
+            # писався одною ногою AUTO_TP1_PARTIAL, а tp2_done лишався False назавжди —
+            # тому пізніше _auto_decide_exit міг ще раз спробувати продати вже проданий
+            # тейк-2 як частину залишку. Ділимо на дві ноги з правильними частками.
+            tp1_frac = min(remaining, CFG["auto_tp1_sell_frac"])
             p["tp1_done"] = True
             p["peak_price"] = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0))
             log("LIVE_TP1_DETECTED", p.get("symbol", ""),
                 f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到保本")
-            _log_chain_partial(g, p, newly_sold, "AUTO_TP1_PARTIAL")
-        else:
+            _log_chain_partial(g, p, tp1_frac, "AUTO_TP1_PARTIAL")
+            remaining = round(remaining - tp1_frac, 4)
+        if remaining >= 0.02 and not p.get("tp2_done"):
             p["tp2_done"] = True
             log("LIVE_TP2_DETECTED", p.get("symbol", ""), f"链上余额剩 {left:.0%} → 第二次止盈已成交")
-            _log_chain_partial(g, p, newly_sold, "AUTO_TP2_PARTIAL")
+            _log_chain_partial(g, p, remaining, "AUTO_TP2_PARTIAL")
         p["chain_sold_frac"] = sold_total
     if is_final:
         # Остання нога, скільки б кроків до цього не було — весь ще не зарахований залишок
@@ -3383,60 +3420,84 @@ def _cancel_live_strategy(g: "GMGNAdapter", p: dict) -> None:
 
 def do_sell(address: str, exit_tag: str | None = None) -> dict:
     """exit_tag：非空时说明这是 auto_manage_exits 触发的自动离场（AUTO_SL/AUTO_TP/AUTO_TRAIL/
-    AUTO_ESCAPE），写进日志供 compute_auto_stats 读取；人工卖出（/api/sell）永远传 None。"""
-    idx = next((i for i, p in enumerate(ST.positions) if p["address"] == address), None)
-    if idx is None:
-        raise HTTPException(404, "未找到该持仓")
-    p = ST.positions[idx]
-    pchain = p.get("chain", "sol")               # 用持仓自带链，避免用错链的 adapter/原生币
-    if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
-        g = ST.adapter_for(pchain)
-        _cancel_live_strategy(g, p)   # 先撤挂单再清仓：顺序反了会留下对空仓乱触发的策略单
-        # 清仓：input=持仓币(非 currency，可用 percent)，output=该链原生币，percent=100 全清。
-        try:
-            g.swap(from_wallet=g.wallet_address(), input_token=address,
-                   output_token=native_token(pchain), percent=100,
-                   slippage=CFG["live_slippage_sell"],
-                   priority_fee=CFG["live_priority_fee_sol"])
-        except Exception as e:                       # 卖出失败→保留持仓，回清晰错误
-            log("SELL_FAIL", p["symbol"], str(e))
-            raise HTTPException(502, f"链上卖出失败：{e}")
-    pnl = p.get("pnl", 0)
-    if pnl < 0:
-        ST.risk.consec_losses += 1
-        ST.risk.realized_loss_today = round(ST.risk.realized_loss_today + abs(pnl) * p["size_sol"], 4)
-    else:
-        ST.risk.consec_losses = 0
-    usd_notional = _sell_usd_notional(p, p["size_sol"])   # auto 部分止盈过的仓位，剩余部分只值原 $20 的一部分
-    # Знімок ринку для СПРАВЖНІХ виходів (не ручний клік, не тейк) — щоб згодом можна було
-    # відрізнити відкат від краху за даними (обсяг/ліквідність у момент падіння), а не на око.
-    # Рахуємо і в SHADOW теж: реальних виходів мало, паперових — сотні, вибірка звідти.
-    exit_ctx = (_capture_exit_context(ST.adapter_for(pchain), p)
-                if exit_tag in ("AUTO_SL", "AUTO_TRAIL_BE", "AUTO_ESCAPE", "AUTO_SL_LATE") else None)
-    log("SELL", p["symbol"], f"{ST.mode} 平仓 PnL {pnl:+.1%}" + (f" · {exit_tag}" if exit_tag else ""),
-        dict(address=p["address"], chain=pchain, size_sol=p["size_sol"], pnl=pnl, usd_notional=usd_notional,
-             auto=bool(p.get("auto")), live=bool(p.get("live")),   # без цього真钱 угода не потрапляє в реальну статистику
-             exit_tag=exit_tag, entry_signal=p.get("entry_signal"),
-             **({"exit_context": exit_ctx} if exit_ctx else {})))
-    if p.get("live"):
-        proceeds_sol = round(p["size_sol"] * (1 + pnl), 6)
-        if exit_tag == "AUTO_TRAIL_BE":
-            # завжди червоний — це вихід-стоп, а не свідома фіксація прибутку
-            send_telegram(
-                f"🔴 Закрито по трейлінговому стопу\n"
-                f"{p['symbol']} · PnL {pnl:+.1%}\nСума: {proceeds_sol:.4f} SOL")
-        elif exit_tag == "AUTO_SL":
-            loss_sol = round(p["size_sol"] - proceeds_sol, 6)
-            send_telegram(
-                f"🔴 Закрито по стоп-лосу\n"
-                f"{p['symbol']} · {pnl:+.1%} від депозиту\nВтрачено: {loss_sol:.4f} SOL")
+    AUTO_ESCAPE），写进日志供 compute_auto_stats 读取；人工卖出（/api/sell）永远传 None。
+
+    Лок береться лише навколо читання/мутацій ST.positions/ST.risk, а НЕ навколо мережевого
+    swap — інакше цей виклик (кілька секунд, до 25с timeout gmgn-cli) блокує _live_price_watch_loop,
+    для якого і існує швидкий 3-секундний нагляд за ціною (обвал Hardy 2026-07-30 стався й
+    відкотився саме в такому вікні — див. докстрінг того циклу). "_exiting" — застава проти
+    подвійного продажу тим часом, поки своп у польоті: інший виклик на ту саму адресу (з іншого
+    потоку чи повторний ручний клік) бачить прапор і виходить з 409, а не дублює своп.
+    self.lock — RLock, тож виклики нижче не дедлочать, навіть якщо викликач (auto_manage_exits)
+    сам усе ще тримає той самий лок зовні."""
+    with ST.lock:
+        idx = next((i for i, p in enumerate(ST.positions) if p["address"] == address), None)
+        if idx is None:
+            raise HTTPException(404, "未找到该持仓")
+        p = ST.positions[idx]
+        if p.get("_exiting"):
+            raise HTTPException(409, "该仓位正在处理离场中，请稍候")
+        p["_exiting"] = True
+        pchain = p.get("chain", "sol")               # 用持仓自带链，避免用错链的 adapter/原生币
+
+    try:
+        if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+            g = ST.adapter_for(pchain)
+            _cancel_live_strategy(g, p)   # 先撤挂单再清仓：顺序反了会留下对空仓乱触发的策略单
+            # 清仓：input=持仓币(非 currency，可用 percent)，output=该链原生币，percent=100 全清。
+            try:
+                g.swap(from_wallet=g.wallet_address(), input_token=address,
+                       output_token=native_token(pchain), percent=100,
+                       slippage=CFG["live_slippage_sell"],
+                       priority_fee=CFG["live_priority_fee_sol"])
+            except Exception as e:                       # 卖出失败→保留持仓，回清晰错误
+                log("SELL_FAIL", p["symbol"], str(e))
+                raise HTTPException(502, f"链上卖出失败：{e}")
+        # Знімок ринку для СПРАВЖНІХ виходів (не ручний клік, не тейк) — щоб згодом можна було
+        # відрізнити відкат від краху за даними (обсяг/ліквідність у момент падіння), а не на око.
+        # Рахуємо і в SHADOW теж: реальних виходів мало, паперових — сотні, вибірка звідти.
+        exit_ctx = (_capture_exit_context(ST.adapter_for(pchain), p)
+                    if exit_tag in ("AUTO_SL", "AUTO_TRAIL_BE", "AUTO_ESCAPE", "AUTO_SL_LATE") else None)
+    except Exception:
+        with ST.lock:
+            p.pop("_exiting", None)   # звільняємо заставу — наступна спроба (ручна чи авто) не має бути заблокована 409
+        raise
+
+    with ST.lock:
+        pnl = p.get("pnl", 0)
+        if pnl < 0:
+            ST.risk.consec_losses += 1
+            ST.risk.realized_loss_today = round(ST.risk.realized_loss_today + abs(pnl) * p["size_sol"], 4)
         else:
-            send_telegram(
-                f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД\n"
-                f"{p['symbol']} · PnL {pnl:+.1%}{_mcap_line(p)}"
-                + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
-    ST.positions.pop(idx)
-    save_positions()
+            ST.risk.consec_losses = 0
+        usd_notional = _sell_usd_notional(p, p["size_sol"])   # auto 部分止盈过的仓位，剩余部分只值原 $20 的一部分
+        log("SELL", p["symbol"], f"{ST.mode} 平仓 PnL {pnl:+.1%}" + (f" · {exit_tag}" if exit_tag else ""),
+            dict(address=p["address"], chain=pchain, size_sol=p["size_sol"], pnl=pnl, usd_notional=usd_notional,
+                 auto=bool(p.get("auto")), live=bool(p.get("live")),   # без цього真钱 угода не потрапляє в реальну статистику
+                 exit_tag=exit_tag, entry_signal=p.get("entry_signal"),
+                 **({"exit_context": exit_ctx} if exit_ctx else {})))
+        if p.get("live"):
+            proceeds_sol = round(p["size_sol"] * (1 + pnl), 6)
+            if exit_tag == "AUTO_TRAIL_BE":
+                # завжди червоний — це вихід-стоп, а не свідома фіксація прибутку
+                send_telegram(
+                    f"🔴 Закрито по трейлінговому стопу\n"
+                    f"{p['symbol']} · PnL {pnl:+.1%}\nСума: {proceeds_sol:.4f} SOL")
+            elif exit_tag == "AUTO_SL":
+                loss_sol = round(p["size_sol"] - proceeds_sol, 6)
+                send_telegram(
+                    f"🔴 Закрито по стоп-лосу\n"
+                    f"{p['symbol']} · {pnl:+.1%} від депозиту\nВтрачено: {loss_sol:.4f} SOL")
+            else:
+                send_telegram(
+                    f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД\n"
+                    f"{p['symbol']} · PnL {pnl:+.1%}{_mcap_line(p)}"
+                    + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
+        # Видалення за ідентичністю об'єкта, не за idx: idx знято до мережевого свопу (вище),
+        # і поки лок був відпущений, інший потік міг встигнути змінити список — застарілий
+        # idx міг би видалити не ту позицію.
+        ST.positions[:] = [x for x in ST.positions if x is not p]
+        save_positions()
     return dict(ok=True, symbol=p["symbol"])
 
 def _capture_exit_context(g: "GMGNAdapter", p: dict) -> dict | None:
@@ -3490,48 +3551,65 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
 
     LIVE 下真实发单（--percent 按"当前持仓量"的比例算，与这里的 frac 口径一致）。
     正常情况下 LIVE 的部分止盈由 GMGN 条件单在链上完成，走不到这里；这条路径是**兜底**——
-    条件单没挂上（best-effort 失败）时，本地轮询仍能把阶梯执行掉，不至于只剩全仓止损。"""
-    idx = next((i for i, p in enumerate(ST.positions) if p["address"] == address), None)
-    if idx is None:
-        raise HTTPException(404, "未找到该持仓")
-    p = ST.positions[idx]
-    pnl = p.get("pnl", 0)
-    sell_size = round(p["size_sol"] * frac, 6)
-    if p.get("live") and ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+    条件单没挂上（best-effort 失败）时，本地轮询仍能把阶梯执行掉，不至于只剩全仓止损。
+
+    Локування — той самий патерн, що й у do_sell: лок тільки навколо стану, не навколо
+    мережевого swap; "_exiting" боронить від паралельного do_sell/do_sell_partial на ту
+    саму адресу (напр. фонового потоку й ручного /api/sell одночасно)."""
+    with ST.lock:
+        idx = next((i for i, p in enumerate(ST.positions) if p["address"] == address), None)
+        if idx is None:
+            raise HTTPException(404, "未找到该持仓")
+        p = ST.positions[idx]
+        if p.get("_exiting"):
+            raise HTTPException(409, "该仓位正在处理离场中，请稍候")
+        p["_exiting"] = True
+        pnl = p.get("pnl", 0)
+        sell_size = round(p["size_sol"] * frac, 6)
         pchain = p.get("chain", "sol")
-        g = ST.adapter_for(pchain)
-        try:
-            g.swap(from_wallet=g.wallet_address(), input_token=address,
-                   output_token=native_token(pchain), percent=round(frac * 100, 4),
-                   slippage=CFG["live_slippage_sell"],
-                   priority_fee=CFG["live_priority_fee_sol"])
-        except Exception as e:      # 部分止盈失败→保留原仓位不动，等下一轮重试；不改账目
-            log("SELL_FAIL", p["symbol"], f"部分止盈 {frac:.0%} · {e}")
-            raise HTTPException(502, f"链上部分止盈失败：{e}")
-    usd_notional = _sell_usd_notional(p, sell_size)
-    if pnl < 0:                     # 部分止盈按定义 pnl>0 触发，这里只是防御性保留同样的风控记账逻辑
-        ST.risk.consec_losses += 1
-        ST.risk.realized_loss_today = round(ST.risk.realized_loss_today + abs(pnl) * sell_size, 4)
-    else:
-        ST.risk.consec_losses = 0
-    log("SELL", p["symbol"], f"{ST.mode} 部分止盈 {frac:.0%} PnL {pnl:+.1%} · {exit_tag}",
-        dict(address=p["address"], chain=p.get("chain", "sol"), size_sol=sell_size, pnl=pnl, usd_notional=usd_notional,
-             auto=bool(p.get("auto")), live=bool(p.get("live")),
-             exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
-    if p.get("live"):
-        proceeds_sol = round(sell_size * (1 + pnl), 6)
-        tp_label = "ТЕЙК 1" if exit_tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
-        tp_pct = int(CFG["auto_tp1_pct"] * 100) if exit_tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
-        send_telegram(
-            f"🟢 {tp_label} (+{tp_pct}%) спрацював — продано {frac:.0%}\n"
-            f"{p['symbol']} · PnL {pnl:+.1%}\n"
-            f"Отримано: {proceeds_sol:.4f} SOL")
-    p["size_sol"] = round(p["size_sol"] - sell_size, 6)
-    p["tp1_done"] = True
-    if exit_tag == "AUTO_TP2_PARTIAL":
-        p["tp2_done"] = True
-    p["peak_price"] = p.get("cur_price", p.get("entry_price", 0.0))   # 从此刻开始追踪移动止损
-    save_positions()
+
+    try:
+        if p.get("live") and ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+            g = ST.adapter_for(pchain)
+            try:
+                g.swap(from_wallet=g.wallet_address(), input_token=address,
+                       output_token=native_token(pchain), percent=round(frac * 100, 4),
+                       slippage=CFG["live_slippage_sell"],
+                       priority_fee=CFG["live_priority_fee_sol"])
+            except Exception as e:      # 部分止盈失败→保留原仓位不动，等下一轮重试；不改账目
+                log("SELL_FAIL", p["symbol"], f"部分止盈 {frac:.0%} · {e}")
+                raise HTTPException(502, f"链上部分止盈失败：{e}")
+    except Exception:
+        with ST.lock:
+            p.pop("_exiting", None)
+        raise
+
+    with ST.lock:
+        usd_notional = _sell_usd_notional(p, sell_size)
+        if pnl < 0:                     # 部分止盈按定义 pnl>0 触发，这里只是防御性保留同样的风控记账逻辑
+            ST.risk.consec_losses += 1
+            ST.risk.realized_loss_today = round(ST.risk.realized_loss_today + abs(pnl) * sell_size, 4)
+        else:
+            ST.risk.consec_losses = 0
+        log("SELL", p["symbol"], f"{ST.mode} 部分止盈 {frac:.0%} PnL {pnl:+.1%} · {exit_tag}",
+            dict(address=p["address"], chain=pchain, size_sol=sell_size, pnl=pnl, usd_notional=usd_notional,
+                 auto=bool(p.get("auto")), live=bool(p.get("live")),
+                 exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
+        if p.get("live"):
+            proceeds_sol = round(sell_size * (1 + pnl), 6)
+            tp_label = "ТЕЙК 1" if exit_tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
+            tp_pct = int(CFG["auto_tp1_pct"] * 100) if exit_tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
+            send_telegram(
+                f"🟢 {tp_label} (+{tp_pct}%) спрацював — продано {frac:.0%}\n"
+                f"{p['symbol']} · PnL {pnl:+.1%}\n"
+                f"Отримано: {proceeds_sol:.4f} SOL")
+        p["size_sol"] = round(p["size_sol"] - sell_size, 6)
+        p["tp1_done"] = True
+        if exit_tag == "AUTO_TP2_PARTIAL":
+            p["tp2_done"] = True
+        p["peak_price"] = p.get("cur_price", p.get("entry_price", 0.0))   # 从此刻开始追踪移动止损
+        p.pop("_exiting", None)
+        save_positions()
     return dict(ok=True, symbol=p["symbol"])
 
 def do_unmonitor(address: str) -> dict:
@@ -3958,9 +4036,11 @@ def api_buy(b: BuyIn):
 
 @app.post("/api/sell")
 def api_sell(s: SellIn):
+    # Без with ST.lock: do_sell сам бере лок лише навколо мутацій стану, не навколо
+    # мережевого swap — тож ручний продаж із UI більше не блокує фоновий моніторинг
+    # інших live-позицій на весь час свопу.
     _block_if_public()
-    with ST.lock:
-        return do_sell(s.address)
+    return do_sell(s.address)
 
 @app.post("/api/unmonitor")
 def api_unmonitor(s: SellIn):
