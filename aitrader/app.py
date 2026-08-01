@@ -303,6 +303,7 @@ PUBLIC_DEMO = os.getenv("PUBLIC_DEMO", "").strip().lower() in ("1", "true", "yes
 DEFAULT_TRENDING_CMDS = {
     "sol": ("gmgn-cli market trending --chain sol "
             "--platform Pump.fun --platform pump_mayhem --platform pump_mayhem_agent --platform pump_agent "
+            "--platform letsbonk --platform meteora_virtual_curve --platform bags "
             "--interval 1h --order-by volume --limit 100 --raw"),
     "bsc": ("gmgn-cli market trending --chain bsc "
             "--platform fourmeme --platform fourmeme_agent --platform bn_fourmeme "
