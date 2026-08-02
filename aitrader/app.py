@@ -227,6 +227,14 @@ CFG = {
     # SOL 上挂条件单（--condition-orders）时，priority-fee 与 tip-fee 是**必填**，不是可选优化。
     "live_priority_fee_sol": 0.0001,
     "live_tip_fee_sol": 0.0001,
+    # 统计卡片("chekker")用的手续费估算——2026-08-02 从 `gmgn-cli portfolio activity`
+    # 实测 59 笔 LIVE 腿（2026-07-31→08-02，$5 仓位）算出：固定部分(gas+priority+tip)
+    # 均值 $0.0227/腿；比例部分(Pump.fun/DEX 成交费) 占名义额 1.106%。我们自己记的 `pnl`
+    # 字段只是价格涨跌，从不含这两块——这就是钱包实际余额比"胜率卡"上的 PnL 差得多的原因
+    # （用户 2026-08-02 发现：$73.45→$64.66，卡片却只显示 -1.7）。这是经验估算，不是每笔
+    # 链上精确值；SOL 价格/仓位大小变化后可能要重新测。
+    "est_fee_usd_fixed_per_leg": 0.0227,
+    "est_fee_pct_of_notional": 0.01106,
     # 把止损/止盈挂到 GMGN 侧（<0.3s 触发），而不是靠我们 5.6s 的轮询——
     # 那几笔 -80% 就是秒级砸盘，轮询根本追不上（见 CONTEXT.md「关于亏损性质的重要发现」）。
     "live_condition_orders": True,
@@ -2425,6 +2433,15 @@ def _row_usd(r: dict) -> float:
     v = r.get("usd_notional")
     return v if v else CFG["auto_size_usd"]
 
+def _estimate_fee_usd(notional_usd: float) -> float:
+    """Оцінка реальної on-chain комісії (gas + priority + tip + DEX своп-фі) за одну ногу
+    угоди. Наш власний `pnl` — це лише цінова зміна, ніде не рахує ці витрати, тому картка
+    статистики систематично показувала кращий результат, ніж реальний баланс гаманця
+    (2026-08-02: гаманець -$8.79, картка -1.7). Коефіцієнти виміряні по
+    `gmgn-cli portfolio activity` — див. CFG['est_fee_usd_fixed_per_leg']. Застосовувати
+    тільки до LIVE-ніг (paper/SHADOW не платить реальних комісій)."""
+    return CFG["est_fee_usd_fixed_per_leg"] + CFG["est_fee_pct_of_notional"] * notional_usd
+
 def _local_ts(r: dict) -> datetime.datetime | None:
     """日志 ts 是 UTC ISO 字符串；按钮/时钟统一显示本地时区 UTC+3（见前端 tick()），
     按日/周/月分桶也用同一偏移，避免日期边界跟 UI 时钟对不上。"""
@@ -2455,21 +2472,32 @@ def _attach_trade_totals(rows: list[dict]) -> list[dict]:
     """
     pend_usd: dict[str, float] = {}
     pend_notional: dict[str, float] = {}
+    pend_fee: dict[str, float] = {}
     finals: list[dict] = []
     for r in rows:
         addr = r.get("address") or ""
         notional = _row_usd(r)
         usd = r.get("pnl", 0) * notional
+        is_live = bool(r.get("live"))
+        leg_fee = _estimate_fee_usd(notional) if is_live else 0.0
         if r.get("partial"):
             pend_usd[addr] = pend_usd.get(addr, 0.0) + usd
             pend_notional[addr] = pend_notional.get(addr, 0.0) + notional
+            pend_fee[addr] = pend_fee.get(addr, 0.0) + leg_fee
             continue
         total = usd + pend_usd.pop(addr, 0.0)
         total_notional = notional + pend_notional.pop(addr, 0.0)
-        r["trade_pnl_usd"] = round(total, 4)
+        total_fee = leg_fee + pend_fee.pop(addr, 0.0)
+        if is_live:
+            # У SELL-записах немає окремого рядка для BUY-ноги цієї ж позиції (лог пише її
+            # окремим BUY-записом, який сюди не потрапляє) — рахуємо її комісію по тій самій
+            # оцінці, використовуючи повну номінальну вартість позиції.
+            total_fee += _estimate_fee_usd(total_notional)
+        r["trade_pnl_usd"] = round(total - total_fee, 4)
         # 等效百分比：整笔交易盈亏 ÷ 这笔仓位自己的建仓名义（不是当前 CFG 值——仓位大小
         # 改过之后，老交易的名义早就不是 CFG["auto_size_usd"] 了，见 bug 记录）。
-        r["trade_pnl_pct"] = round(total / total_notional, 4) if total_notional else 0.0
+        r["trade_pnl_pct"] = round((total - total_fee) / total_notional, 4) if total_notional else 0.0
+        r["est_fee_usd"] = round(total_fee, 4)
         finals.append(r)
     return finals
 
@@ -2509,7 +2537,9 @@ def compute_auto_stats(live: bool | None = None) -> dict:
                     by_day=[], by_week=[], by_month=[], recent=[])
     wins = sum(1 for r in full_rows if _is_win(r))
     losses = n - wins
-    total_usd = sum(r.get("pnl", 0) * _row_usd(r) for r in rows)
+    # trade_pnl_usd вже враховує оцінку комісій (див. _attach_trade_totals/_estimate_fee_usd) —
+    # рахувати total_usd окремо від сирих pnl%*notional означало б знову загубити цю поправку.
+    total_usd = sum(r.get("trade_pnl_usd", 0.0) for r in full_rows)
     return dict(
         total_trades=n, wins=wins, losses=losses, win_rate=round(wins / n, 3), total_pnl_usd=round(total_usd, 2),
         avg_pnl_pct=round(sum(r.get("trade_pnl_pct", 0) for r in full_rows) / n, 4),
