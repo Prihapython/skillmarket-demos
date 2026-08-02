@@ -2250,9 +2250,15 @@ def _all_sell_rows() -> list[dict]:
     виклик, а фронтенд смикає його при кожному перемиканні режиму й кожні 5 циклів.
     Тепер пам'ятаємо зміщення й розбираємо тільки те, що дописалось.
 
-    Читаємо байтами й зупиняємось на останньому переводі рядка: інакше можна
-    прихопити рядок, який пишеться просто зараз, і зіпсувати кеш незакінченим JSON.
-    Файл став меншим (обрізали/підмінили) → перечитуємо з нуля."""
+    Читаємо рядок за рядком (файловий ітератор), а не одним блобом: журнал доріс до
+    800+ МБ / 5.1+ млн рядків, і `f.read(size - pos)` на холодному старті (pos=0
+    після кожного рестарту процесу — кеш у пам'яті, не на диску) намагався за раз
+    виділити ~800 МБ байтів + стільки ж на decode + ще на splitlines — на 4 ГБ
+    сервері це валило процес по OOM ще ДО першої відповіді (2026-08-02, побачили
+    відразу після рестарту заради fee-фікса вище: RSS до 3.5 ГБ за секунди,
+    systemd рестартував, і так по колу на кожен виклик /api/stats/auto).
+    Незакінчений хвостовий рядок (пишеться просто зараз) лишаємо нерозібраним до
+    наступного виклику. Файл став меншим (обрізали/підмінили) → перечитуємо з нуля."""
     with _SELLS_LOCK:
         if not LOG_PATH.exists():
             _SELLS_CACHE.update(pos=0, rows=[])
@@ -2261,19 +2267,22 @@ def _all_sell_rows() -> list[dict]:
         if size < _SELLS_CACHE["pos"]:
             _SELLS_CACHE.update(pos=0, rows=[])
         if size > _SELLS_CACHE["pos"]:
+            new_pos = _SELLS_CACHE["pos"]
             with LOG_PATH.open("rb") as f:
                 f.seek(_SELLS_CACHE["pos"])
-                blob = f.read(size - _SELLS_CACHE["pos"])
-            cut = blob.rfind(b"\n")
-            if cut >= 0:
-                for ln in blob[:cut + 1].decode("utf-8", "replace").splitlines():
+                for raw in f:
+                    if not raw.endswith(b"\n"):
+                        break               # незакінчений хвіст — не рухаємо pos, дочитаємо наступного разу
+                    new_pos += len(raw)
+                    if b'"action": "SELL"' not in raw:   # дешевий байтовий фільтр до json.loads —
+                        continue                          # SELL це частки відсотка рядків журналу
                     try:
-                        rec = json.loads(ln)
+                        rec = json.loads(raw)
                     except Exception:
                         continue
                     if rec.get("action") == "SELL":
                         _SELLS_CACHE["rows"].append(rec)
-                _SELLS_CACHE["pos"] += cut + 1
+            _SELLS_CACHE["pos"] = new_pos
         return list(_SELLS_CACHE["rows"])
 
 # Реальна швидкість сканування (не плутати з UI-лічильником у kpiData, який рахує
