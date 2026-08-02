@@ -1915,20 +1915,27 @@ def auto_manage_exits(chain: str) -> None:
                      **({"exit_context": exit_ctx} if exit_ctx else {})))
             if p.get("live"):
                 proceeds_sol = round(remainder_sol * (1 + pnl), 6)
+                total_sol_spent = orig_sol
+                total_sol_received = round(_f(p.get("realized_sol")) + proceeds_sol, 6)
+                total_usd_pnl = round(_f(p.get("realized_usd_pnl")) + pnl * CFG["auto_size_usd"] * rest, 4)
+                net_sol = round(total_sol_received - total_sol_spent, 6)
+                summary = (f"\n\nПідсумок угоди: витрачено {total_sol_spent:.4f} SOL, "
+                           f"отримано {total_sol_received:.4f} SOL\n"
+                           f"Чистий результат: {net_sol:+.4f} SOL ({total_usd_pnl:+.2f}$)")
                 if p.get("tp1_done"):
                     # після тейку1 захищає трейлінг/беззбитковий стоп (trailing_stop_price)
                     # завжди червоний — це вихід-стоп, а не свідома фіксація прибутку
                     send_telegram(
                         f"🔴 Закрито по трейлінговому стопу\n"
                         f"{p.get('symbol', '')} · PnL {pnl:+.1%}\n"
-                        f"Сума: {proceeds_sol:.4f} SOL")
+                        f"Сума: {proceeds_sol:.4f} SOL" + summary)
                 else:
                     # до тейку1 захищає лише початковий жорсткий стоп -35%
                     loss_sol = round(remainder_sol - proceeds_sol, 6)
                     send_telegram(
                         f"🔴 Закрито по стоп-лосу\n"
                         f"{p.get('symbol', '')} · {pnl:+.1%} від депозиту\n"
-                        f"Втрачено: {loss_sol:.4f} SOL")
+                        f"Втрачено: {loss_sol:.4f} SOL" + summary)
             ST.positions[:] = [x for x in ST.positions if x is not p]
         save_positions()
     for p in pool:
@@ -3252,8 +3259,13 @@ def _log_chain_partial(g: "GMGNAdapter", p: dict, frac: float, tag: str) -> None
              auto=bool(p.get("auto")), live=True, exit_tag=tag,
              entry_signal=p.get("entry_signal"), partial=True))
     p["chain_sold_frac"] = round(_f(p.get("chain_sold_frac")) + frac, 4)
+    proceeds_sol = round(sold_sol * (1 + pnl), 6)
+    # Накопичуємо реалізований результат по позиції — використовується для підсумку
+    # угоди в Telegram, коли вона повністю закриється (див. send_telegram нижче в do_sell/
+    # auto_manage_exits). Без цього підсумок на фінальному кроці бачив би лише останню ногу.
+    p["realized_sol"] = round(_f(p.get("realized_sol")) + proceeds_sol, 6)
+    p["realized_usd_pnl"] = round(_f(p.get("realized_usd_pnl")) + pnl * CFG["auto_size_usd"] * frac, 4)
     if p.get("live"):
-        proceeds_sol = round(sold_sol * (1 + pnl), 6)
         tp_label = "ТЕЙК 1" if tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
         tp_pct = int(CFG["auto_tp1_pct"] * 100) if tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
         send_telegram(
@@ -3518,21 +3530,31 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
                  **({"exit_context": exit_ctx} if exit_ctx else {})))
         if p.get("live"):
             proceeds_sol = round(p["size_sol"] * (1 + pnl), 6)
+            # Підсумок УСІЄЇ угоди (не лише цієї ноги) — додає раніше реалізовані тейки
+            # до цього фінального кроку. Без цього видно було б лише останню ногу, як
+            # у баг-кейсі LEMO (див. _log_chain_partial).
+            total_sol_spent = _f(p.get("orig_size_sol")) or p["size_sol"]
+            total_sol_received = round(_f(p.get("realized_sol")) + proceeds_sol, 6)
+            total_usd_pnl = round(_f(p.get("realized_usd_pnl")) + pnl * usd_notional, 4)
+            net_sol = round(total_sol_received - total_sol_spent, 6)
+            summary = (f"\n\nПідсумок угоди: витрачено {total_sol_spent:.4f} SOL, "
+                       f"отримано {total_sol_received:.4f} SOL\n"
+                       f"Чистий результат: {net_sol:+.4f} SOL ({total_usd_pnl:+.2f}$)")
             if exit_tag == "AUTO_TRAIL_BE":
                 # завжди червоний — це вихід-стоп, а не свідома фіксація прибутку
                 send_telegram(
                     f"🔴 Закрито по трейлінговому стопу\n"
-                    f"{p['symbol']} · PnL {pnl:+.1%}\nСума: {proceeds_sol:.4f} SOL")
+                    f"{p['symbol']} · PnL {pnl:+.1%}\nСума: {proceeds_sol:.4f} SOL" + summary)
             elif exit_tag == "AUTO_SL":
                 loss_sol = round(p["size_sol"] - proceeds_sol, 6)
                 send_telegram(
                     f"🔴 Закрито по стоп-лосу\n"
-                    f"{p['symbol']} · {pnl:+.1%} від депозиту\nВтрачено: {loss_sol:.4f} SOL")
+                    f"{p['symbol']} · {pnl:+.1%} від депозиту\nВтрачено: {loss_sol:.4f} SOL" + summary)
             else:
                 send_telegram(
                     f"{'🟢' if pnl >= 0 else '🔴'} ВИХІД\n"
                     f"{p['symbol']} · PnL {pnl:+.1%}{_mcap_line(p)}"
-                    + (f" · {exit_tag}" if exit_tag else " · ручний продаж"))
+                    + (f" · {exit_tag}" if exit_tag else " · ручний продаж") + summary)
         # Видалення за ідентичністю об'єкта, не за idx: idx знято до мережевого свопу (вище),
         # і поки лок був відпущений, інший потік міг встигнути змінити список — застарілий
         # idx міг би видалити не ту позицію.
@@ -3635,8 +3657,10 @@ def do_sell_partial(address: str, frac: float, exit_tag: str) -> dict:
             dict(address=p["address"], chain=pchain, size_sol=sell_size, pnl=pnl, usd_notional=usd_notional,
                  auto=bool(p.get("auto")), live=bool(p.get("live")),
                  exit_tag=exit_tag, entry_signal=p.get("entry_signal"), partial=True))
+        proceeds_sol = round(sell_size * (1 + pnl), 6)
+        p["realized_sol"] = round(_f(p.get("realized_sol")) + proceeds_sol, 6)
+        p["realized_usd_pnl"] = round(_f(p.get("realized_usd_pnl")) + pnl * usd_notional, 4)
         if p.get("live"):
-            proceeds_sol = round(sell_size * (1 + pnl), 6)
             tp_label = "ТЕЙК 1" if exit_tag == "AUTO_TP1_PARTIAL" else "ТЕЙК 2"
             tp_pct = int(CFG["auto_tp1_pct"] * 100) if exit_tag == "AUTO_TP1_PARTIAL" else int(CFG["auto_tp2_pct"] * 100)
             send_telegram(
