@@ -1707,38 +1707,55 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     """SHADOW-only 自动入场；调用方须已持有 ST.lock（从 screen_once 内调用，api_run 持锁跑它）。"""
     # 2026-07-30：用户明确要求解锁 LIVE 自动开仓（此前这里是「绝不在 LIVE 下自动开仓」的硬阀）。
     # 现在 LIVE + auto_trade 会**真实下单**，走 do_buy（条件单、成交价回填、链上校准都在那边）。
+    # 2026-08-03: усі return нижче раніше були німі — жодного логу, тож "чому саме X не
+    # купили" було в принципі невідповідальне питання (у SCREEN-записі це вже "待决策",
+    # рішення приймається саме тут, а слід губився). Кожна гілка тепер пише AUTO_BUY_SKIP
+    # з конкретною причиною — той самий action, що й risk-gate skip нижче.
     if ST.mode == "LIVE" and LIVE_TRADING_DISABLED:
-        return                               # 只剩顶层总闸还能拦（app.py 顶部的 LIVE_TRADING_DISABLED）
+        return                               # 只剩顶层总闸还能拦（app.py 顶部的 LIVE_TRADING_DISABLED，不記錄——這是全域開關，不是針對某個幣的判斷）
     if chain not in TRADEABLE_CHAINS:        # 用户明确要求：只在 SOL 开仓（见 TRADEABLE_CHAINS 注释）
         return
     if any(p["address"] == f.address and p.get("chain", "sol") == chain for p in ST.positions):
-        return                               # 已持有（人工或自动）→ 不重复开仓
+        return                               # 已持有（人工或自动）→ 不重复开仓（不記錄——高頻正常路徑，記了就是噪音）
     if f.address in ST.auto_traded_addresses:
+        log("AUTO_BUY_SKIP", f.symbol_safe, "地址已自动入场过一次（永不重复）")
         return                               # 用户明确要求：同一地址永远只自动入场一次，不管上次结果如何
     if v.crowdedness == "crowded":
+        log("AUTO_BUY_SKIP", f.symbol_safe, "LLM 判定拥挤/迟到（crowded）")
         return                               # LLM 已判定该币为"拥挤/迟到"（大概率已过高峰段），priority_score
                                               # 不看 crowdedness，靠这里硬拦，避免追进已经死掉的顶部
     if f.sniper_count > CFG["max_auto_sniper_count"]:
+        log("AUTO_BUY_SKIP", f.symbol_safe, f"狙击钱包过多 {f.sniper_count} > {CFG['max_auto_sniper_count']}")
         return                               # 狙击钱包过多 → 疑似秒买等拉盘就跑，目前只在 UI 标签展示、不影响评分，这里补硬拦
     if f.liquidity < CFG["min_auto_liquidity_usd"]:
+        log("AUTO_BUY_SKIP", f.symbol_safe, f"流动性不足 ${f.liquidity:.0f} < ${CFG['min_auto_liquidity_usd']:.0f}")
         return                               # 流动性太薄，$20 建仓/平仓本身就会显著滑价，止损/止盈价格会失真
     if f.swaps < CFG["min_auto_swaps"] or f.vol_1h < CFG["min_auto_volume_usd"]:
+        log("AUTO_BUY_SKIP", f.symbol_safe,
+            f"成交笔数/成交额过低 swaps={f.swaps} vol_1h=${f.vol_1h:.0f}")
         return                               # 成交笔数/成交额太小，buy_ratio 等比率型信号在个位数样本上是噪音不是信号
     if f.ath_mcap > 0 and f.mcap / f.ath_mcap < CFG["min_auto_ath_ratio"]:
+        log("AUTO_BUY_SKIP", f.symbol_safe,
+            f"现价/历史最高市值比过低 {f.mcap / f.ath_mcap:.2f} < {CFG['min_auto_ath_ratio']}")
         return                               # 当前市值/历史最高市值比例太低 → 主升浪已经走完，crowdedness="early"
                                               # 只看得到"现在在涨"，看不到"这是死透后的反弹"（真实事故：BUNKEE）
     if f.sm_confluence < CFG["min_auto_sm_confluence"]:
+        log("AUTO_BUY_SKIP", f.symbol_safe,
+            f"聪明钱+KOL 共识不足 {f.sm_confluence} < {CFG['min_auto_sm_confluence']}")
         return                               # 聪明钱+KOL 计数刚好卡在 hard_gates 最低线(1)不是好现象——
                                               # 真实事故：连续三笔亏损全部 sm_confluence==1，无任何安全冗余
     if f.dev_eval is not None and f.dev_eval < CFG["min_auto_dev_score"]:
+        log("AUTO_BUY_SKIP", f.symbol_safe, f"dev 评分不足 {f.dev_eval:.2f} < {CFG['min_auto_dev_score']}")
         return                               # dev 评分刚好卡在筛选流水线最低线(0.15)同理——
                                               # 三笔亏损里两笔 dev_score 正好等于 0.15
     if not (f.dev and f.dev.get("exited")):
+        log("AUTO_BUY_SKIP", f.symbol_safe, "dev 尚未清仓（或查不到 dev 历史）")
         return                               # 用户明确要求反过来：dev 必须已经清仓本币才买——dev 还握着仓位
                                               # 就随时可能砸盘；dev 已经出清、后续没有内部人能再靠抛售操纵价格，
                                               # 配合上面的 dev_score 门槛（历史记录不能太差）比"dev 还在场"更安全。
                                               # f.dev 为 None（没查到历史）按未知处理，同样不买。
     if f.age_min > CFG["max_token_age_min"]:
+        log("AUTO_BUY_SKIP", f.symbol_safe, f"币龄过大 {f.age_min:.1f}min > {CFG['max_token_age_min']}min")
         return                               # 超过 15 分钟的币实测系统性亏损（见 CFG 注释的分桶数据）；
                                               # 无条件拦截——原先的 conviction 例外实测只漏亏损单，已删
     g = ST.adapter_for(chain)
