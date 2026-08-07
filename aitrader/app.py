@@ -1653,11 +1653,16 @@ def build_condition_orders() -> list[dict]:
       loss_stop                       → 相对入场的**跌幅**百分数（"35" = 跌 35%）
 
     移动止盈是**近似**：见 CFG live_trailing_drawdown_pct 注释——我们的规则是回撤固定
-    百分点，GMGN 只能表达固定的价格回撤比例，取值刻意偏松，只作兜底，不抢在本地逻辑前面。"""
+    百分点，GMGN 只能表达固定的价格回撤比例，取值刻意偏松，只作兜底，不抢在本地逻辑前面。
+
+    ⚠️ 2026-08-07:硬止损（loss_stop）**故意不**放在这里了。实测触发时的真实成交带
+    `tip_fee: "0"` —— swap() 里传的 tip_fee/priority_fee 只作用于买入这笔交易本身，
+    condition_orders 里挂的子单后续被 GMGN 自己的机器人触发时并不继承这两个参数。
+    暴跌时没有小费的交易在拥堵的区块里排不上号，这正是止损屡屡跑输标称 -35% 一大截
+    的具体机制之一。现在改为买入成交后立刻用 strategy_create_stop()（跟移动止损同一
+    条路径）单独挂一个绝对价止损单——那条路径的 tip_fee/priority_fee 从一开始就是显式
+    必填的，见 do_buy() 里的调用。"""
     orders = [
-        # 硬止损：第一次部分止盈前保护全仓
-        dict(order_type="loss_stop", side="sell",
-             price_scale=str(round(CFG["hard_stop_pct"] * 100, 4)), sell_ratio="100"),
         dict(order_type="profit_stop", side="sell",
              price_scale=str(round(CFG["auto_tp1_pct"] * 100, 4)),
              sell_ratio=str(round(CFG["auto_tp1_sell_frac"] * 100, 4))),
@@ -1961,10 +1966,13 @@ def auto_manage_exits(chain: str) -> None:
             continue
         # LIVE 且该阶段**确实有链上保护**时，价格类退出归 GMGN 管，本地只负责逃生。
         # 不这样分工就会双重卖出——涨到 +20% 时 GMGN 卖 30%，本地这遍看到 pnl>=20% 又卖 30%。
-        # 保护来源随阶段变化：第一次止盈前是建仓时挂的条件单组；之后是 _live_arm_stop 挂的
-        # 绝对价格止损单。任一环节失败（对应 id 为空）→ 本地立刻接管完整逻辑，不会裸奔。
+        # 保护来源按决策类型分（2026-08-07 起，不再按 tp1_done 分阶段）：硬止损/移动止损
+        # 都走 live_stop_id（同一条 strategy_create_stop 路径，见 do_buy/_live_arm_stop）；
+        # 部分止盈仍是买入时挂的 condition_orders 组，走 live_strategy_id。
+        # 任一环节失败（对应 id 为空）→ 本地立刻接管完整逻辑，不会裸奔。
         if p.get("live") and decision[-1] != "AUTO_ESCAPE":
-            protected = p.get("live_stop_id") if p.get("tp1_done") else p.get("live_strategy_id")
+            protected = (p.get("live_stop_id") if decision[-1] in ("AUTO_SL", "AUTO_TRAIL_BE")
+                         else p.get("live_strategy_id"))
             if protected:
                 continue
         try:
@@ -2789,9 +2797,11 @@ def _live_price_watch_loop():
                                 continue
                             # Той самий поділ обов'язків, що в auto_manage_exits: поки на боці
                             # GMGN живий ордер, цінові виходи — його справа, наша тут лише втеча.
+                            # d[0]=="full" тут уже відфільтровано вище, тож d[-1] — завжди
+                            # AUTO_SL/AUTO_TRAIL_BE/AUTO_ESCAPE, а не частковий тейк; захист
+                            # для обох перших двох — один і той самий live_stop_id (2026-08-07).
                             if d[-1] != "AUTO_ESCAPE":
-                                protected = (p.get("live_stop_id") if p.get("tp1_done")
-                                             else p.get("live_strategy_id"))
+                                protected = p.get("live_stop_id")
                                 if protected:
                                     continue
                             to_sell.append((p["address"], d[1]))
@@ -3075,10 +3085,36 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
                     entry_price = real
         except Exception as e:
             log("LIVE_FILL_PRICE_FAIL", symbol, f"读取实际成交价失败，沿用下单前快照：{e}")
+        # Жорсткий стоп -35% — окремим ордером тим самим шляхом, що й пізніший трейлінг
+        # (strategy_create_stop), а НЕ в condition_orders свопу купівлі: див. коментар
+        # у build_condition_orders() — тільки тут tip_fee/priority_fee реально йдуть
+        # на транзакцію, яка спрацює під час обвалу, а не лише на саму купівлю.
+        hard_stop_id = None
+        hard_stop_price = 0.0
+        if entry_tokens and entry_price > 0:
+            try:
+                dec = g.token_decimals(address)
+                hard_stop_price = entry_price * (1 - CFG["hard_stop_pct"])
+                r = g.strategy_create_stop(
+                    wallet=wallet, base_token=address, quote_token=native_token(chain),
+                    check_price=hard_stop_price, amount_in=int(entry_tokens * (10 ** dec)),
+                    slippage=CFG["live_slippage_sell"],
+                    priority_fee=CFG["live_priority_fee_sol"], tip_fee=CFG["live_tip_fee_sol"])
+                hard_stop_id = r.get("order_id")
+                if not hard_stop_id:
+                    raise RuntimeError(f"немає order_id у відповіді: {r}")
+            except Exception as e:
+                log("LIVE_NO_STOPLOSS", symbol,
+                    f"⚠ жорсткий стоп окремим ордером не встав: {e} — позиція тимчасово "
+                    f"без GMGN-ордера захисту, локальний цикл підхопить негайно")
+                hard_stop_id = None
+                hard_stop_price = 0.0
     else:
         filled = False
         live_strategy = None
         entry_tokens = None
+        hard_stop_id = None
+        hard_stop_price = 0.0
         status_msg = "SHADOW（未真实发送，需切 LIVE + 配签名密钥）"
 
     ST.positions.append(dict(symbol=symbol, address=address, size_sol=round(size_sol, 4),
@@ -3089,7 +3125,7 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
                              # 记下策略单 id，逃生离场前要先撤，否则策略单会对着空仓乱触发。
                              live=(ST.mode == "LIVE" and not LIVE_TRADING_DISABLED),
                              live_strategy_id=live_strategy,
-                             live_stop_id=None, live_stop_price=0.0,
+                             live_stop_id=hard_stop_id, live_stop_price=hard_stop_price,
                              entry_token_amount=entry_tokens,
                              entry_signal=_manual_entry_signal(chain, address),
                              auto_gates=gates,
@@ -3164,25 +3200,25 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
     # 建仓当时可能因为策略入库延迟没查到（swap 响应里本来就没有这个字段）。
     # 不补的后果很具体：仓位被当成"无保护"，本地逻辑会跟 GMGN 抢着卖，
     # 涨到 +20% 时两边各卖 30% = 卖掉 60%。所以每轮都尝试认领一次。
+    #
+    # ⚠️ 2026-08-07: live_strategy_id 现在只对应买入时挂的止盈组（TP1/TP2），
+    # 硬止损已经搬到 live_stop_id（走 strategy_create_stop，见 do_buy）——所以这里
+    # 丢失/找回只关心止盈，跟止损健康与否无关，不再触发 _live_rearm_hard_stop。
     if CFG["live_condition_orders"]:
-        # **每轮都查**，不是只在缺失时查。止损不只会创建失败，还会**触发时失败**：
-        # 2026-07-30 实测 CSC —— 建仓时 status=check（已武装），价格跌穿 -35% 时变成 failed，
-        # 币根本没卖出去，等我们发现已经 -40%。原来的写法只在 live_strategy_id 为空时回查，
-        # 所以一旦认定"有保护"就永远不再复核，本地逻辑一直让路，等于两边都没人管。
         sid = _find_live_strategy(g, g.wallet_address(), p["address"], tries=1)
         if sid and not p.get("live_strategy_id"):
             p["live_strategy_id"] = sid
             log("LIVE_STRATEGY_RECLAIMED", p.get("symbol", ""), f"补回条件单 {sid}")
         elif not sid and p.get("live_strategy_id"):
-            # 之前有、现在没了（或止损已 failed）→ 立刻交还给本地逻辑，别再让路
             p["live_strategy_id"] = None
-            log("LIVE_STOPLOSS_LOST", p.get("symbol", ""),
-                "⚠ 链上止损已失效（触发失败或被撤），本地逻辑接管")
-            # 立刻补挂一张新的：2026-07-30 复盘发现，止损失效**几乎总是发生在第一次止盈之前**，
-            # 而 _live_arm_stop 只在 tp1_done 之后才动作——也就是说这段时间仓位实际上**完全裸奔**，
-            # 只剩每 12-17 秒一次的本地轮询，而它连 Hardy 那种插针式暴跌都看不见（跌穿又弹回，
-            # 两次轮询之间就结束了）。补挂用的是同一个 -35% 触发价，只是这次带 20% 滑点容忍度。
-            _live_rearm_hard_stop(g, p)
+            log("LIVE_TP_ORDER_LOST", p.get("symbol", ""),
+                "⚠ 链上止盈条件单已失效（触发失败或被撤），本地逻辑接管止盈判断")
+    # Стоп-лос (live_stop_id) — окрема перевірка, щоразу до тейку1: якщо ордера немає
+    # (ще не встав при купівлі, або TODO: тихо провалився пізніше — на це поки немає
+    # окремого детектора, той самий пробіл був і в трейлінгу через _live_arm_stop),
+    # спробувати заново. Функція сама не робить нічого, якщо live_stop_id вже є.
+    if not p.get("tp1_done"):
+        _live_rearm_hard_stop(g, p)
 
     # ── 自愈 2：补回建仓数量 ─────────────────────────────────────────────
     # 建仓后立刻读余额常常拿到 0（成交与索引之间有延迟）。只要还没发生过部分止盈，
