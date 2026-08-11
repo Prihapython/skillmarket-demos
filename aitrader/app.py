@@ -218,6 +218,22 @@ CFG = {
     # обґрунтована незалежно від числа; число перевіряти в SHADOW, див. NEXT.md.
     "auto_post_tp1_floor_pct": 0.12,
 
+    # ── Відкладений вхід «почекати відкат» (2026-08-11, SHADOW-вимірювання) ──────
+    # Бот купував у ту саму мить, коли спрацювали ворота. На бектесті реальних
+    # 1-хвилинних свічок (103 токени, 6 год після входу) це виявилось систематично
+    # гіршим за «почекати ~5 хв і купити, тільки якщо ціна впала на ≥5% від рівня,
+    # на якому спрацювали ворота»: -0.4% проти +10.5% нетто на угоду.
+    # Правило вижило там, де попередні три напрями не вижили: 20 із 20 підвибірок
+    # (сітка час × глибина відкату, розбита навпіл за періодом) позитивні, бутстрап
+    # дає 86% ресемплів вище тертя.
+    # ⚠️ АЛЕ: медіана угоди від'ємна (-9.7%), середнє тримається на 2-3 викидах із 49,
+    # 95% ДІ -4.5%..+34.2% накриває нуль. Це НЕ доведена перевага — це найкращий
+    # кандидат, гідний вимірювання на папері. Умова визнання: див. NEXT.md.
+    # 0 у auto_entry_delay_min повністю вимикає механізм (повернення до старої поведінки).
+    "auto_entry_delay_min": 5.0,       # скільки чекати після спрацювання воріт
+    "auto_entry_dip_pct": 0.05,        # наскільки ціна має впасти від рівня воріт
+    "auto_entry_watch_expiry_min": 12.0,  # не дочекались відкату — забути токен назавжди
+
     # ── LIVE 下单参数（SHADOW 完全用不到）──────────────────────────────────
     # 滑点：gmgn-cli 的 --slippage 单位是**百分数**（30 = 30%），不是小数。
     # 旧代码硬编码 0.01/0.02 实为 0.01%/0.02%，任何 meme 都不可能成交。
@@ -1735,6 +1751,59 @@ def native_usd_price(g: "GMGNAdapter", chain: str) -> float:
         pass
     return NATIVE_USD_FALLBACK.get(chain, 150.0)
 
+def _auto_entry_dip_ready(chain: str, f: "TokenFeatures") -> bool | None:
+    """Чи можна купувати ЗАРАЗ, з погляду механізму «почекати відкат».
+
+    Три можливі відповіді, і кожна значуща окремо:
+      True  — відкат стався, купуємо (і викликач має пропустити гейт crowded)
+      False — механізм вимкнено (auto_entry_delay_min <= 0), купуємо як раніше
+      None  — ще чекаємо / вікно вичерпано → викликач мусить вийти без покупки
+
+    Повертає None також коли не вдалось дістати ціну: без ціни немає ні точки
+    відліку, ні порівняння, і купувати «наосліп» тут гірше, ніж пропустити."""
+    delay = CFG["auto_entry_delay_min"]
+    if delay <= 0:
+        return False
+    try:
+        px = ST.adapter_for(chain).token_price(f.address)
+    except Exception as e:
+        log("AUTO_BUY_SKIP", f.symbol_safe, f"немає ціни для перевірки відкату: {e}")
+        return None
+    if not px or px <= 0:
+        log("AUTO_BUY_SKIP", f.symbol_safe, "немає ціни для перевірки відкату")
+        return None
+    pend = ST.pending_entries.get(f.address)
+    now = time.monotonic()
+    if pend is None:
+        # Прибирання протухлих: токен, що зник із热榜, більше сюди не потрапить і його
+        # запис лишився б назавжди. Дешевше підмести тут, ніж заводити окремий цикл.
+        cutoff = CFG["auto_entry_watch_expiry_min"] * 60
+        for addr in [a for a, d in ST.pending_entries.items() if now - d["t"] > cutoff]:
+            ST.pending_entries.pop(addr, None)
+        ST.pending_entries[f.address] = dict(ref=px, t=now, sym=f.symbol_safe)
+        log("AUTO_BUY_DEFER", f.symbol_safe,
+            f"ворота пройдено · чекаємо {delay:.0f} хв на відкат ≥{CFG['auto_entry_dip_pct']:.0%}",
+            dict(ref_price=px, delay_min=delay, dip_pct=CFG["auto_entry_dip_pct"]))
+        return None
+    waited = (now - pend["t"]) / 60.0
+    if waited < delay:
+        return None                          # ще рано (мовчки — це високочастотний нормальний шлях)
+    target = pend["ref"] * (1 - CFG["auto_entry_dip_pct"])
+    if px <= target:
+        ST.pending_entries.pop(f.address, None)
+        log("AUTO_BUY_DIP_OK", f.symbol_safe,
+            f"відкат дочекались за {waited:.1f} хв — купуємо",
+            dict(ref_price=pend["ref"], now_price=px, drop_pct=round(px / pend["ref"] - 1, 4)))
+        return True
+    if waited > CFG["auto_entry_watch_expiry_min"]:
+        ST.pending_entries.pop(f.address, None)
+        ST.auto_traded_addresses.add(f.address)   # більше не повертатись до цього токена
+        save_auto_traded_addresses()
+        log("AUTO_BUY_SKIP", f.symbol_safe,
+            f"за {waited:.1f} хв відкату не сталось — вікно закрито",
+            dict(ref_price=pend["ref"], now_price=px, drop_pct=round(px / pend["ref"] - 1, 4)))
+    return None
+
 def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int) -> None:
     """SHADOW-only 自动入场；调用方须已持有 ST.lock（从 screen_once 内调用，api_run 持锁跑它）。"""
     # 2026-07-30：用户明确要求解锁 LIVE 自动开仓（此前这里是「绝不在 LIVE 下自动开仓」的硬阀）。
@@ -1752,10 +1821,17 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     if f.address in ST.auto_traded_addresses:
         log("AUTO_BUY_SKIP", f.symbol_safe, "地址已自动入场过一次（永不重复）")
         return                               # 用户明确要求：同一地址永远只自动入场一次，不管上次结果如何
-    if v.crowdedness == "crowded":
+    dip_confirmed = _auto_entry_dip_ready(chain, f)
+    if dip_confirmed is None:
+        return                               # ще чекаємо на відкат (або вікно вичерпано) — причина вже в журналі
+    if v.crowdedness == "crowded" and not dip_confirmed:
         log("AUTO_BUY_SKIP", f.symbol_safe, "LLM 判定拥挤/迟到（crowded）")
         return                               # LLM 已判定该币为"拥挤/迟到"（大概率已过高峰段），priority_score
                                               # 不看 crowdedness，靠这里硬拦，避免追进已经死掉的顶部
+                                              # Виняток для dip_confirmed: відкат на ≥5% майже завжди
+                                              # заганяє 5-хвилинну зміну під поріг early → токен стає
+                                              # "crowded" саме тому, що впав. Тобто цей гейт відсіював би
+                                              # рівно те, що механізм відкладеного входу шукає навмисно.
     if f.sniper_count > CFG["max_auto_sniper_count"]:
         log("AUTO_BUY_SKIP", f.symbol_safe, f"狙击钱包过多 {f.sniper_count} > {CFG['max_auto_sniper_count']}")
         return                               # 狙击钱包过多 → 疑似秒买等拉盘就跑，目前只在 UI 标签展示、不影响评分，这里补硬拦
@@ -2105,6 +2181,11 @@ class AppState:
                                        # （mode 本身仍不落盘、重启回默认 SHADOW——即使 auto_trade 恢复为 True，
                                        # 也只在 mode=="SHADOW" 时才真正生效，LIVE 下这条路径全程不触发）
         self.auto_traded_addresses: set[str] = load_auto_traded_addresses()  # 永久黑名单：同一地址只自动入场一次
+        # Токени, що пройшли ворота й тепер чекають на відкат (див. CFG["auto_entry_delay_min"]).
+        # address -> {"ref": ціна на момент воріт, "t": monotonic, "sym": символ}
+        # Свідомо НЕ зберігається на диск: запис живе 5-12 хв, а рестарт із порожнім
+        # списком лише пропускає кілька входів — на відміну від позицій, тут нема чого втрачати.
+        self.pending_entries: dict[str, dict] = {}
         self.chain = CFG["chain"]     # 启动默认链（仅用于未带 chain 的请求兜底 + status 展示）
         self.live = False             # 是否已配 key（决定按链建 Live 还是 Mock 适配器）
         self._adapters: dict[str, GMGNAdapter] = {}              # chain -> 适配器（缓存）
