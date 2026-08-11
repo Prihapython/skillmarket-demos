@@ -192,7 +192,7 @@ CFG = {
     "min_auto_ath_ratio": 0.6,
     # 自动交易离场（用户指定，2026-07-24 起改四段）：
     #   1) +20% 第一次部分止盈：卖原始仓位的 30%，锁定利润；
-    #      剩余仓位止损立即上移到保本价（entry_price）——从此这笔交易再也不可能亏钱；
+    #      剩余仓位止损立即上移到 auto_post_tp1_floor_pct（2026-08-11 前是保本价 entry_price）；
     #   2) +50% 第二次部分止盈：再卖原始仓位的 30%（与第一刀口径一致，不是"剩余仓位的 30%"）；
     #      从第 1 步开始，保本价+移动止损的保护在整个过程中持续生效（不因等第二刀而暂停）；
     #   3) 两刀之后剩下的 40%：只用移动止损 25%（保本价与移动止损取更高者）管理，只升不降，
@@ -207,6 +207,16 @@ CFG = {
     "auto_tp2_sell_frac": 0.25,     # 30%→25% (компенсує зростання частки на тейку1: 50+25+25=100%)
                                     #按"原始仓位"的比例算，与 auto_tp1_sell_frac 口径一致
     "auto_trailing_pct": 0.25,
+    # Пол прибутку для залишку позиції після тейку1 (у частках від входу).
+    # 2026-08-11: був жорсткий 0.0 («беззбиток») — і це виявилось детермінованим витоком,
+    # а не нейтральним запобіжником. Розбір 105 реальних AUTO-угод (30.07-11.08): з 68 угод,
+    # що дійшли до тейку1, лише 26 дійшли до тейку2, а залишок решти 42 виходив у середньому
+    # на **+0.1%** — тобто рівно в нерухому точку формули max(0, пік−25 п.п.). Типовий
+    # виграш через це = +9.7% проти типового програшу -33.8%: потрібен вінрейт 68%, факт 58-63%.
+    # ⚠️ Саме число 0.12 підігнане на вже побачених угодах (контрфактично +$10.5 брутто на тій
+    # самій вибірці) — воно НЕ перевірене на свіжих даних. Структурна частина зміни (пол > 0)
+    # обґрунтована незалежно від числа; число перевіряти в SHADOW, див. NEXT.md.
+    "auto_post_tp1_floor_pct": 0.12,
 
     # ── LIVE 下单参数（SHADOW 完全用不到）──────────────────────────────────
     # 滑点：gmgn-cli 的 --slippage 单位是**百分数**（30 = 30%），不是小数。
@@ -1634,8 +1644,10 @@ def position_size(g: "GMGNAdapter", chain: str) -> float:
 def trailing_stop_price(p: dict) -> float:
     """第一次部分止盈之后，这笔仓位的止损价 —— **全系统唯一定义**。
 
-    规则（用户指定）：止损 = max(保本价, 峰值涨幅 - auto_trailing_pct 个百分点)，只升不降。
-    注意第二次止盈**不改止损规则**，只是多卖 30%，所以 tp1 之后自始至终就这一个公式。
+    规则：止损 = max(入场价 × (1 + auto_post_tp1_floor_pct), 峰值涨幅 - auto_trailing_pct 个百分点)，
+    只升不降。注意第二次止盈**不改止损规则**，只是多卖一刀，所以 tp1 之后自始至终就这一个公式。
+    2026-08-11 之前那个兜底是写死的 0%（"保本"），实盘证明它是漏点而非中性保险——见 CFG
+    里 auto_post_tp1_floor_pct 的注释。
 
     本地轮询（_auto_decide_exit）与挂到 GMGN 的止损单（_live_arm_stop）都调这里，
     绝不各自再算一遍——`exit_plan()` 的注释里已经吃过"两处各维护一份、慢慢就不一致"的亏，
@@ -1647,7 +1659,12 @@ def trailing_stop_price(p: dict) -> float:
         return 0.0
     peak = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0), entry)
     peak_pct = peak / entry - 1
-    stop_pct = max(0.0, peak_pct - CFG["auto_trailing_pct"])   # 保本兜底：回撤后的止损不低于 0%
+    # 兜底不再是"保本"(0%)，而是 auto_post_tp1_floor_pct：0% 是这条公式的不动点，
+    # 42/68 笔实盘交易的剩余仓位正好停在 +0.1% 离场（见 CFG 里那条注释的数据）。
+    # 夹在 tp1 阈值之下：floor >= auto_tp1_pct 会让止损价在第一刀成交的瞬间就已经在现价之上，
+    # 剩余仓位当场被全部清掉——配置写错时宁可退化成原来的行为，也不能变成"止盈即清仓"。
+    floor = min(CFG["auto_post_tp1_floor_pct"], CFG["auto_tp1_pct"] - 0.02)
+    stop_pct = max(floor, peak_pct - CFG["auto_trailing_pct"])
     return entry * (1 + stop_pct)
 
 def build_condition_orders() -> list[dict]:
@@ -1694,7 +1711,8 @@ def exit_plan() -> dict:
     tp = [f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%",
           f"+{int(CFG['auto_tp2_pct']*100)}%→卖{int(CFG['auto_tp2_sell_frac']*100)}%"]
     return dict(hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%", tp_ladder=tp,
-                trailing=f"{int(CFG['auto_trailing_pct']*100)}%")
+                trailing=f"{int(CFG['auto_trailing_pct']*100)}%",
+                post_tp1_floor=f"+{int(CFG['auto_post_tp1_floor_pct']*100)}%")
 
 # ──────────────────────────────────────────────────────────────────────────
 # 8b. SHADOW-only 自动交易（人在环铁律的有意收窄豁免，仅纸面模拟；见 SPEC.md §2/§14）
@@ -1702,8 +1720,8 @@ def exit_plan() -> dict:
 #     离场：三段式（用户指定，见 CFG 里 auto_tp1_*/auto_trailing_pct 注释）：
 #       1) 逃生 severity≥escape_severity → 任何阶段都立即全仓离场；
 #       2) 部分止盈前：pnl≤-hard_stop_pct → 全仓止损；pnl≥auto_tp1_pct(+20%) → 卖出
-#          auto_tp1_sell_frac(30%)、锁定利润，剩余仓位止损上移到保本价(entry_price)；
-#       3) 部分止盈后：剩余仓位止损 = max(保本价, 峰值涨幅 - auto_trailing_pct 个百分点)，只升不降
+#          auto_tp1_sell_frac、锁定利润，剩余仓位止损上移到 auto_post_tp1_floor_pct（不再是保本价）；
+#       3) 部分止盈后：剩余仓位止损 = max(该利润地板, 峰值涨幅 - auto_trailing_pct 个百分点)，只升不降
 #          （注意：是回撤固定**百分点**，不是回撤峰值价格的 auto_trailing_pct **比例**——
 #           以 _auto_decide_exit 的实现为准，见其内部注释）
 #          （保证不再亏钱），无固定金额硬止盈上限——不强制清仓，只靠移动止损让盈利奔跑。
@@ -1840,7 +1858,8 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     log("BUY", f.symbol_safe, f"{ST.mode} AUTO {'成交' if ST.mode == 'LIVE' else '记录'} {size_native} ({chain})",
         dict(address=f.address, size_sol=size_native, chain=chain, auto=True, live=(ST.mode == "LIVE"),
              entry_signal=sig, hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%",
-             tp1=f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%+保本",
+             tp1=(f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%"
+                  f"+锁定 +{int(CFG['auto_post_tp1_floor_pct']*100)}%"),
              tp2=f"+{int(CFG['auto_tp2_pct']*100)}%→卖{int(CFG['auto_tp2_sell_frac']*100)}%",
              trailing=f"{int(CFG['auto_trailing_pct']*100)}%（无固定止盈上限）"))
 
@@ -3262,7 +3281,8 @@ def _live_sync_from_chain(g: "GMGNAdapter", p: dict) -> None:
             p["tp1_done"] = True
             p["peak_price"] = max(p.get("peak_price", 0.0), p.get("cur_price", 0.0))
             log("LIVE_TP1_DETECTED", p.get("symbol", ""),
-                f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到保本")
+                f"链上余额剩 {left:.0%} → 第一次止盈已成交，止损抬到 "
+                f"+{int(CFG['auto_post_tp1_floor_pct']*100)}%")
             _log_chain_partial(g, p, tp1_frac, "AUTO_TP1_PARTIAL")
             remaining = round(remaining - tp1_frac, 4)
         if remaining >= 0.02 and not p.get("tp2_done"):
