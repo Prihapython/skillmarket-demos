@@ -3271,12 +3271,23 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
         # (strategy_create_stop), а НЕ в condition_orders свопу купівлі: див. коментар
         # у build_condition_orders() — тільки тут tip_fee/priority_fee реально йдуть
         # на транзакцію, яка спрацює під час обвалу, а не лише на саму купівлю.
+        #
+        # ⚠️ У режимі «лише трейлінг» початковий стоп мусить одразу стояти на трейлінговому
+        # рівні (-auto_trail_only_pct), а не на -35%. Інакше кожна LIVE-угода перші секунди
+        # свого життя захищена втричі слабше за конструкцію, яку ми перевіряємо: до трейлінгу
+        # її підтягне лише _live_arm_stop() на наступному раунді головного циклу (до ~14 с
+        # плюс мережа), а заміряна медіана утримання в цьому режимі — 1.4 хв, тобто це
+        # помітна частка угоди. Той самий поділ уже зроблено в _live_rearm_hard_stop().
         hard_stop_id = None
         hard_stop_price = 0.0
         if entry_tokens and entry_price > 0:
             try:
                 dec = g.token_decimals(address)
-                hard_stop_price = entry_price * (1 - CFG["hard_stop_pct"])
+                hard_stop_price = (
+                    trailing_stop_price(dict(entry_price=entry_price, peak_price=entry_price,
+                                             cur_price=entry_price))
+                    if CFG["auto_exit_trail_only"]
+                    else entry_price * (1 - CFG["hard_stop_pct"]))
                 r = g.strategy_create_stop(
                     wallet=wallet, base_token=address, quote_token=native_token(chain),
                     check_price=hard_stop_price, amount_in=int(entry_tokens * (10 ** dec)),
