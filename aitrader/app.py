@@ -1763,7 +1763,11 @@ def exit_plan() -> dict:
     （auto_tp1_*/auto_tp2_*/auto_trailing_pct/hard_stop_pct），保证人工看到的计划与
     auto 实际执行的退出逻辑永远是同一份数字，不会像过去那样各自维护、渐渐不一致。"""
     if CFG["auto_exit_trail_only"]:
-        return dict(hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%", tp_ladder=[],
+        # hard_sl тут — саме трейлінговий рівень, а не hard_stop_pct: на вході пік == вхід,
+        # тож стоп реально стоїть на -auto_trail_only_pct, а -35% лишається недосяжною
+        # абсолютною межею. Показувати «-35%» означало б підписати інтерфейс і журнал
+        # утричі слабшим захистом, ніж діє насправді.
+        return dict(hard_sl=f"-{int(CFG['auto_trail_only_pct']*100)}%", tp_ladder=[],
                     trailing=f"{int(CFG['auto_trail_only_pct']*100)}% від піку, з моменту входу",
                     post_tp1_floor=None)
     tp = [f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%",
@@ -1974,12 +1978,14 @@ def auto_open_position(chain: str, f: "TokenFeatures", v: "LLMVerdict", pri: int
     save_auto_traded_addresses()
     save_positions()
     log("BUY", f.symbol_safe, f"{ST.mode} AUTO {'成交' if ST.mode == 'LIVE' else '记录'} {size_native} ({chain})",
+        # План виходу — через exit_plan(), як і ручний do_buy, а не власною копією рядків:
+        # ця гілка описувала сходинку жорстко зашитим текстом, тож із 11.08 (`4ff119c`,
+        # режим «лише трейлінг») кожен BUY-запис стверджував «hard_sl -35%, tp1 +20%,
+        # trailing 25%» — нічого з цього вже не діяло. Журнал — єдине джерело для
+        # подальшого аналізу, і він не має права описувати конструкцію, якої не було.
+        # entry_price потрібен там же: без нього угоду неможливо звірити зі свічками.
         dict(address=f.address, size_sol=size_native, chain=chain, auto=True, live=(ST.mode == "LIVE"),
-             entry_signal=sig, hard_sl=f"-{int(CFG['hard_stop_pct']*100)}%",
-             tp1=(f"+{int(CFG['auto_tp1_pct']*100)}%→卖{int(CFG['auto_tp1_sell_frac']*100)}%"
-                  f"+锁定 +{int(CFG['auto_post_tp1_floor_pct']*100)}%"),
-             tp2=f"+{int(CFG['auto_tp2_pct']*100)}%→卖{int(CFG['auto_tp2_sell_frac']*100)}%",
-             trailing=f"{int(CFG['auto_trailing_pct']*100)}%（无固定止盈上限）"))
+             entry_signal=sig, entry_price=entry_price, **exit_plan()))
 
 def _auto_decide_exit(p: dict):
     """纯规则判断该 auto 持仓本轮该怎么处理；顺带更新 p 的 peak_price（供移动止损用）。
@@ -3329,7 +3335,8 @@ def do_buy(chain: str, address: str, size_sol: float, from_auto: bool = False) -
     save_positions()
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
     log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})",
-        dict(size_sol=size_sol, chain=chain, auto_gates=gates, **exit_plan()))
+        dict(address=address, size_sol=size_sol, chain=chain, entry_price=entry_price,
+             auto_gates=gates, **exit_plan()))
     if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
         # token_info не віддає готове поле капіталізації — тільки price + supply окремо
         # (сама trending-стрічка рахує market_cap так само, з тих самих двох чисел).
@@ -3785,6 +3792,12 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
             dict(address=p["address"], chain=pchain, size_sol=p["size_sol"], pnl=pnl, usd_notional=usd_notional,
                  auto=bool(p.get("auto")), live=bool(p.get("live")),   # без цього真钱 угода не потрапляє в реальну статистику
                  exit_tag=exit_tag, entry_signal=p.get("entry_signal"),
+                 # Три ціни, без яких угоду неможливо перевірити нічим, крім нашого ж pnl:
+                 # вхід, факт виходу і пік, що вів трейлінг. Саме розбіжність між піком,
+                 # який бачило наше опитування, і справжнім рухом ціни — головне питання
+                 # до режиму «лише трейлінг» (див. NEXT.md, блок 2026-08-13).
+                 entry_price=_f(p.get("entry_price")), exit_price=_f(p.get("cur_price")),
+                 peak_price=_f(p.get("peak_price")),
                  **({"exit_context": exit_ctx} if exit_ctx else {})))
         if p.get("live"):
             proceeds_sol = round(p["size_sol"] * (1 + pnl), 6)
