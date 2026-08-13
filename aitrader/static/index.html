@@ -594,7 +594,7 @@ const I18N={
     tm_data:'采集数据', tm_manual:'手动', tm_auto:'自动', tm_off:'已停止',
     tm_switched:(m)=>`模式：${m}`,
     tm_warn_manual:'手动 —— 真实资金。你决定何时买入，卖出由机器人管（止损/止盈/移动止损）。',
-    tm_warn_auto:(sz,mx)=>`自动 —— 真实资金。机器人自己选币、自己按 $${sz} 建仓、自己平仓，最多 ${mx} 笔并发（在场上限 $${(sz*mx).toFixed(0)}），无人值守且重启后继续。`,
+    tm_warn_auto:(sz)=>`自动 —— 真实资金。机器人自己选币、自己按 $${sz} 建仓、自己平仓，无人值守且重启后继续。<b>并发笔数没有上限</b>：一轮里过闸的币有几个就开几笔，在场金额没有封顶。`,
     be_ok:'已连接',
     be_down:'未连接',
     be_down_hint:'连不上后端 —— 页面不会显示任何数据（DEMO 假数据模式已移除）',
@@ -691,8 +691,11 @@ const I18N={
     sig_5mweak:'5m 动能转弱、卖压上来', sig_mintback:'增发权疑似找回（可砸盘）← 逃生信号',
     sig_top10sell:'top10 持有人开始减持', sig_devout:'dev 关联钱包转出', sig_lppull:'LP 流动性撤离启动 ← 逃生信号',
     alert_lp:'逃生信号：LP 撤离启动，建议立即平仓',
-    exit_full:'SL -35% · TP +20%→卖30% / +50%→卖30% · 移动止损 25%',
-    exit_ladder:'SL -35% · TP 阶梯 · 移动止损 25%',
+    // ⚠️ 这两条只给下面的演示行（CLEANCAT/BASEPEPE）用，真实行走 exit_plan()。
+    // 2026-08-13 审计：内容原为止盈阶梯，那套从 11.08(4ff119c) 起就没在跑了。
+    // 改退出设计时记得回来改这里——它们是静态串，不会自己跟着 CFG 走。
+    exit_full:'移动止损 12 个百分点（自入场起，只升不降）',
+    exit_ladder:'移动止损 12 个百分点（无止盈阶梯）',
     th_cleancat:'48 聪明钱 + 16 知名 KOL 在场，放权完成、筹码尚分散。',
     th_gooddog:'9 聪明钱 + 3 KOL 早期吸筹，放权完成、筹码分散。',
     th_basepepe:'质量门全过；但买入会触及并发/敞口上限，风控提示你先腾位。',
@@ -728,14 +731,12 @@ const I18N={
     buy_log_reason:(live,size,exit)=>`${live?'LIVE 真实成交 ':'SHADOW 记录 '}${size} SOL · ${exit}`,
     toast_buy_fail:(m)=>`下单失败：${m}`, buy_ordering:'下单中…',
     toast_trade_locked:'链上交易已锁（LIVE_TRADING_DISABLED），无法切到 LIVE。后端始终走 SHADOW。',
-    auto_on:'已开启', auto_off:'关闭',
-    auto_toggle_title:'自动交易（仅 SHADOW）：按信号自动开 $20 纸面仓位 + 分段自动离场（+20%/+50% 两次部分止盈→保本→移动止损）',
-    auto_disabled_title:'自动交易仅支持 SHADOW，请先切回模拟盘',
-    confirm_auto_title:'开启自动交易（SHADOW）',
-    confirm_auto_msg:'开启后，通过全部闸门的信号会<b>自动</b>以 $20 名义仓位开纸面仓（不会真实上链），离场规则：① 部分止盈前若跌 -35% 触发初始止损全仓离场（最多亏 -35%，不会因扫描间隔滑点亏更多）；② 涨 +20% 自动卖 30% 锁定利润，剩余止损立即上移到保本价（此后不可能再亏钱）；③ 涨 +50% 再卖 30%（与第一刀口径一致）；④ 剩余 40% 此后只用移动止损 25% 管理（只升不降），不设固定止盈上限，尽量让盈利奔跑。任何阶段命中逃生信号都立即全仓离场。同一代币只自动入场一次，不会二次进场；默认不追超过 3 天的老币，除非信号极强。仅在 SHADOW 生效，切到 LIVE 会自动关闭。<br>确定开启吗？',
-    toast_auto_on:'自动交易已开启（SHADOW · $20/单）', toast_auto_off:'自动交易已关闭', toast_auto_fail:(m)=>`切换失败：${m}`,
-    toast_auto_live_only:'自动交易仅支持 SHADOW，请先切回模拟盘',
-    toast_auto_reverted:'后端已自动关闭自动交易（可能切到了 LIVE 或重启过）。',
+    // 2026-08-13 审计：旧的「自动交易开关」那一组文案（auto_on/auto_off/auto_toggle_title/
+    // auto_disabled_title/confirm_auto_title/confirm_auto_msg/toast_auto_*）已删除。
+    // 那个拨钮早就被三档模式切换（setTradingMode）取代，这些串**没有任何代码引用**，
+    // 但内容全都停留在 2026-07-30 之前：描述已经不存在的止盈阶梯，并且断言
+    // 「仅在 SHADOW 生效，切到 LIVE 会自动关闭」——那两条现在都是假的。
+    // 留着死文案的代价不是渲染错误，是下一个读代码的人据此以为切 LIVE 是安全的。
     auto_pos_tip:'该持仓由自动交易开仓（$20 纸面仓位），按代码规则自动管理止损/止盈',
     auto_armed:'已止盈1/2(+20%)·保本+移动止损', auto_armed2:'已止盈2/2(+50%)·移动止损',
     auto_row_tip:'点击在 GMGN 打开该币图表',
@@ -800,7 +801,7 @@ const I18N={
     tm_data:'DATA', tm_manual:'MANUAL', tm_auto:'AUTO', tm_off:'OFF',
     tm_switched:(m)=>`Mode: ${m}`,
     tm_warn_manual:'MANUAL — real money. You choose entries; the bot still runs the exits (stop, takes, trailing).',
-    tm_warn_auto:(sz,mx)=>`AUTO — real money. The bot picks tokens, buys $${sz} positions and exits them on its own, up to ${mx} at once, so $${(sz*mx).toFixed(0)} deployed at most. Unattended, and it survives restarts.`,
+    tm_warn_auto:(sz)=>`AUTO — real money. The bot picks tokens, buys $${sz} positions and exits them on its own. Unattended, and it survives restarts. <b>There is no cap on concurrent positions</b>: it opens one per token that clears the gates in a round, so total money deployed is unbounded.`,
     be_ok:'connected',
     be_down:'no backend',
     be_down_hint:'Cannot reach the backend — nothing will be shown (the DEMO fake-data mode was removed)',
@@ -897,8 +898,9 @@ const I18N={
     sig_5mweak:'5m momentum weakening, sell pressure rising', sig_mintback:'mint authority possibly regained (dump risk) ← escape signal',
     sig_top10sell:'top10 holders start selling', sig_devout:'dev-linked wallet outflow', sig_lppull:'LP liquidity pull started ← escape signal',
     alert_lp:'Escape signal: LP pull started, sell now',
-    exit_full:'SL -35% · TP +20%→sell 30% / +50%→sell 30% · trailing 25%',
-    exit_ladder:'SL -35% · TP ladder · trailing 25%',
+    // Demo rows only (see the zh note): real rows carry exit_plan() from the backend.
+    exit_full:'trailing stop 12 pp from entry (ratchets up only)',
+    exit_ladder:'trailing stop 12 pp (no take-profit ladder)',
     th_cleancat:'48 smart-money + 16 renowned KOL present; mint renounced, supply still dispersed.',
     th_gooddog:'9 smart-money + 3 KOL accumulating early; mint renounced, supply dispersed.',
     th_basepepe:'Passed all quality gates; but buying would hit the concurrency/exposure cap—risk asks you to free a slot first.',
@@ -934,14 +936,10 @@ const I18N={
     buy_log_reason:(live,size,exit)=>`${live?'LIVE filled ':'SHADOW logged '}${size} SOL · ${exit}`,
     toast_buy_fail:(m)=>`Order failed: ${m}`, buy_ordering:'Placing order…',
     toast_trade_locked:'On-chain trading is locked (LIVE_TRADING_DISABLED); cannot switch to LIVE. The backend always runs SHADOW.',
-    auto_on:'ON', auto_off:'OFF',
-    auto_toggle_title:'Auto-trade (SHADOW only): auto-opens $20 paper positions on signal + staged exit (partial TP at +20%/+50% → breakeven → trailing)',
-    auto_disabled_title:'Auto-trade only works in SHADOW — switch back first',
-    confirm_auto_title:'Enable auto-trade (SHADOW)',
-    confirm_auto_msg:'Once enabled, any signal that clears every gate will <b>automatically</b> open a $20 paper position (never on-chain), with this exit sequence: ① before the first partial TP, a -35% drop triggers an initial stop-loss on the full position (capped at -35%, no worse loss from scan-interval slippage); ② at +20% auto-sell 30% to lock in profit, stop on the rest moves up to breakeven immediately (this trade can never turn into a loss after that); ③ at +50% auto-sell another 30% (same sizing as step ②); ④ the remaining 40% is then managed only with a 25% trailing stop (moves up only) — no fixed take-profit ceiling, letting winners run. An escape signal at any stage closes the full position immediately. Each token is only ever auto-entered once — no re-entries; by default it will not chase tokens older than 3 days unless the signal is exceptionally strong. Only active in SHADOW; switching to LIVE disables it automatically.<br>Enable it?',
-    toast_auto_on:'Auto-trade enabled (SHADOW · $20/trade)', toast_auto_off:'Auto-trade disabled', toast_auto_fail:(m)=>`Toggle failed: ${m}`,
-    toast_auto_live_only:'Auto-trade only works in SHADOW — switch back first',
-    toast_auto_reverted:'Backend auto-disabled auto-trade (likely switched to LIVE or restarted).',
+    // 2026-08-13 audit: the old auto-trade-toggle strings were deleted here — see the
+    // note in the zh block above. Unreferenced by any code, and every one of them still
+    // described the take-profit ladder plus the claim "only active in SHADOW; switching
+    // to LIVE disables it automatically", which stopped being true on 2026-07-30.
     auto_pos_tip:'Opened by the auto-trade bot ($20 paper position); managed automatically per its stop/TP rules',
     auto_armed:'TP 1/2 done (+20%) · breakeven+trailing', auto_armed2:'TP 2/2 done (+50%) · trailing',
     auto_row_tip:'Click to open this token\'s chart on GMGN',
@@ -1006,7 +1004,7 @@ const I18N={
     tm_data:'ЗБІР ДАНИХ', tm_manual:'РУЧНИЙ', tm_auto:'АВТО', tm_off:'ВИМКНЕНО',
     tm_switched:(m)=>`Режим: ${m}`,
     tm_warn_manual:'РУЧНИЙ — реальні гроші. Входиш ти, виходами керує бот (стоп, тейки, трейлінг).',
-    tm_warn_auto:(sz,mx)=>`АВТО — реальні гроші. Бот сам обирає токени, сам купує на $${sz} і сам продає. До ${mx} позицій одночасно, тобто максимум $${(sz*mx).toFixed(0)} у ринку. Працює без тебе, переживає перезапуск.`,
+    tm_warn_auto:(sz)=>`АВТО — реальні гроші. Бот сам обирає токени, сам купує на $${sz} і сам продає. Працює без тебе, переживає перезапуск. <b>Ліміту одночасних позицій немає</b>: скільки токенів пройде ворота за раунд — стільки й відкриє, сума в ринку нічим не обмежена.`,
     be_ok:'з\'єднано',
     be_down:'немає зв\'язку',
     be_down_hint:'Бекенд недоступний — дані не показуються (режим DEMO з фальшивими даними прибрано)',
@@ -1103,8 +1101,9 @@ const I18N={
     sig_5mweak:'момент 5хв слабшає, тиск продажів росте', sig_mintback:'право допемісії, схоже, повернулось (ризик зливу) ← сигнал втечі',
     sig_top10sell:'холдери топ10 почали продавати', sig_devout:'відтік з гаманця, пов\'язаного з dev', sig_lppull:'почалось виведення ліквідності LP ← сигнал втечі',
     alert_lp:'Сигнал втечі: почалось виведення LP, продавайте зараз',
-    exit_full:'SL -35% · TP +20%→продати 30% / +50%→продати 30% · трейлінг 25%',
-    exit_ladder:'SL -35% · драбина TP · трейлінг 25%',
+    // Лише демо-рядки (див. примітку в zh-блоці): справжні беруть exit_plan() з бекенда.
+    exit_full:'трейлінг 12 п.п. від піку, з моменту входу (тільки вгору)',
+    exit_ladder:'трейлінг 12 п.п. (без драбини тейків)',
     th_cleancat:'48 розумних гаманців + 16 відомих KOL присутні; допемісію відкликано, пропозиція ще розпорошена.',
     th_gooddog:'9 розумних гаманців + 3 KOL накопичують рано; допемісію відкликано, пропозиція розпорошена.',
     th_basepepe:'Пройшов усі ворота якості; але купівля впритул до ліміту одночасних позицій/експозиції — ризик просить спершу звільнити слот.',
@@ -1140,14 +1139,12 @@ const I18N={
     buy_log_reason:(live,size,exit)=>`${live?'LIVE заповнено ':'SHADOW записано '}${size} SOL · ${exit}`,
     toast_buy_fail:(m)=>`Ордер не вдався: ${m}`, buy_ordering:'Виставлення ордера…',
     toast_trade_locked:'Ончейн-торгівля заблокована (LIVE_TRADING_DISABLED); перемкнути на LIVE не можна. Бекенд завжди працює в SHADOW.',
-    auto_on:'УВІМК', auto_off:'ВИМК',
-    auto_toggle_title:'Автотрейд (лише SHADOW): автоматично відкриває паперові позиції по $20 за сигналом + поетапний вихід (частковий тейк на +20%/+50% → беззбиток → трейлінг)',
-    auto_disabled_title:'Автотрейд працює лише в SHADOW — спершу перемкніться назад',
-    confirm_auto_title:'Увімкнути автотрейд (SHADOW)',
-    confirm_auto_msg:'Після увімкнення будь-який сигнал, що пройде всі ворота, <b>автоматично</b> відкриє паперову позицію на $20 (ніколи не ончейн), з таким виходом: ① до першого часткового тейку падіння -35% вмикає початковий стоп-лос на всю позицію (максимум -35%, без гіршого прослизання між сканами); ② на +20% автоматично продає 30%, фіксуючи прибуток, стоп на залишок одразу підтягується до беззбитку (після цього угода вже не може стати збитковою); ③ на +50% продає ще 30% (той самий розмір, що й на кроці ②); ④ залишок 40% далі ведеться лише трейлінг-стопом 25% (тільки вгору) — без фіксованої стелі тейк-профіту, щоб прибуток міг рости далі. Сигнал втечі на будь-якому етапі одразу закриває всю позицію. Кожен токен купується автоматично лише один раз — повторного входу не буде; за замовчуванням не заходить у токени старші 3 днів, окрім дуже сильного сигналу. Діє лише в SHADOW; перемикання на LIVE вимикає автоматично.<br>Увімкнути?',
-    toast_auto_on:'Автотрейд увімкнено (SHADOW · $20/угода)', toast_auto_off:'Автотрейд вимкнено', toast_auto_fail:(m)=>`Перемикання не вдалось: ${m}`,
-    toast_auto_live_only:'Автотрейд працює лише в SHADOW — спершу перемкніться назад',
-    toast_auto_reverted:'Бекенд сам вимкнув автотрейд (ймовірно, перемкнувся на LIVE або перезапустився).',
+    // 2026-08-13, аудит: тут видалено рядки старого тумблера автотрейду (auto_on/auto_off/
+    // auto_toggle_title/auto_disabled_title/confirm_auto_title/confirm_auto_msg/toast_auto_*) —
+    // див. пояснення у zh-блоці вище. Жоден із них не мав посилань у коді, і всі описували
+    // драбину тейків, якої нема з 11.08, а також стверджували «Діє лише в SHADOW; перемикання
+    // на LIVE вимикає автоматично» — неправда з 30.07. Мертвий текст тут небезпечний не тим,
+    // що малюється, а тим, що наступний читач повірить у неіснуючий запобіжник.
     auto_pos_tip:'Відкрито автотрейд-ботом (паперова позиція $20); керується автоматично за його правилами стоп/тейк',
     auto_armed:'тейк 1/2 зроблено (+20%) · беззбиток+трейлінг', auto_armed2:'тейк 2/2 зроблено (+50%) · трейлінг',
     auto_row_tip:'Клік — відкрити графік цього токена на GMGN',
@@ -1339,7 +1336,12 @@ function reasonOf(r){
   return buildReason(r);                      // 后端英文 UI（或无原文）：重建
 }
 const thesisOf=r=>r.thesisK?t(r.thesisK):(r.thesis||'');
-const exitOf=r=>r.exitK?t(r.exitK):(r.exit||t('exit_ladder'));
+// r.exitK — лише демо-рядки (CLEANCAT/BASEPEPE нижче). Справжні рядки несуть r.exit,
+// зібраний з exit_plan() бекенда, тобто з тих самих CFG-чисел, які виконує бот.
+// 2026-08-13, аудит: резервом тут був t('exit_ladder') — тобто рядок без exec-даних
+// отримував **вигаданий** опис виходу (драбину, вимкнену з 11.08). Порожній прочерк
+// чесніший: «не знаємо» краще за «знаємо, і ось неправильна відповідь».
+const exitOf=r=>r.exitK?t(r.exitK):(r.exit||'—');
 const sigText=s=>s.k?t(s.k):s.t;
 
 const COL={ACTION:'var(--lime)',WARN:'var(--amber)',SKIP:'var(--clay)',BLOCK:'var(--amber)'};
@@ -1868,7 +1870,11 @@ async function setTradingMode(target){
   if(st?.real){
     // Не питати підтвердження, поки не знаємо справжніх цифр — інакше попередження
     // назве неправильну суму, а це саме той текст, на підставі якого людина вирішує.
-    if(target==='AUTO'&&(autoSizeUsd==null||maxAutoPos==null)){
+    // Потрібен лише розмір позиції. maxAutoPos звідси прибрано 2026-08-13 (аудит): він
+    // підставлявся в цей текст як «до N позицій, максимум $N×розмір у ринку», хоча такого
+    // ліміту в бекенді нема — див. CFG max_auto_positions. Чекати на число, яке ми більше
+    // не показуємо, означало б блокувати діалог заради неіснуючої гарантії.
+    if(target==='AUTO'&&autoSizeUsd==null){
       toast(t('tm_no_cfg'),'err');
       try{const s=await(await fetch(API+'/api/status')).json();
           autoSizeUsd=s.auto_size_usd;maxAutoPos=s.max_auto_positions;}catch(e){}
@@ -1876,7 +1882,7 @@ async function setTradingMode(target){
     }
     // Одне вікно підтвердження, без набору «LIVE» руками (користувач прибрав).
     // Текст усе одно називає точні суми — саме він тут і є запобіжником.
-    const warn=(target==='AUTO')?t('tm_warn_auto',autoSizeUsd,maxAutoPos):t('tm_warn_manual');
+    const warn=(target==='AUTO')?t('tm_warn_auto',autoSizeUsd):t('tm_warn_manual');
     const ok=await new Promise(res=>confirmDialog(t('confirm_live_title'),warn,()=>res(true),()=>res(false)));
     if(!ok)return;
     confirmStr='LIVE';
