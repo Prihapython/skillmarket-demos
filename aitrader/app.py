@@ -3003,6 +3003,28 @@ def _live_price_watch_loop():
                         do_sell(addr, exit_tag=tag)
                     except Exception as e:
                         log("AUTO_SELL_FAIL", addr[:8], str(e))
+                # Підтягнути стоп на боці GMGN слідом за піком — теж тут, а не лише раз на
+                # раунд головного циклу (~14 с). Причина конкретна: гілка вище навмисно НЕ
+                # продає локально, поки живий live_stop_id — «є ордер, значить захищено».
+                # Але захищено рівно на тій ціні, на якій ордер стоїть. Поки перевішування
+                # жило тільки в головному циклі, під час швидкого зростання ордер лишався
+                # позаду піку до ~14 с, а швидкий нагляд у цей час мовчав, бо бачив ордер.
+                # У режимі «лише трейлінг» це і є вся стратегія (стоп = пік − 12 п.п.),
+                # тож застаріла на 14 с ціна стопа — це прямий витік.
+                # Продаж іде першим: він терміновіший за перевішування.
+                # Гістерезис live_stop_resync_pct (2%) лишається — він і стримує потік
+                # перевішувань, інакше на швидкій пампі це були б дві API-операції кожні 3 с.
+                if live_watch:
+                    selling = {a for a, _ in to_sell}
+                    with ST.lock:
+                        to_arm = [p for p in ST.positions
+                                  if p.get("live") and not p.get("_exiting")
+                                  and p["address"] in prices and p["address"] not in selling]
+                    for p in to_arm:      # мережа — поза локом, як і продаж вище
+                        try:
+                            _live_arm_stop(ST.adapter_for(p.get("chain", "sol")), p)
+                        except Exception as e:
+                            log("LIVE_ARM_STOP_FAIL", p.get("symbol", ""), str(e))
         except Exception as e:
             log("PRICEWATCH_ERR", "-", str(e))
         time.sleep(CFG["live_price_poll_s"])
@@ -3590,7 +3612,7 @@ def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
     失败处理刻意不对称：**撤单失败就不建新单**（否则同一仓位挂两个止损，会双重卖出）；
     建单失败则清空 live_stop_id 并记 LIVE_NO_STOPLOSS —— 本地轮询会立刻接管
     （auto_manage_exits 里"没有 strategy id 就走完整本地逻辑"那条分支），不会出现裸奔。"""
-    if not p.get("live"):
+    if not p.get("live") or p.get("_exiting"):
         return
     if not p.get("tp1_done") and not CFG["auto_exit_trail_only"]:
         return                      # у сходинковому режимі до тейку1 стоп веде окремий ордер;
@@ -3603,41 +3625,53 @@ def _live_arm_stop(g: "GMGNAdapter", p: dict) -> None:
     cur_armed = _f(p.get("live_stop_price"))
     if cur_armed > 0 and abs(want - cur_armed) / cur_armed < CFG["live_stop_resync_pct"]:
         return                      # 变化太小，不值得为它烧两次 API
-    old = p.get("live_stop_id")
-    if old:
-        try:
-            g.strategy_cancel(g.wallet_address(), old, order_type="limit_order")
-        except Exception as e:
-            log("STRATEGY_CANCEL_FAIL", p.get("symbol", ""), f"止损重挂时撤单失败，保留旧单：{e}")
+    # Застава від паралельного перевішування: з 2026-08-13 цю функцію викликає і головний
+    # цикл, і швидкий 3-секундний нагляд. Два одночасні проходи означали б два скасування
+    # того самого ордера (друге впаде) або два стопи на одну позицію — тобто подвійний
+    # продаж. Той самий підхід, що "_exiting" у do_sell.
+    with ST.lock:
+        if p.get("_arming"):
             return
-        p["live_stop_id"] = None
+        p["_arming"] = True
     try:
-        # 卖掉当时链上还剩的全部（保本/移动止损都是全清语义）。用**实时余额**换算，
-        # 不用账面数字：GMGN 已经替我们卖掉过部分止盈，账面和链上随时可能对不上。
-        wallet = g.wallet_address()
-        bal = g.token_balance(wallet, p["address"])
-        if bal <= 0:
-            return                       # 链上已经没货了（可能刚被条件单清掉），没什么可保护的
-        dec = g.token_decimals(p["address"])
-        r = g.strategy_create_stop(
-            wallet=wallet, base_token=p["address"],
-            quote_token=native_token(p.get("chain", "sol")),
-            check_price=want,
-            amount_in=int(bal * (10 ** dec)),
-            slippage=CFG["live_slippage_sell"],
-            priority_fee=CFG["live_priority_fee_sol"], tip_fee=CFG["live_tip_fee_sol"])
-        sid = r.get("order_id")
-        if not sid:
-            raise RuntimeError(f"返回里没有 order_id：{r}")
-        p["live_stop_id"] = sid
-        p["live_stop_price"] = want
-        log("LIVE_STOP_ARMED", p.get("symbol", ""),
-            f"止损已挂 @ {want:.10g}（{(want / p['entry_price'] - 1):+.1%}）")
-    except Exception as e:
-        p["live_stop_id"] = None
-        p["live_stop_price"] = 0.0
-        log("LIVE_NO_STOPLOSS", p.get("symbol", ""),
-            f"⚠ 止损挂单失败，本轮起由本地轮询兜底：{e}")
+        old = p.get("live_stop_id")
+        if old:
+            try:
+                g.strategy_cancel(g.wallet_address(), old, order_type="limit_order")
+            except Exception as e:
+                log("STRATEGY_CANCEL_FAIL", p.get("symbol", ""), f"止损重挂时撤单失败，保留旧单：{e}")
+                return
+            p["live_stop_id"] = None
+        try:
+            # 卖掉当时链上还剩的全部（保本/移动止损都是全清语义）。用**实时余额**换算，
+            # 不用账面数字：GMGN 已经替我们卖掉过部分止盈，账面和链上随时可能对不上。
+            wallet = g.wallet_address()
+            bal = g.token_balance(wallet, p["address"])
+            if bal <= 0:
+                return                   # 链上已经没货了（可能刚被条件单清掉），没什么可保护的
+            dec = g.token_decimals(p["address"])
+            r = g.strategy_create_stop(
+                wallet=wallet, base_token=p["address"],
+                quote_token=native_token(p.get("chain", "sol")),
+                check_price=want,
+                amount_in=int(bal * (10 ** dec)),
+                slippage=CFG["live_slippage_sell"],
+                priority_fee=CFG["live_priority_fee_sol"], tip_fee=CFG["live_tip_fee_sol"])
+            sid = r.get("order_id")
+            if not sid:
+                raise RuntimeError(f"返回里没有 order_id：{r}")
+            p["live_stop_id"] = sid
+            p["live_stop_price"] = want
+            log("LIVE_STOP_ARMED", p.get("symbol", ""),
+                f"止损已挂 @ {want:.10g}（{(want / p['entry_price'] - 1):+.1%}）")
+        except Exception as e:
+            p["live_stop_id"] = None
+            p["live_stop_price"] = 0.0
+            log("LIVE_NO_STOPLOSS", p.get("symbol", ""),
+                f"⚠ 止损挂单失败，本轮起由本地轮询兜底：{e}")
+    finally:
+        with ST.lock:
+            p.pop("_arming", None)
 
 def auto_gate_report(chain: str, address: str) -> dict | None:
     """Чи пройшов би цей токен ворота авто-бота? Повертає {'pass':bool,'failed':[...]}.
