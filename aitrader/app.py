@@ -2039,20 +2039,29 @@ def _auto_decide_exit(p: dict):
             p["peak_price"] = max(p.get("peak_price", 0.0), cur, entry)
             stop_price = trailing_stop_price(p)
             if cur <= stop_price:
-                if not p.get("live"):        # SHADOW рахує за ціною спрацювання (симуляція)
-                    p["pnl"] = max(pnl, stop_price / entry - 1)
+                # 2026-08-15: раніше тут стояло `p["pnl"] = max(pnl, stop_price/entry-1)` —
+                # SHADOW навмисно писала ціну ідеального спрацювання стопа замість того, що
+                # реально побачило опитування. Задум був як для AUTO_SL нижче (симуляція
+                # чесного ордера), але вимірювання на свіжій вибірці (7 угод, 15.08) показало
+                # різницю до 13 п.п.: PRINGLES записано -2.4%, реальна ціна на момент продажу
+                # була -9.9%; SOLDIER/Poor записано -12.0%, реально -23.4%/-25.1%. При стопі
+                # -35% (стара сходинка) ця похибка була дрібною — 35%-ві тіні між опитуваннями
+                # рідкість. Стоп -12% зробив її визначальною: саме цю конструкцію й перевіряють.
+                # Тепер лишаємо `p["pnl"]`, яке вже виставив викликач (monitor_positions /
+                # _live_price_watch_loop) із реальної `cur_price` — нічого не підмінюємо.
                 return ("full", "AUTO_TRAIL_BE")
         return None
     if not p.get("tp1_done"):
         # 部分止盈前：初始硬止损 -35% 保护全仓
         if pnl <= -CFG["hard_stop_pct"]:
-            # SHADOW：扫描周期之间价格可能已经跌穿止损位很远；真实止损单会在触发价附近成交，
-            # 所以纸面成绩按 -35% 记账，而不是"看到多少算多少"——这是**模拟**，不是观测。
-            # LIVE：绝不套这个夹子。实盘有真实成交价，夹一下就等于往账本里写一个没发生过的数字，
-            # 而 LIVE 存在的全部意义就是拿真实数据校准 SHADOW。2026-07-30 MANTEN 实测：
-            # 真实成交 -32.4%，夹完记成 -35.0% —— 这次偏向对我们有利，方向无所谓，记假就是错。
-            if not p.get("live"):
-                p["pnl"] = max(pnl, -CFG["hard_stop_pct"])
+            # 2026-08-15: тут раніше стояв той самий затискач `p["pnl"] = max(pnl, -hard_stop_pct)`,
+            # що й у AUTO_TRAIL_BE нижче — і те саме обґрунтування («реальний ордер виконається
+            # біля ціни спрацювання») виявилось занадто оптимістичним на свіжих даних (див.
+            # коментар у trail-only гілці вище: різниця до 13 п.п. на стопі -12%). Ця гілка зараз
+            # не виконується, поки `auto_exit_trail_only=True` (див. ранній `return None` вище),
+            # але якщо сходинку колись увімкнуть назад — той самий затискач знову спотворив би
+            # вимірювання, тож прибрано тут теж, для узгодженості. `p["pnl"]` лишається тим, що
+            # вже виставив викликач із реальної `cur_price` — LIVE і SHADOW тепер рахують однаково.
             return ("full", "AUTO_SL")
         if pnl >= CFG["auto_tp1_pct"]:
             return ("partial", CFG["auto_tp1_sell_frac"], "AUTO_TP1_PARTIAL")
@@ -2066,9 +2075,8 @@ def _auto_decide_exit(p: dict):
     p["peak_price"] = peak
     stop_price = trailing_stop_price(p)
     if entry > 0 and cur > 0 and cur <= stop_price:
-        # 同上：SHADOW 按触发价记账（模拟），LIVE 用真实价（观测）。见上面 AUTO_SL 分支的注释。
-        if not p.get("live"):
-            p["pnl"] = max(pnl, stop_price / entry - 1)
+        # 2026-08-15: той самий затискач, що вище (AUTO_SL) — прибрано з тієї ж причини.
+        # `p["pnl"]` лишається реальною ціною, яку вже виставив викликач.
         return ("full", "AUTO_TRAIL_BE")
     if not p.get("tp2_done") and pnl >= CFG["auto_tp2_pct"]:
         # 第二次部分止盈：再卖掉"原始仓位"的 auto_tp2_sell_frac（口径与第一刀一致，不是"剩余仓位"的比例），
@@ -2881,10 +2889,11 @@ def screen_once(chain: str) -> dict:
     rows_by_addr = {t["address"]: t for t in candidates if t.get("address")}
     positions_out = monitor_positions(chain, rows_by_addr)
     auto_manage_exits(chain)                 # 独立第二遍：止损/止盈/移动止损/逃生离场（仅 auto 持仓）
-    # auto_manage_exits 可能就地夹平 p["pnl"]（止损/移动止损按触发价成交，而非滑点后的更差价）
-    # 或直接平仓（从 ST.positions 弹出）——positions_out 是在这之前拍的快照，不会反映这些变化。
-    # 若不重新对齐，同一轮响应会出现"仓位卡片显示滑点前的更差 pnl"与"交易日志记录夹平后 pnl"
-    # 两个矛盾的数字。已平仓的持仓从快照里剔除，仍持有的按当前 p["pnl"] 刷新。
+    # auto_manage_exits 可能直接平仓（从 ST.positions 弹出）或再刷新 p["pnl"]——
+    # positions_out 是在这之前拍的快照，不会反映这些变化。若不重新对齐，同一轮响应会出现
+    # 仓位卡片与交易日志两个不一致的 pnl。已平仓的持仓从快照里剔除，仍持有的按当前 p["pnl"] 刷新。
+    # （2026-08-15 前这里还提到"夹平"——SHADOW 把 pnl 写成触发价而非实际价，已删除该行为，
+    # 见 _auto_decide_exit 里的说明。）
     live_by_addr = {p["address"]: p for p in ST.positions if p.get("chain", "sol") == chain}
     positions_out = [row for row in positions_out if row["address"] in live_by_addr]
     for row in positions_out:
