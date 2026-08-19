@@ -2291,6 +2291,13 @@ class AppState:
         # Свідомо НЕ зберігається на диск: запис живе 5-12 хв, а рестарт із порожнім
         # списком лише пропускає кілька входів — на відміну від позицій, тут нема чого втрачати.
         self.pending_entries: dict[str, dict] = {}
+        # Гіпотеза A (2026-08-19, NEXT.md): спостереження за ціною 15 хв ПІСЛЯ реального
+        # стоп/трейлінг-виходу — чи відкат чи крах. Суто лог: не впливає на жоден продаж,
+        # do_sell() уже виконався до того, як сюди щось потрапляє. Свідомо НЕ зберігається
+        # на диск — той самий принцип, що й pending_entries: пікова конкурентність
+        # SHADOW-виходів виміряна як 1, втрата запису при рестарті коштує лише один
+        # пропущений SHADOW_EXIT_CONFIRM рядок, не реальні гроші.
+        self.confirm_watch: list[dict] = []
         self.chain = CFG["chain"]     # 启动默认链（仅用于未带 chain 的请求兜底 + status 展示）
         self.live = False             # 是否已配 key（决定按链建 Live 还是 Mock 适配器）
         self._adapters: dict[str, GMGNAdapter] = {}              # chain -> 适配器（缓存）
@@ -3054,7 +3061,18 @@ def _live_price_watch_loop():
                 # існує (див. докстрінг вище про обвал Hardy).
                 for addr, tag in to_sell:
                     try:
-                        do_sell(addr, exit_tag=tag)
+                        res = do_sell(addr, exit_tag=tag)
+                        # Гіпотеза A (NEXT.md, 2026-08-19): стежимо за ціною ПІСЛЯ реального
+                        # стоп/трейлінг-виходу, щоб зібрати дані «відкат чи крах». AUTO_ESCAPE
+                        # свідомо виключено — це втеча від рага/honeypot, а не цінового стопа,
+                        # затримувати чи аналізувати «чи варто було чекати» тут не можна.
+                        if tag in ("AUTO_SL", "AUTO_TRAIL_BE", "AUTO_SL_LATE") and res.get("exit_price"):
+                            with ST.lock:
+                                ST.confirm_watch.append(dict(
+                                    address=addr, chain=res.get("chain", "sol"),
+                                    symbol=res.get("symbol", ""), exit_tag=tag,
+                                    exit_ts=time.time(), exit_price=res["exit_price"],
+                                    checked_5m=False, checked_15m=False))
                     except Exception as e:
                         log("AUTO_SELL_FAIL", addr[:8], str(e))
                 # Підтягнути стоп на боці GMGN слідом за піком — теж тут, а не лише раз на
@@ -3079,6 +3097,42 @@ def _live_price_watch_loop():
                             _live_arm_stop(ST.adapter_for(p.get("chain", "sol")), p)
                         except Exception as e:
                             log("LIVE_ARM_STOP_FAIL", p.get("symbol", ""), str(e))
+            # Гіпотеза A: добігають незалежно від live_watch/shadow_watch — токен уже
+            # проданий, це лише спостереження за ціною, яке не має зупинятись, якщо
+            # хтось перемкнув режим/auto_trade в проміжку між виходом і +15хв.
+            now_m = time.time()
+            with ST.lock:
+                due_5m = [w for w in ST.confirm_watch if not w["checked_5m"] and now_m - w["exit_ts"] >= 300]
+                due_15m = [w for w in ST.confirm_watch if not w["checked_15m"] and now_m - w["exit_ts"] >= 900]
+            for w in due_5m:               # мережа — поза локом, як і скрізь у цьому циклі
+                try:
+                    w["_price_5m"] = ST.adapter_for(w["chain"]).token_price(w["address"])
+                except Exception:
+                    w["_price_5m"] = None
+            for w in due_15m:
+                try:
+                    w["_price_15m"] = ST.adapter_for(w["chain"]).token_price(w["address"])
+                except Exception:
+                    w["_price_15m"] = None
+            if due_5m or due_15m:
+                with ST.lock:
+                    for w in due_5m:
+                        w["checked_5m"] = True
+                    for w in due_15m:
+                        w["checked_15m"] = True
+                    finished = [w for w in ST.confirm_watch if w["checked_15m"]]
+                    ST.confirm_watch[:] = [w for w in ST.confirm_watch if not w["checked_15m"]]
+                for w in finished:
+                    ep = w["exit_price"]
+                    p5, p15 = w.get("_price_5m"), w.get("_price_15m")
+                    r5 = round(p5 / ep - 1, 4) if p5 and ep else None
+                    r15 = round(p15 / ep - 1, 4) if p15 and ep else None
+                    log("SHADOW_EXIT_CONFIRM", w["symbol"],
+                        f"{w['exit_tag']} +5хв {r5:+.1%} +15хв {r15:+.1%}"
+                        if r5 is not None and r15 is not None else f"{w['exit_tag']} дані неповні",
+                        dict(address=w["address"], chain=w["chain"], exit_tag=w["exit_tag"],
+                             exit_price=ep, price_5m=p5, price_15m=p15,
+                             realized_forward_return_5m=r5, realized_forward_return_15m=r15))
         except Exception as e:
             log("PRICEWATCH_ERR", "-", str(e))
         time.sleep(CFG["live_price_poll_s"])
@@ -3919,7 +3973,12 @@ def do_sell(address: str, exit_tag: str | None = None) -> dict:
         # idx міг би видалити не ту позицію.
         ST.positions[:] = [x for x in ST.positions if x is not p]
         save_positions()
-    return dict(ok=True, symbol=p["symbol"])
+    # address/chain/exit_price/exit_context/exit_tag — додано 2026-08-19 для гіпотези A
+    # (спостереження «відкат чи крах» у _live_price_watch_loop). Ці ключі просто ігнорує
+    # будь-який наявний викликач (у т.ч. /api/sell — FastAPI серіалізує весь dict).
+    return dict(ok=True, symbol=p["symbol"], address=p["address"], chain=pchain,
+                exit_price=_f(p.get("cur_price")), exit_tag=exit_tag,
+                **({"exit_context": exit_ctx} if exit_ctx else {}))
 
 def _capture_exit_context(g: "GMGNAdapter", p: dict) -> dict | None:
     """Знімок ринку в момент СПРАВЖНЬОГО виходу (стоп/трейлінг/escape, не ручний клік
